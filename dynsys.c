@@ -14,10 +14,6 @@
 #define SCALE 10.0
 #define MAX_POINTS 10000
 
-const double LORENZ_SIGMA = 10.0;
-const double LORENZ_RHO = 28.0;
-const double LORENZ_BETA = 8.0 / 3.0;
-
 double time_step = 0.01;
 
 typedef struct {
