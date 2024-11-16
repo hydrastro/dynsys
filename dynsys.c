@@ -1,5 +1,7 @@
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
+#include <ds.h>
+#include <lizard.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +17,7 @@
 const double LORENZ_SIGMA = 10.0;
 const double LORENZ_RHO = 28.0;
 const double LORENZ_BETA = 8.0 / 3.0;
+
 double time_step = 0.01;
 
 typedef struct {
@@ -54,14 +57,61 @@ void to_screen_coordinates(vector3 p, int *screen_x, int *screen_y) {
   *screen_y = (int)(p.y * SCALE) + WINDOW_HEIGHT / 2;
 }
 
-void update_lorenz_attractor(vector3 *p) {
-  double dx = LORENZ_SIGMA * (p->y - p->x) * time_step;
-  double dy = (p->x * (LORENZ_RHO - p->z) - p->y) * time_step;
-  double dz = (p->x * p->y - LORENZ_BETA * p->z) * time_step;
+double evaluate_ast(lizard_ast_node_t *ast, vector3 *state) {
+  switch (ast->type) {
+  case AST_NUMBER:
+    return mpz_get_d(ast->number);
+  case AST_SYMBOL: {
+    if (strcmp(ast->variable, "x") == 0) {
+      return state->x;
+    }
+    if (strcmp(ast->variable, "y") == 0) {
+      return state->y;
+    }
+    if (strcmp(ast->variable, "z") == 0) {
+      return state->z;
+    }
+    fprintf(stderr, "Unknown variable: %s\n", ast->variable);
+    exit(1);
+  }
+  case AST_APPLICATION: {
+    lizard_ast_node_t *op_node =
+        &CAST(ast->application_arguments->head, lizard_ast_list_node_t)->ast;
+    lizard_ast_node_t *arg1 =
+        &CAST(ast->application_arguments->head->next, lizard_ast_list_node_t)
+             ->ast;
+    lizard_ast_node_t *arg2 =
+        &CAST(ast->application_arguments->head->next->next,
+              lizard_ast_list_node_t)
+             ->ast;
+    char *op = op_node->variable;
+    double val1 = evaluate_ast(arg1, state);
+    double val2 = evaluate_ast(arg2, state);
+    if (strcmp(op, "+") == 0)
+      return val1 + val2;
+    if (strcmp(op, "*") == 0)
+      return val1 * val2;
+    if (strcmp(op, "-") == 0)
+      return val1 - val2;
+    if (strcmp(op, "/") == 0)
+      return val1 / val2;
+  } break;
+  default:
+    fprintf(stderr, "Unsupported AST node type: %d \n", ast->type);
+    exit(1);
+  }
+}
 
-  p->x += dx;
-  p->y += dy;
-  p->z += dz;
+void update_lorenz_attractor(vector3 *p, lizard_ast_node_t **equations) {
+  double dx, dy, dz;
+
+  dx = evaluate_ast(equations[0], p);
+  dy = evaluate_ast(equations[1], p);
+  dz = evaluate_ast(equations[2], p);
+
+  p->x += dx * time_step;
+  p->y += dy * time_step;
+  p->z += dz * time_step;
 }
 
 void draw_axes(Display *display, Window window, GC gc) {
@@ -106,7 +156,19 @@ int main() {
   GC gc = XCreateGC(display, window, 0, NULL);
   XSetForeground(display, gc, BlackPixel(display, screen));
 
-  vector3 point = {0.1, 0.0, 0.0};
+  char *input1 = "( * 10 (- y x))";
+  char *input2 = "( - (* x (- 28 z)) y)";
+  char *input3 = "( - (* x y) (* (/ 8 3) z))";
+
+  list_t *ast_list1 = lizard_parse(lizard_tokenize(input1));
+  list_t *ast_list2 = lizard_parse(lizard_tokenize(input2));
+  list_t *ast_list3 = lizard_parse(lizard_tokenize(input3));
+  lizard_ast_node_t *equations[3] = {
+      &CAST(ast_list1->head, lizard_ast_list_node_t)->ast,
+      &CAST(ast_list2->head, lizard_ast_list_node_t)->ast,
+      &CAST(ast_list3->head, lizard_ast_list_node_t)->ast};
+
+  vector3 point = {0.1, 0.1, 0.1};
   point_count = 0;
 
   clock_t last_time = clock();
@@ -149,7 +211,7 @@ int main() {
     }
 
     if (point_count < MAX_POINTS) {
-      update_lorenz_attractor(&point);
+      update_lorenz_attractor(&point, equations);
       attractor_points[point_count++] = point;
     }
 
@@ -181,7 +243,7 @@ int main() {
             point_count);
     draw_text(display, window, gc, 10, 20, buffer);
 
-    usleep(10000);
+    usleep(1000);
   }
 
   XCloseDisplay(display);
