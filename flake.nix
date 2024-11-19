@@ -19,23 +19,24 @@
           src = ./.;
 
           # (pkgs.callPackage ds { })
-          buildInputs = [ pkgs.gmp pkgs.stdenv.cc ds.defaultPackage.x86_64-linux lizard.defaultPackage.x86_64-linux pkgs.xorg.libX11 ];
+          buildInputs = [ pkgs.gmp pkgs.stdenv.cc ds.defaultPackage.x86_64-linux lizard.defaultPackage.x86_64-linux pkgs.virtualgl pkgs.freeglut pkgs.glew ];
 
           buildPhase = ''
             mkdir -p $out
-            gcc -c hm.c -lX11 -o dynsys -lgmp -lm
+            gcc -c dynsys.c -o dynsys -lgmp -lm -lGL -lGLU -lglut -lds -llizard
           '';
 
           installPhase = ''
             mkdir -p $out/bin
             cp dynsys $out/bin
           '';
+
           postInstall = ''
             cp $out/bin/dynsys ./dynsys
           '';
 
           meta = with pkgs.lib; {
-            description = "hm";
+            description = "dynsys";
             #license = licenses.mit;
             #maintainers = [ maintainers.yourname ];
             platforms = platforms.unix;
