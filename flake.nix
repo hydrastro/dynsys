@@ -19,7 +19,7 @@
           src = ./.;
 
           # (pkgs.callPackage ds { })
-          buildInputs = [ pkgs.gmp pkgs.stdenv.cc ds.defaultPackage.x86_64-linux lizard.defaultPackage.x86_64-linux pkgs.virtualgl pkgs.freeglut pkgs.glew ];
+          buildInputs = [ pkgs.gmp pkgs.stdenv.cc ds.defaultPackage.x86_64-linux lizard.defaultPackage.x86_64-linux pkgs.virtualgl pkgs.freeglut pkgs.glew pkgs.glibc pkgs.cglm pkgs.glfw3 pkgs.freetype];
 
           buildPhase = ''
             mkdir -p $out
