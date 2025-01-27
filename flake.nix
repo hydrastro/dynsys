@@ -22,17 +22,14 @@
           buildInputs = [ pkgs.gmp pkgs.stdenv.cc ds.defaultPackage.x86_64-linux lizard.defaultPackage.x86_64-linux pkgs.virtualgl pkgs.freeglut pkgs.glew pkgs.glibc pkgs.cglm pkgs.glfw3 pkgs.freetype];
 
           buildPhase = ''
-            mkdir -p $out
-            gcc -c dynsys.c -o dynsys -lgmp -lm -lGL -lGLU -lglut -lds -llizard
+            make clean PREFIX=$out
+            make PREFIX=$out
           '';
 
           installPhase = ''
             mkdir -p $out/bin
-            cp dynsys $out/bin
-          '';
-
-          postInstall = ''
-            cp $out/bin/dynsys ./dynsys
+            cp dynsys $out/bin/
+            chmod +x $out/bin/dynsys
           '';
 
           meta = with pkgs.lib; {
