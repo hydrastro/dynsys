@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include "lib/context.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* TPCAS keeps a small project-local arena facade, but the storage policy now
  * comes from the custom data-structures library. Internally each growth chunk
  * is a ds_arena_t, preserving the old “grow by chunks” behavior while reusing
@@ -27,4 +31,8 @@ void  arena_destroy(arena_t *a);
 size_t arena_used(const arena_t *a);
 size_t arena_remaining(const arena_t *a);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

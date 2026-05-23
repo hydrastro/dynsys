@@ -4,6 +4,10 @@
 #include "ast.h"
 #include "arena.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     bool        ok;
     node_t     *ast;
@@ -14,4 +18,8 @@ typedef struct {
 /* Parse the whole input as one expression. */
 parse_result_t parse(const char *src, arena_t *arena);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

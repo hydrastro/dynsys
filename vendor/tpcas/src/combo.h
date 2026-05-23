@@ -4,6 +4,10 @@
 #include "ast.h"
 #include "arena.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     bool        ok;
     node_t     *ast;
@@ -16,4 +20,8 @@ typedef struct {
  * ast_equal. */
 combo_result_t combo_parse(const char *src, arena_t *arena);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

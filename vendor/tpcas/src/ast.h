@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include "arena.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ============================================================
  * Source positions — every token and AST node carries one,
  * so errors can be reported with caret diagnostics.
@@ -140,4 +144,8 @@ node_t *ast_rewrite_fixpoint(arena_t *a, node_t *n, ast_rewrite_fn fn, void *ctx
 /* free-variable check */
 bool ast_free_in(const node_t *n, const char *name);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

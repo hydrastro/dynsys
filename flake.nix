@@ -1,61 +1,62 @@
 {
-  description = "Dynamical-system visualizer using TPCAS infix equations";
+  description = "Development shell for the dynsys TPCAS + Dear ImGui visualizer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    imgui = {
+      url = "github:ocornut/imgui/v1.92.8";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { nixpkgs, imgui, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in {
-      packages = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-          fontPath = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
-        in {
-          default = pkgs.stdenv.mkDerivation {
-            pname = "dynsys";
-            version = "0.1.0";
-            src = ./.;
-
-            nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ];
-            buildInputs = [
-              pkgs.cglm
-              pkgs.freetype
-              pkgs.glew
-              pkgs.glfw3
-              pkgs.libGL
-            ];
-
-            buildPhase = ''
-              make MODE=release FONT_PATH=${fontPath}
-            '';
-
-            installPhase = ''
-              make install PREFIX=$out
-            '';
-          };
-        });
-
-      apps = forAllSystems (system: {
-        default = {
-          type = "app";
-          program = "${self.packages.${system}.default}/bin/dynsys";
-        };
-      });
-
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          fontPath = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
         in {
           default = pkgs.mkShell {
-            nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config pkgs.clang-tools ];
-            buildInputs = [ pkgs.cglm pkgs.freetype pkgs.glew pkgs.glfw3 pkgs.libGL ];
-            DYNSYS_FONT_PATH = fontPath;
+            nativeBuildInputs = with pkgs; [
+              clang
+              clang-tools
+              gdb
+              gnumake
+              pkg-config
+            ];
+
+            buildInputs = with pkgs; [
+              cglm
+              glew
+              glfw3
+              libGL
+              xorg.libX11
+              xorg.libXcursor
+              xorg.libXi
+              xorg.libXinerama
+              xorg.libXrandr
+            ];
+
+            CC = "clang";
+            CXX = "clang++";
+            IMGUI_DIR = "${imgui}";
+
+            shellHook = ''
+              export CC=clang
+              export CXX=clang++
+              echo "dynsys Dear ImGui dev shell"
+              echo "  build: make"
+              echo "  run:   make run"
+              echo "  clean: make clean"
+              echo "  IMGUI_DIR=$IMGUI_DIR"
+            '';
           };
         });
+
+      formatter = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in pkgs.nixfmt-rfc-style);
     };
 }

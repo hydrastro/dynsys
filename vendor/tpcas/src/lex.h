@@ -6,6 +6,10 @@
 #include "ast.h"
 #include "arena.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     TOK_EOF,
     TOK_LPAREN,     /* (        */
@@ -48,4 +52,8 @@ bool kw_is_true  (const char *s);
 bool kw_is_false (const char *s);
 bool kw_is_any   (const char *s);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif
