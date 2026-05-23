@@ -1,47 +1,61 @@
 {
-  description = "dynsys";
+  description = "Dynamical-system visualizer using TPCAS infix equations";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    ds.url = "github:hydrastro/ds";
-    lizard.url = "github:hydrastro/lizard";
   };
 
-  outputs = { self, nixpkgs, ds, lizard }: {
-    packages = nixpkgs.lib.genAttrs [ "x86_64-linux" ] (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-      in rec {
-        dynsys = pkgs.stdenv.mkDerivation {
-          pname = "dynsys";
-          version = "0.0.0";
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+    in {
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          fontPath = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
+        in {
+          default = pkgs.stdenv.mkDerivation {
+            pname = "dynsys";
+            version = "0.1.0";
+            src = ./.;
 
-          src = ./.;
+            nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ];
+            buildInputs = [
+              pkgs.cglm
+              pkgs.freetype
+              pkgs.glew
+              pkgs.glfw3
+              pkgs.libGL
+            ];
 
-          # (pkgs.callPackage ds { })
-          buildInputs = [ pkgs.gmp pkgs.stdenv.cc ds.defaultPackage.x86_64-linux lizard.defaultPackage.x86_64-linux pkgs.virtualgl pkgs.freeglut pkgs.glew pkgs.glibc pkgs.cglm pkgs.glfw3 pkgs.freetype];
+            buildPhase = ''
+              make MODE=release FONT_PATH=${fontPath}
+            '';
 
-          buildPhase = ''
-            make clean PREFIX=$out
-            make PREFIX=$out
-          '';
-
-          installPhase = ''
-            mkdir -p $out/bin
-            cp dynsys $out/bin/
-            chmod +x $out/bin/dynsys
-          '';
-
-          meta = with pkgs.lib; {
-            description = "dynsys";
-            #license = licenses.mit;
-            #maintainers = [ maintainers.yourname ];
-            platforms = platforms.unix;
+            installPhase = ''
+              make install PREFIX=$out
+            '';
           };
+        });
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/dynsys";
         };
       });
 
-    defaultPackage = { x86_64-linux = self.packages.x86_64-linux.dynsys; };
-
-  };
+      devShells = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          fontPath = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
+        in {
+          default = pkgs.mkShell {
+            nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config pkgs.clang-tools ];
+            buildInputs = [ pkgs.cglm pkgs.freetype pkgs.glew pkgs.glfw3 pkgs.libGL ];
+            DYNSYS_FONT_PATH = fontPath;
+          };
+        });
+    };
 }

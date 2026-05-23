@@ -1,69 +1,67 @@
-# Dynamical Systems
+# dynsys
 
-A C program for visualizing continuous time dynamical systems in a 3D space.
+A C/OpenGL visualizer for continuous-time 3D dynamical systems.
 
-## Features
+This version uses the vendored TPCAS parser directly, so equations are written in normal TPCAS/infix mode instead of the old Lisp/Polish notation.
 
-- 3D plotting
-- customizable input equations
-- mouse and keyboard controls for the 3D plot
+## Build
 
-## Installation
-### Dependencies
-- cglm
-- freetype
-- gmp
-- GLEW
-- GLFW3
-- OpenGL
-- lizard
-- ds
-
-### With Nix
-```shell
-nix build
-```
-
-### With Make
-```shell
+```sh
 make
 ```
 
-## Usage
-```shell
-./dynsys
+With Nix:
+
+```sh
+nix build
+nix run
 ```
 
-### Controls
-- `w`,`a`,`s`,`d`: camera angle
-- `-`,`=`: zoom
+The executable is `build/dynsys` when using Make.
+
+## Equation syntax
+
+Use `x`, `y`, and `z` for the current point, and write ordinary infix arithmetic:
+
+```text
+Lorenz:
+dx/dt = 10 * (y - x)
+dy/dt = x * (28 - z) - y
+dz/dt = x * y - (8 / 3) * z
+
+Rössler:
+dx/dt = 0 - (y + z)
+dy/dt = x + (1 / 5) * y
+dz/dt = (1 / 5) + z * (x - (57 / 10))
+```
+
+Unary minus and decimals are supported, for example `-x + 1.5`. The evaluator also accepts `sin`, `cos`, `tan`, `exp`, `log`, `sqrt`, `abs`, `pow`, `min`, and `max` as function calls.
+
+## Runtime font
+
+The uploaded bitmap/font file is not vendored here. By default, the Make build tries `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf`. Override it with:
+
+```sh
+DYNSYS_FONT_PATH=/path/to/font.ttf ./build/dynsys
+```
+
+or at compile time:
+
+```sh
+make FONT_PATH=/path/to/font.ttf
+```
+
+## Controls
+
+- `w`, `a`, `s`, `d`: rotate camera
+- `-`, `=`: zoom
 - `z`: toggle cross
-- `x`: toggle axis
+- `x`: toggle axes
 - `c`: clear/reset
 - `spacebar`: pause/resume
-- `m`,`,`: speed decrease
-- `.`,`/`: speed increase
-- `j`,`l`: x translation
-- `i`,`k`: y translation
-- `p`,`;`: z translation
-- `v`, `b`: dt
-
-![Visualization of the resulting plot](./result.png)
-
-Note: __at the moment__ the input equation must be provided in Polish notation:
-```
-Lorenz attractor:
-dx: ( * 10 (- y x))
-dy: ( - (* x (- 28 z)) y)
-dz: ( - (* x y) (* (/ 8 3) z))
-
-Rössler attractor:
-dx: ( - 0 ( + y z))
-dy: ( + x ( * (/ 1 5) y))
-dz: ( + (/ 1 5) ( * z ( - x (/ 57 10))))
-```
-## Contributing
-
-Contributions are welcome! Before submitting a pull request, please:
-- Format your code with clang-format
-- Test your code for memory leaks and undefined behavior with valgrind
+- `m`, `,`: decrease speed
+- `.`, `/`: increase speed
+- `j`, `l`: x translation
+- `i`, `k`: y translation
+- `p`, `;`: z translation
+- `v`, `b`: adjust `dt`
