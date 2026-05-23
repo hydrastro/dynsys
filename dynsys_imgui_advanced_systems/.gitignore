@@ -1,6 +1,0 @@
-/build/
-/result
-/result-*
-/.direnv/
-*.o
-*.d

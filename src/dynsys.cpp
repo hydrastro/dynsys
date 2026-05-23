@@ -80,6 +80,7 @@ struct AppState {
   int current_point = 0;
   int steps_per_frame = 1;
   bool paused = false;
+  int selected_preset = 0;
 
   float center_x = 0.0f;
   float center_y = 0.0f;
@@ -760,66 +761,195 @@ void copy_system_input(AppState &app, const char *text) {
   std::snprintf(app.system_input, sizeof(app.system_input), "%s", text);
 }
 
+struct SystemPreset {
+  const char *name;
+  const char *source;
+  double start_x;
+  double start_y;
+  double start_z;
+  double start_t;
+  double dt;
+  int steps_per_frame;
+  float zoom;
+  float center_x;
+  float center_y;
+  float center_z;
+};
+
+const SystemPreset kPresets[] = {
+    {
+        "Thomas",
+        "# Thomas cyclically symmetric attractor\n"
+        "# Dynamic Mathematics parameter: b = 0.208186\n"
+        "b = 0.208186\n"
+        "dx = sin(y) - b * x\n"
+        "dy = sin(z) - b * y\n"
+        "dz = sin(x) - b * z\n",
+        0.1, 0.0, 0.0, 0.0, 0.01, 4, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Langford / Aizawa",
+        "# Langford, also called Aizawa\n"
+        "# Parameters: a=.95, b=.7, c=.6, d=3.5, e=.25, f=.1\n"
+        "a = 0.95\n"
+        "b = 0.7\n"
+        "c = 0.6\n"
+        "d = 3.5\n"
+        "e = 0.25\n"
+        "f = 0.1\n"
+        "r2 = pow(x, 2) + pow(y, 2)\n"
+        "dx = (z - b) * x - d * y\n"
+        "dy = d * x + (z - b) * y\n"
+        "dz = c + a * z - pow(z, 3) / 3 - r2 * (1 + e * z) + f * z * pow(x, 3)\n",
+        0.1, 0.0, 0.0, 0.0, 0.005, 4, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Lorenz",
+        "# Lorenz system\n"
+        "# Parameters: sigma=10, rho=28, beta=8/3\n"
+        "sigma = 10\n"
+        "rho = 28\n"
+        "beta = 8 / 3\n"
+        "dx = sigma * (0 - x + y)\n"
+        "dy = 0 - x * z + rho * x - y\n"
+        "dz = x * y - beta * z\n",
+        0.1, 0.1, 0.1, 0.0, 0.01, 2, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Dadras",
+        "# Dadras attractor\n"
+        "# Parameters: a=3, b=2.7, c=1.7, d=2, e=9\n"
+        "a = 3\n"
+        "b = 2.7\n"
+        "c = 1.7\n"
+        "d = 2\n"
+        "e = 9\n"
+        "dx = y - a * x + b * y * z\n"
+        "dy = c * y - x * z + z\n"
+        "dz = d * x * y - e * z\n",
+        0.1, 0.1, 0.1, 0.0, 0.005, 4, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Chen / Chen-Lee",
+        "# Chen / Chen-Lee system\n"
+        "# Parameters: alpha=5, beta=-10, delta=-0.38\n"
+        "alpha = 5\n"
+        "beta = 0 - 10\n"
+        "delta = 0 - 0.38\n"
+        "dx = alpha * x - y * z\n"
+        "dy = beta * y + x * z\n"
+        "dz = delta * z + x * y / 3\n",
+        1.0, 1.0, 1.0, 0.0, 0.002, 8, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Lorenz83",
+        "# Lorenz83 system\n"
+        "# Parameters: a=.95, b=7.91, f=4.83, g=4.66\n"
+        "a = 0.95\n"
+        "b = 7.91\n"
+        "f = 4.83\n"
+        "g = 4.66\n"
+        "dx = 0 - a * x - pow(y, 2) - pow(z, 2) + a * f\n"
+        "dy = 0 - y + x * y - b * x * z + g\n"
+        "dz = 0 - z + b * x * y + x * z\n",
+        0.1, 0.1, 0.1, 0.0, 0.005, 4, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Rossler",
+        "# Rössler system\n"
+        "# Parameters: a=.2, b=.2, c=5.7\n"
+        "a = 0.2\n"
+        "b = 0.2\n"
+        "c = 5.7\n"
+        "dx = 0 - (y + z)\n"
+        "dy = x + a * y\n"
+        "dz = b + z * (x - c)\n",
+        0.1, 0.1, 0.1, 0.0, 0.01, 2, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Halvorsen",
+        "# Halvorsen attractor\n"
+        "# Parameter: a=1.89\n"
+        "a = 1.89\n"
+        "dx = 0 - a * x - 4 * y - 4 * z - pow(y, 2)\n"
+        "dy = 0 - a * y - 4 * z - 4 * x - pow(z, 2)\n"
+        "dz = 0 - a * z - 4 * x - 4 * y - pow(x, 2)\n",
+        0.1, 0.0, 0.0, 0.0, 0.005, 4, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Rabinovich-Fabrikant",
+        "# Rabinovich-Fabrikant system\n"
+        "# Parameters: alpha=.14, gamma=.10\n"
+        "alpha = 0.14\n"
+        "gamma = 0.10\n"
+        "dx = y * (z - 1 + pow(x, 2)) + gamma * x\n"
+        "dy = x * (3 * z + 1 - pow(x, 2)) + gamma * y\n"
+        "dz = 0 - 2 * z * (alpha + x * y)\n",
+        0.1, 0.1, 0.1, 0.0, 0.002, 8, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Three-Scroll Unified",
+        "# Three-Scroll Unified Chaotic System\n"
+        "# Parameters: a=32.48, b=45.84, c=1.18, d=.13, e=.57, f=14.7\n"
+        "a = 32.48\n"
+        "b = 45.84\n"
+        "c = 1.18\n"
+        "d = 0.13\n"
+        "e = 0.57\n"
+        "f = 14.7\n"
+        "dx = a * (y - x) + d * x * z\n"
+        "dy = b * x - x * z + f * y\n"
+        "dz = c * z + x * y - e * pow(x, 2)\n",
+        0.1, 0.1, 0.1, 0.0, 0.0005, 16, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Sprott",
+        "# Sprott system\n"
+        "# Parameters: a=2.07, b=1.79\n"
+        "a = 2.07\n"
+        "b = 1.79\n"
+        "dx = y + a * x * y + x * z\n"
+        "dy = 1 - b * pow(x, 2) + y * z\n"
+        "dz = x - pow(x, 2) - pow(y, 2)\n",
+        0.1, 0.1, 0.1, 0.0, 0.002, 8, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+    {
+        "Four-Wing",
+        "# Four-Wing attractor\n"
+        "# Parameters: a=.2, b=.01, c=-.4\n"
+        "a = 0.2\n"
+        "b = 0.01\n"
+        "c = 0 - 0.4\n"
+        "dx = a * x + y * z\n"
+        "dy = b * x + c * y - x * z\n"
+        "dz = 0 - z - x * y\n",
+        0.1, 0.1, 0.1, 0.0, 0.005, 4, 1.0f, 0.0f, 0.0f, 0.0f,
+    },
+};
+
+constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
+
+void apply_preset(AppState &app, int index) {
+  if (index < 0 || index >= kPresetCount) {
+    index = 0;
+  }
+  const SystemPreset &preset = kPresets[index];
+  app.selected_preset = index;
+  copy_system_input(app, preset.source);
+  app.start_x = preset.start_x;
+  app.start_y = preset.start_y;
+  app.start_z = preset.start_z;
+  app.start_t = preset.start_t;
+  app.dt = preset.dt;
+  app.steps_per_frame = preset.steps_per_frame;
+  app.zoom = preset.zoom;
+  app.center_x = preset.center_x;
+  app.center_y = preset.center_y;
+  app.center_z = preset.center_z;
+}
+
 void set_lorenz(AppState &app) {
-  copy_system_input(app,
-                    "# Lorenz system with named parameters\n"
-                    "sigma = 10\n"
-                    "rho = 28\n"
-                    "beta = 8 / 3\n"
-                    "dx = sigma * (y - x)\n"
-                    "dy = x * (rho - z) - y\n"
-                    "dz = x * y - beta * z\n");
-  app.start_x = 0.1;
-  app.start_y = 0.1;
-  app.start_z = 0.1;
-  app.start_t = 0.0;
-}
-
-void set_rossler(AppState &app) {
-  copy_system_input(app,
-                    "# Rossler system\n"
-                    "a = 1 / 5\n"
-                    "b = 1 / 5\n"
-                    "c = 57 / 10\n"
-                    "dx = 0 - (y + z)\n"
-                    "dy = x + a * y\n"
-                    "dz = b + z * (x - c)\n");
-  app.start_x = 0.1;
-  app.start_y = 0.1;
-  app.start_z = 0.1;
-  app.start_t = 0.0;
-}
-
-void set_thomas(AppState &app) {
-  copy_system_input(app,
-                    "# Thomas cyclically symmetric attractor\n"
-                    "b = 0.208186\n"
-                    "wave(u) = sin(u)\n"
-                    "dx = wave(y) - b * x\n"
-                    "dy = wave(z) - b * y\n"
-                    "dz = wave(x) - b * z\n");
-  app.start_x = 0.1;
-  app.start_y = 0.0;
-  app.start_z = 0.0;
-  app.start_t = 0.0;
-}
-
-void set_duffing_like(AppState &app) {
-  copy_system_input(app,
-                    "# Forced Duffing-like 3D autonomous form\n"
-                    "delta = 0.2\n"
-                    "alpha = -1\n"
-                    "beta = 1\n"
-                    "gamma = 0.3\n"
-                    "omega = 1.2\n"
-                    "drive(tau) = gamma * cos(omega * tau)\n"
-                    "dx = y\n"
-                    "dy = 0 - delta * y - alpha * x - beta * pow(x, 3) + drive(t)\n"
-                    "dz = 1\n");
-  app.start_x = 0.1;
-  app.start_y = 0.0;
-  app.start_z = 0.0;
-  app.start_t = 0.0;
+  apply_preset(app, 2);
 }
 
 void allocate_points(AppState &app) {
@@ -1241,35 +1371,31 @@ void draw_gui(AppState &app) {
   }
 
   if (ImGui::CollapsingHeader("System", ImGuiTreeNodeFlags_DefaultOpen)) {
-    if (ImGui::Button("Lorenz")) {
-      set_lorenz(app);
-      if (compile_system(app, app.system_input, &app.parse_error)) {
-        reset_simulation(app);
+    const char *current_preset_name = kPresets[std::max(0, std::min(app.selected_preset, kPresetCount - 1))].name;
+    if (ImGui::BeginCombo("Preset", current_preset_name)) {
+      for (int i = 0; i < kPresetCount; ++i) {
+        const bool selected = app.selected_preset == i;
+        if (ImGui::Selectable(kPresets[i].name, selected)) {
+          apply_preset(app, i);
+          if (compile_system(app, app.system_input, &app.parse_error)) {
+            reset_simulation(app);
+          }
+        }
+        if (selected) {
+          ImGui::SetItemDefaultFocus();
+        }
       }
+      ImGui::EndCombo();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Rossler")) {
-      set_rossler(app);
-      if (compile_system(app, app.system_input, &app.parse_error)) {
-        reset_simulation(app);
-      }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Thomas")) {
-      set_thomas(app);
-      if (compile_system(app, app.system_input, &app.parse_error)) {
-        reset_simulation(app);
-      }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Duffing")) {
-      set_duffing_like(app);
+    if (ImGui::Button("Reload preset")) {
+      apply_preset(app, app.selected_preset);
       if (compile_system(app, app.system_input, &app.parse_error)) {
         reset_simulation(app);
       }
     }
 
-    ImGui::TextWrapped("Define one equation per line. Required: dx, dy, dz. Optional: constants, auxiliary expressions, and helper functions.");
+    ImGui::TextWrapped("The preset list includes the 12 strange-attractor systems from Dynamic Mathematics. Define one equation per line. Required: dx, dy, dz. Optional: constants, auxiliary expressions, and helper functions.");
     ImGui::InputTextMultiline("##system_input", app.system_input,
                               sizeof(app.system_input), ImVec2(-FLT_MIN, 260.0f),
                               ImGuiInputTextFlags_AllowTabInput);

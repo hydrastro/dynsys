@@ -8,6 +8,7 @@ This version uses:
 - TPCAS for equation parsing
 - normal TPCAS/infix equations instead of Lisp/Polish notation
 - named auxiliary definitions and user-defined helper functions
+- built-in preset catalogue for the Dynamic Mathematics strange-attractor systems
 
 ## Build
 
@@ -60,7 +61,7 @@ The expected source layout is:
 
 ## System syntax
 
-The GUI now has one multiline system editor instead of three isolated derivative fields. Each non-empty line is a definition:
+The GUI now has a preset selector plus one multiline system editor instead of three isolated derivative fields. Each non-empty line is a definition:
 
 ```text
 name = expression
@@ -123,7 +124,7 @@ Example with explicit time dependence:
 # Forced Duffing-like 3D autonomous form
 # z is still rendered; t is internal simulation time.
 delta = 0.2
-alpha = -1
+alpha = 0 - 1
 beta = 1
 gamma = 0.3
 omega = 1.2
@@ -137,11 +138,30 @@ dz = 1
 
 The evaluator rejects cyclic scalar definitions and recursive helper functions. Input is TPCAS infix mode; Lisp/S-expression syntax is not used.
 
+## Built-in attractor presets
+
+The preset selector includes the strange-attractor systems listed by Dynamic Mathematics:
+
+- Thomas
+- Langford / Aizawa
+- Lorenz
+- Dadras
+- Chen / Chen-Lee
+- Lorenz83
+- Rössler
+- Halvorsen
+- Rabinovich-Fabrikant
+- Three-Scroll Unified Chaotic System
+- Sprott
+- Four-Wing
+
+The source equations use mathematical powers like `x^2` and `z^3`; dynsys writes those as TPCAS-compatible calls such as `pow(x, 2)` and `pow(z, 3)`.
+
 ## UI
 
 The control panel supports:
 
-- preset switching between Lorenz, Rössler, Thomas, and Duffing-like systems
+- preset switching across Thomas, Langford/Aizawa, Lorenz, Dadras, Chen/Chen-Lee, Lorenz83, Rössler, Halvorsen, Rabinovich-Fabrikant, Three-Scroll Unified, Sprott, Four-Wing
 - editing the full system live
 - named parameters and auxiliary expressions
 - helper functions such as `wave(u) = sin(u)`
@@ -181,3 +201,7 @@ make
 ```
 
 The old file `src/dynsys.c` is not part of this package. The active entry point is `src/dynsys.cpp`.
+
+## Dynamic Mathematics preset provenance
+
+The built-in strange-attractor presets are transcribed from the Dynamic Mathematics strange-attractors page. The catalogue intentionally contains only the systems listed there: Thomas, Langford/Aizawa, Lorenz, Dadras, Chen/Chen-Lee, Lorenz83, Rössler, Halvorsen, Rabinovich-Fabrikant, Three-Scroll Unified Chaotic System, Sprott, and Four-Wing. Powers from the source notation such as `x^2` and `z^3` are written as `pow(x, 2)` and `pow(z, 3)` because dynsys currently exposes exponentiation as a builtin function rather than as a `^` operator.
