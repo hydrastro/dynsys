@@ -10,6 +10,8 @@ This version uses:
 - named auxiliary definitions and user-defined helper functions
 - built-in preset catalogue for the Dynamic Mathematics strange-attractor systems
 
+- ![Visualization of the resulting plot](./result.png)
+
 ## Build
 
 Preferred workflow:
