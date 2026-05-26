@@ -85,8 +85,18 @@ WARNINGS_CXX := -Wall -Wextra
 CSTD         := -std=c11
 CXXSTD       := -std=c++17
 
+ifeq ($(WINDOWS_BUILD),1)
+  # For the Windows build, ask pkg-config for static link flags so GLFW's
+  # transitive system libraries are included. This still links against normal
+  # Windows system DLLs such as kernel32/user32/gdi32/opengl32, which are
+  # supplied by Windows.
+  PKG_CONFIG_LIBS_ARGS ?= --libs --static
+else
+  PKG_CONFIG_LIBS_ARGS ?= --libs
+endif
+
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
-PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS) 2>/dev/null)
+PKG_LIBS   := $(shell $(PKG_CONFIG) $(PKG_CONFIG_LIBS_ARGS) $(PKGS) 2>/dev/null)
 
 CPPFLAGS ?=
 CPPFLAGS += -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds $(PKG_CFLAGS)
@@ -114,9 +124,12 @@ ifeq ($(WINDOWS_BUILD),1)
   # MinGW/Windows OpenGL + GLFW backend system libraries. GLEW is compiled
   # from source into this project for Windows, so do not link -lglew32 here.
   LDLIBS += $(PKG_LIBS) -lopengl32 -lgdi32 -limm32 -lole32 -luuid -lwinmm -lm
+  # Produce a self-contained MinGW executable for third-party/runtime
+  # libraries: libstdc++, libgcc, winpthread, and static GLFW/GLEW where
+  # available. Windows system DLLs remain dynamically loaded by design.
   WIN_STATIC_RUNTIME ?= 1
   ifeq ($(WIN_STATIC_RUNTIME),1)
-    LDFLAGS += -static-libgcc -static-libstdc++
+    LDFLAGS += -static -static-libgcc -static-libstdc++
   endif
 else
   LDLIBS += $(PKG_LIBS) -lGL -ldl -lm
@@ -344,7 +357,9 @@ print-vars:
 	@echo "PKGS=$(PKGS)"
 	@echo "IMGUI_DIR=$(IMGUI_DIR)"
 	@echo "PKG_CFLAGS=$(PKG_CFLAGS)"
+	@echo "PKG_CONFIG_LIBS_ARGS=$(PKG_CONFIG_LIBS_ARGS)"
 	@echo "PKG_LIBS=$(PKG_LIBS)"
+	@echo "LDFLAGS=$(LDFLAGS)"
 	@echo "LDLIBS=$(LDLIBS)"
 
 help:

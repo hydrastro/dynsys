@@ -1,209 +1,217 @@
-# dynsys
+# Lizard
 
-A GLFW/OpenGL visualizer for continuous-time 3D dynamical systems.
+```
+___                     .-*''*-.
+ '.* *'.        .|     *       _*
+  _)*_*_\__   \.`',/  * EVAL .'  *
+ / _______ \  = ,. =  *.___.'    *
+ \_)|@_@|(_/   // \   '.   APPLY.'
+   ))\_/((    //        *._  _.*
+  (((\V/)))  //            ||
+ //-\\^//-\\--            /__\
+```
 
-This version uses:
+A C89 Scheme interpreter with a small cubical type theory implementation
+built on top. Three things in one codebase:
 
-- Dear ImGui for the control UI
-- TPCAS for equation parsing
-- normal TPCAS/infix equations instead of Lisp/Polish notation
-- named auxiliary definitions and user-defined helper functions
-- built-in preset catalogue for the Dynamic Mathematics strange-attractor systems
+1. A working Scheme implementation: bignums (via GMP), tail-call
+   optimization, lexical closures, syntax-rules macros with hygiene,
+   exception handling, vectors, hash tables.
+
+2. A bidirectional type checker for λΠ extended with most of Martin-Löf
+   type theory's term formers (Sigma, Sum, Unit, Bot, Id) and a universe
+   lattice with cumulativity.
+
+3. A cubical type theory layer (CCHM-style) on top of that: interval,
+   paths, faces, partial elements, Kan composition, Glue types, and `ua`
+   — with computational univalence working end-to-end in the canonical
+   case.
+
+Six focused turns of cubical work, each adding a layer in the standard
+CCHM pipeline. The result is a small but coherent cubical type checker.
+
+For the precise scope of what works, what's incomplete, and what's
+deliberately out of reach, see `LIMITATIONS.md`. For how the pieces
+fit together, see `DESIGN.md`.
 
 - ![Visualization of the resulting plot](./result.png)
 
 ## Build
 
-Preferred workflow:
+Requires GCC (or compatible C89-clean compiler) and GMP.
 
-```sh
-nix develop
+With Nix:
+```
+nix-shell --run make
+```
+
+Without Nix (assuming GMP installed at standard prefix):
+```
 make
 ```
 
-Run it with:
-
-```sh
-make run
+If GMP is at a non-standard location:
+```
+CPPFLAGS="-I/path/to/gmp/include" LDFLAGS="-L/path/to/gmp/lib" make
 ```
 
-Useful variants:
-
-```sh
-make release
-make asan
-make clean
-make print-vars
+Binary lands at `build/lizard`. Tests:
+```
+make test
 ```
 
-The executable is `build/dynsys`.
+## Run
 
-The flake intentionally provides a development shell, not a `nix build`/`nix run` application. `make` owns the build.
-
-## Dear ImGui source
-
-`nix develop` exports `IMGUI_DIR` to the pinned Dear ImGui source input declared in `flake.nix`. The Makefile compiles the Dear ImGui core sources plus the GLFW/OpenGL3 backends directly into dynsys.
-
-Outside Nix, provide your own Dear ImGui checkout:
-
-```sh
-make IMGUI_DIR=/path/to/imgui
+```
+./build/lizard              # REPL
+./build/lizard file.lisp    # run a script
+./build/lizard < file.lisp  # via stdin
 ```
 
-The expected source layout is:
+## What's in the box
 
-```text
-/path/to/imgui/imgui.cpp
-/path/to/imgui/imgui_draw.cpp
-/path/to/imgui/imgui_tables.cpp
-/path/to/imgui/imgui_widgets.cpp
-/path/to/imgui/backends/imgui_impl_glfw.cpp
-/path/to/imgui/backends/imgui_impl_opengl3.cpp
+### Scheme core
+
+Standard forms: `define`, `lambda`, `let`, `let*`, `letrec`, `cond`,
+`if`, `begin`, `set!`, `quote`, `quasiquote`, `unquote`,
+`unquote-splicing`.
+
+Three lambda parameter shapes: fixed (`(lambda (x y) ...)`), varargs
+(`(lambda args ...)`), and mixed (`(lambda (first . rest) ...)`).
+
+Bignums via GMP — arithmetic on arbitrary-precision integers.
+
+Tail-call optimization for direct self-recursion and mutual recursion.
+
+Macros: lizard-original transformer lambdas via `define-syntax` with
+explicit AST manipulation, plus standard `syntax-rules` with basic
+hygiene. `gensym` for fresh symbols.
+
+Exception handling: `raise`, `with-handler`, structured error objects.
+
+Vectors, hash tables, string operations, file I/O, character predicates,
+real-number primitives.
+
+Reflection: `type-of`, environment introspection, AST inspection.
+
+### Dependent type checker
+
+A bidirectional checker (`infer` and `check`) for λΠ with:
+
+- Variables, universes, Pi formation, lambdas, applications
+- Annotation forms `(annot t T)`
+- Sigma, Sum, Unit, Bot — with introduction and elimination rules
+- Identity types `(Id A a b)` with `refl` and `J` (path induction)
+- Universe lattice: concrete `(U n)`, variables `(U-var 'i)`,
+  successor `(U-suc u)`, max `(U-max u v)`, with cumulativity
+- Convertibility check that respects alpha-equivalence and runs full
+  normalization
+
+### Observational HoTT-fragment engine
+
+Reduction rules for the observational fragment:
+- Identity algebra: `sym`, `trans`, `transport`, all with their
+  computation rules
+- `ap` as a functor on paths (commutes with refl, sym, trans)
+- `J` reducing on `refl`
+- Id-on-type-formers: `Id (Pi x A B) f g → Pi x A (Id B (f x) (g x))`
+  (functional extensionality at the computation level)
+- Id on Sigma, Sum, Unit
+- `xport` per type former
+
+### Cubical layer
+
+Six turns of CCHM-style cubical:
+
+**Turn 6 — Interval and paths.** Interval pre-type `I` with endpoints
+`i0`, `i1`, connection operations (`I-and`, `I-or`, `I-neg`) with their
+equations, `Path` type with `path-abs` (`<i> body`) introduction and
+`path-app` (`p @ i`) elimination. Path-app beta computes by
+substituting the interval point into the body. Endpoint conditions on
+`path-abs` are enforced at typing time.
+
+**Turn 7 — Faces and partial elements.** Face formulas `F0`, `F1`,
+`F-eq`, `F-and`, `F-or` with the CCHM connection-on-face equations
+(`(F-eq (i ∧ j) i0) → (F-or (F-eq i i0) (F-eq j i0))` and friends).
+Face entailment decision procedure (returns `#t`/`#f`/`unknown`
+honestly). `Partial` and `Sub` type formers.
+
+**Turn 8 — Kan composition.** `comp`, `hcomp`, `fill` with per-type-
+former reduction rules: F1 boundary collapse, `comp Unit → tt`,
+`comp Sigma` decomposing into Pair of comps, `comp Pi` (non-dependent
+case) becoming Lambda over composed codomain, `comp Sum` pushing
+through `inl`/`inr`, `comp Path` building a path-abs with multi-face
+inner partial.
+
+**Turn 9 — Glue types and equivalences.** `Equiv A B`, `id-equiv`,
+`equiv-fun`, `equiv-inv`, `Glue A φ T e`, `glue-intro`, `unglue` with
+their reduction and typing rules.
+
+**Turn 10 — ua.** `(ua e) : Path U A B` when `e : Equiv A B`. The
+canonical case `(ua (id-equiv A)) @ i → A` fully computes.
+
+**Turn 11 — Systems and comp Glue.** Multi-clause partial elements
+(`system-nil`, `system-cons`) with simplification rules,
+`system-lookup` decision procedure, comp over Glue types producing
+`glue-intro` of constituent comps, and the chain-collapse for the
+identity equivalence that gives end-to-end canonical-case
+computational univalence:
+
+```
+(comp <i>((ua (id-equiv A)) @ i) F0 [] x)  →  x
 ```
 
-## System syntax
+The identity equivalence gives the identity path which gives the
+identity transport, all by reduction, no postulates.
 
-The GUI now has a preset selector plus one multiline system editor instead of three isolated derivative fields. Each non-empty line is a definition:
+## Pluggable rules
 
-```text
-name = expression
-name(arg1, arg2) = expression
-dx = expression
-dy = expression
-dz = expression
-```
+Every reduction rule is gated on a flag — about 60 of them, each
+with a clear name. `(flag-set! 'reduce-path-beta #f)` disables
+path-app beta; `(flag-set! 'reduce-comp-pi #f)` disables comp Pi.
+This is useful for understanding which rule does what and for
+disabling individual rules during debugging or thesis-related
+experimentation. Flags default to enabled.
 
-`dx`, `dy`, and `dz` are required. `dx/dt`, `dy/dt`, and `dz/dt` are also accepted aliases.
+## Examples
 
-Comments start with `#` or `//`.
+Examples live in `examples/`, numbered roughly by topic:
 
-Available state variables:
+- `01-quine.lisp` through `22-benchmarks.lisp` — Scheme programs
+- `23-pi.lisp` through `29-universes.lisp` — λΠ and observational HoTT
+- `30-cubical.lisp` — Turn 6 walkthrough (interval and paths)
+- `31-faces.lisp` — Turn 7 (faces and entailment)
+- `32-comp.lisp` — Turn 8 (Kan composition)
+- `33-glue-ua.lisp` — Turns 9 & 10 (Glue and ua)
+- `34-systems-univalence.lisp` — Turn 11 (canonical computational
+  univalence end-to-end)
 
-```text
-x, y, z, t
-```
+Run any of them: `./build/lizard < examples/34-systems-univalence.lisp`.
 
-Built-in constants:
+## What lizard isn't
 
-```text
-pi, e
-```
+It isn't Cubical Agda. It isn't Coq. It isn't a soundness-proven
+proof assistant. It's a six-turn implementation that demonstrates the
+cubical computation pipeline working in the canonical case, with
+honest documentation of what it doesn't do. For the precise scope of
+limitations, see `LIMITATIONS.md`.
 
-Built-in functions:
+## Honest scope statement
 
-```text
-sin, cos, tan, exp, log, sqrt, abs, pow, min, max
-```
+This codebase exists primarily to support thesis work on
+couniverse-stratified type theory. It is not a competitor to mature
+proof assistants. What it does demonstrate is that a working cubical
+computation engine can be built incrementally and that the canonical
+case of computational univalence — identity equivalence transports —
+runs end-to-end by reduction.
 
-Example Lorenz system using named parameters:
+For research-grade extensions (full per-type-former dependent comp,
+HITs, soundness proofs, decidable typechecking) see `LIMITATIONS.md`,
+which is candid about what would be needed and what is out of scope
+for the present implementation.
 
-```text
-# Lorenz system
-sigma = 10
-rho = 28
-beta = 8 / 3
+## License
 
-dx = sigma * (y - x)
-dy = x * (rho - z) - y
-dz = x * y - beta * z
-```
-
-Example with user-defined helper functions:
-
-```text
-# Thomas cyclically symmetric attractor
-b = 0.208186
-wave(u) = sin(u)
-
-dx = wave(y) - b * x
-dy = wave(z) - b * y
-dz = wave(x) - b * z
-```
-
-Example with explicit time dependence:
-
-```text
-# Forced Duffing-like 3D autonomous form
-# z is still rendered; t is internal simulation time.
-delta = 0.2
-alpha = 0 - 1
-beta = 1
-gamma = 0.3
-omega = 1.2
-
-drive(tau) = gamma * cos(omega * tau)
-
-dx = y
-dy = 0 - delta * y - alpha * x - beta * pow(x, 3) + drive(t)
-dz = 1
-```
-
-The evaluator rejects cyclic scalar definitions and recursive helper functions. Input is TPCAS infix mode; Lisp/S-expression syntax is not used.
-
-## Built-in attractor presets
-
-The preset selector includes the strange-attractor systems listed by Dynamic Mathematics:
-
-- Thomas
-- Langford / Aizawa
-- Lorenz
-- Dadras
-- Chen / Chen-Lee
-- Lorenz83
-- Rössler
-- Halvorsen
-- Rabinovich-Fabrikant
-- Three-Scroll Unified Chaotic System
-- Sprott
-- Four-Wing
-
-The source equations use mathematical powers like `x^2` and `z^3`; dynsys writes those as TPCAS-compatible calls such as `pow(x, 2)` and `pow(z, 3)`.
-
-## UI
-
-The control panel supports:
-
-- preset switching across Thomas, Langford/Aizawa, Lorenz, Dadras, Chen/Chen-Lee, Lorenz83, Rössler, Halvorsen, Rabinovich-Fabrikant, Three-Scroll Unified, Sprott, Four-Wing
-- editing the full system live
-- named parameters and auxiliary expressions
-- helper functions such as `wave(u) = sin(u)`
-- parse/runtime error display without crashing the app
-- start point, start time, `dt`, point-buffer, and speed controls
-- camera rotation, zoom, translation, axes, and crosshair controls
-
-## Controls
-
-The GUI is the primary control surface. Keyboard/mouse shortcuts are still available when ImGui is not capturing input:
-
-- mouse drag: rotate camera
-- mouse wheel: zoom
-- `w`, `a`, `s`, `d`: rotate camera
-- `-`, `=`: zoom
-- `z`: toggle crosshair
-- `x`: toggle axes
-- `c`: clear/reset
-- `spacebar`: pause/resume
-- `m`, `,`: decrease speed
-- `.`, `/`: increase speed
-- `j`, `l`: x translation
-- `i`, `k`: y translation
-- `p`, `;`: z translation
-- `v`, `b`: adjust `dt`
-- `Esc`: quit
-
-## Updating an existing dirty checkout
-
-If you copied this tree over an older dynsys checkout, remove the legacy FreeType/C entry point before building:
-
-```sh
-make prune-legacy
-make prune-legacy CLEAN_APPLY=1
-make clean
-make
-```
-
-The old file `src/dynsys.c` is not part of this package. The active entry point is `src/dynsys.cpp`.
-
-## Dynamic Mathematics preset provenance
-
-The built-in strange-attractor presets are transcribed from the Dynamic Mathematics strange-attractors page. The catalogue intentionally contains only the systems listed there: Thomas, Langford/Aizawa, Lorenz, Dadras, Chen/Chen-Lee, Lorenz83, Rössler, Halvorsen, Rabinovich-Fabrikant, Three-Scroll Unified Chaotic System, Sprott, and Four-Wing. Powers from the source notation such as `x^2` and `z^3` are written as `pow(x, 2)` and `pow(z, 3)` because dynsys currently exposes exponentiation as a builtin function rather than as a `^` operator.
+(Set as appropriate for your thesis context. The Scheme core inherits
+from the project's original licensing; the type-theory additions are
+the user's work.)

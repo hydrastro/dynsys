@@ -34,8 +34,18 @@
           lib = pkgs.lib;
           winPkgs = pkgsAllowUnsupported.pkgsCross.mingwW64;
           winTarget = winPkgs.stdenv.hostPlatform.config;
+          # Force GLFW to be built as a static MinGW library so the final
+          # executable does not need a glfw3.dll next to it.
+          winGlfwStatic = winPkgs.glfw3.overrideAttrs (old: {
+            cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+              "-DBUILD_SHARED_LIBS=OFF"
+              "-DGLFW_BUILD_DOCS=OFF"
+              "-DGLFW_BUILD_EXAMPLES=OFF"
+              "-DGLFW_BUILD_TESTS=OFF"
+            ];
+          });
           winTargetPkgs = [
-            winPkgs.glfw3
+            winGlfwStatic
           ];
           winTargetPkgOutputs = winTargetPkgs ++ (map lib.getDev winTargetPkgs);
           winPkgConfigPath = lib.makeSearchPath "lib/pkgconfig" winTargetPkgOutputs;
@@ -96,6 +106,8 @@
             PKG_CONFIG_ALLOW_CROSS = "1";
             PKG_CONFIG_LIBDIR = lib.concatStringsSep ":" [ winPkgConfigPath winPkgConfigSharePath ];
             PKG_CONFIG_SYSROOT_DIR = "";
+            PKG_CONFIG_ALLOW_SYSTEM_LIBS = "1";
+            PKG_CONFIG_ALLOW_SYSTEM_CFLAGS = "1";
 
             CC = "${winTarget}-gcc";
             CXX = "${winTarget}-g++";
@@ -118,11 +130,14 @@
               export PKG_CONFIG_ALLOW_CROSS=1
               export PKG_CONFIG_LIBDIR=${lib.escapeShellArg (lib.concatStringsSep ":" [ winPkgConfigPath winPkgConfigSharePath ])}
               export PKG_CONFIG_SYSROOT_DIR=
+              export PKG_CONFIG_ALLOW_SYSTEM_LIBS=1
+              export PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1
               export GLEW_DIR=${lib.escapeShellArg "${glew-src}"}
               export CGLM_INCLUDE_DIR=${lib.escapeShellArg "${lib.getDev pkgs.cglm}/include"}
               echo "dynsys Windows cross-build shell"
               echo "  target: ${winTarget}"
               echo "  build:  make windows"
+              echo "  link:   static MinGW runtime + static GLFW/GLEW; Windows system DLLs remain system-provided"
               echo "  output: build/windows/dynsys.exe"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  GLEW_DIR=$GLEW_DIR"

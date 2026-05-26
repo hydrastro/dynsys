@@ -9,6 +9,9 @@ namespace dynsys::ir {
 
 namespace {
 
+constexpr double kPi = 3.141592653589793238462643383279502884;
+constexpr double kE  = 2.718281828459045235360287471352662498;
+
 void set_err(std::string *err, const char *fmt, ...) {
     if (!err) return;
     char buf[512];
@@ -349,8 +352,8 @@ bool exec(const Program &program, const RunContext &ctx, Scratch &scratch,
             break;
         }
         case Op::PushT:  stack.push_back(ctx.t);  break;
-        case Op::PushPi: stack.push_back(M_PI);   break;
-        case Op::PushE:  stack.push_back(M_E);    break;
+        case Op::PushPi: stack.push_back(kPi);    break;
+        case Op::PushE:  stack.push_back(kE);     break;
 
         case Op::Neg:
             stack.back() = -stack.back();
