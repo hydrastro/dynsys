@@ -1,0 +1,11 @@
+# Van der Pol oscillator
+state x, y
+mode = ode
+integrator = rk4
+param mu = 1.0 [0,5]
+plot3d = x, y, 0
+observe energy_like = 0.5 * (x*x + y*y)
+initial x = 2
+initial y = 0
+dx = y
+dy = mu * (1 - x*x) * y - x

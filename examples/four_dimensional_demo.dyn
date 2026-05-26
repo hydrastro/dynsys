@@ -1,0 +1,17 @@
+state x, y, z, w
+mode = ode
+integrator = rk4
+param a = 0.1 [0,1]
+plot3d = x, y, w
+observe r4 = sqrt(x*x + y*y + z*z + w*w)
+section = w
+section_direction = positive
+section_plot = x, z
+initial x = 0.1
+initial y = 0
+initial z = 0
+initial w = 0.2
+dx = y
+dy = 0 - x - a*y + z
+dz = w
+dw = 0 - z - a*w + x

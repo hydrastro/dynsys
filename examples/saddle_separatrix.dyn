@@ -1,0 +1,11 @@
+# Linear saddle demo for fixed-point classification and separatrix tracing
+state x, y
+mode = ode
+integrator = rk4
+
+plot3d = x, y, 0
+initial x = 0.8
+initial y = 0.6
+
+dx = x
+dy = 0 - y

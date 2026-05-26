@@ -1,0 +1,13 @@
+# Lotka-Volterra predator-prey system
+state prey, predator
+mode = ode
+integrator = rk4
+param alpha = 1.1 [0,3]
+param beta = 0.4 [0,2]
+param delta = 0.1 [0,1]
+param gamma = 0.4 [0,2]
+plot3d = prey, predator, 0
+initial prey = 10
+initial predator = 5
+dprey = alpha * prey - beta * prey * predator
+dpredator = delta * prey * predator - gamma * predator

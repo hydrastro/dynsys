@@ -1,0 +1,18 @@
+state x, y, z
+mode = ode
+integrator = rk4
+
+param a = 0.2 [0,1]
+param b = 0.2 [0,1]
+param c = 5.7 [0,20]
+
+plot3d = x, y, z
+plot2d = x, y
+
+initial x = 0.1
+initial y = 0
+initial z = 0
+
+dx = 0 - y - z
+dy = x + a * y
+dz = b + z * (x - c)

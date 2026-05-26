@@ -1,0 +1,17 @@
+state x, y, z
+mode = ode
+integrator = rk4
+
+param b = 0.208186 [0,1]
+wave(u) = sin(u)
+
+plot3d = x, y, z
+plot2d = x, y
+
+initial x = 0.1
+initial y = 0
+initial z = 0
+
+dx = wave(y) - b * x
+dy = wave(z) - b * y
+dz = wave(x) - b * z

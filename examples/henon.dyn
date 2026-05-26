@@ -1,0 +1,7 @@
+state x, y
+mode = map
+param a = 1.4 [0,2]
+param b = 0.3 [0,1]
+plot3d = x, y, 0
+x_next = 1 - a * x * x + y
+y_next = b * x

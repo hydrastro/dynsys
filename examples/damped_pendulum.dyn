@@ -1,0 +1,10 @@
+# Autonomous damped pendulum
+state theta, omega
+mode = ode
+integrator = rk4
+param damping = 0.15 [0,2]
+plot3d = theta, omega, 0
+initial theta = 2.5
+initial omega = 0
+dtheta = omega
+domega = 0 - sin(theta) - damping * omega

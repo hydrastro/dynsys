@@ -1,9 +1,16 @@
 # dynsys — GLFW/OpenGL dynamical-system visualizer with Dear ImGui + TPCAS
 #
-# Normal workflow:
+# Native Linux workflow:
 #   nix develop
 #   make
 #   make run
+#
+# Windows cross-build workflow from NixOS:
+#   nix develop .#windows
+#   make windows
+#
+# The Windows build writes build/windows/dynsys.exe so it does not reuse
+# native Linux object files.
 
 CC         ?= cc
 CXX        ?= c++
@@ -14,24 +21,64 @@ MKDIR_P    ?= mkdir -p
 INSTALL    ?= install
 PKG_CONFIG ?= pkg-config
 
+# Set TARGET_OS=windows directly, or use `make windows` / `make build-windows`.
+TARGET_OS ?= native
+HOST_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null || echo unknown)
+WINDOWS_BUILD := 0
+ifeq ($(TARGET_OS),windows)
+  WINDOWS_BUILD := 1
+else ifneq (,$(findstring mingw,$(HOST_TRIPLE)))
+  WINDOWS_BUILD := 1
+else ifneq (,$(findstring windows,$(HOST_TRIPLE)))
+  WINDOWS_BUILD := 1
+endif
+
+BUILD_ROOT ?= build
+ifeq ($(WINDOWS_BUILD),1)
+  EXEEXT ?= .exe
+  BUILD_DIR := $(BUILD_ROOT)/windows
+else
+  EXEEXT ?=
+  BUILD_DIR := $(BUILD_ROOT)
+endif
+
 SRC_DIR    := src
 TPCAS_DIR  := vendor/tpcas
 DS_DIR     := $(TPCAS_DIR)/vendor/ds/lib
-BUILD_DIR  := build
 OBJ_DIR    := $(BUILD_DIR)/obj
 C_OBJ_DIR  := $(BUILD_DIR)/obj-c
 CXX_OBJ_DIR:= $(BUILD_DIR)/obj-cxx
 DEP_DIR    := $(BUILD_DIR)/dep
 C_DEP_DIR  := $(BUILD_DIR)/dep-c
 CXX_DEP_DIR:= $(BUILD_DIR)/dep-cxx
-TARGET     := $(BUILD_DIR)/dynsys
+TARGET     := $(BUILD_DIR)/dynsys$(EXEEXT)
+IR_TEST_TARGET := $(BUILD_DIR)/ir_smoke$(EXEEXT)
+TEST_OBJ_DIR := $(BUILD_DIR)/obj-test
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
 MODE ?= debug
-PKGS ?= glfw3 glew cglm
+PKGS_NATIVE ?= glfw3 glew cglm
+PKGS_WINDOWS ?= glfw3
+ifeq ($(WINDOWS_BUILD),1)
+  PKGS ?= $(PKGS_WINDOWS)
+else
+  PKGS ?= $(PKGS_NATIVE)
+endif
 IMGUI_DIR ?=
+CGLM_INCLUDE_DIR ?=
+GLEW_DIR ?=
+
+# Used by the recursive `make windows` target. Override these if your MinGW
+# toolchain uses different names.
+WIN_TRIPLE ?= x86_64-w64-mingw32
+WIN_CC ?= $(WIN_TRIPLE)-gcc
+WIN_CXX ?= $(WIN_TRIPLE)-g++
+WIN_AR ?= $(WIN_TRIPLE)-ar
+WIN_PKG_CONFIG ?= pkg-config
+WIN_BUILD_DIR ?= $(BUILD_ROOT)/windows
+WIN_TARGET ?= $(WIN_BUILD_DIR)/dynsys.exe
 
 WARNINGS_C   := -Wall -Wextra -Wpedantic
 WARNINGS_CXX := -Wall -Wextra
@@ -46,6 +93,15 @@ CPPFLAGS += -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds $(PKG_CFLAG
 ifneq ($(strip $(IMGUI_DIR)),)
   CPPFLAGS += -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
 endif
+ifeq ($(WINDOWS_BUILD),1)
+  CPPFLAGS += -D_WIN32_WINNT=0x0601 -DGLEW_STATIC
+  ifneq ($(strip $(CGLM_INCLUDE_DIR)),)
+    CPPFLAGS += -I$(CGLM_INCLUDE_DIR)
+  endif
+  ifneq ($(strip $(GLEW_DIR)),)
+    CPPFLAGS += -I$(GLEW_DIR)/include
+  endif
+endif
 
 CFLAGS ?=
 CFLAGS += $(CSTD) $(WARNINGS_C)
@@ -53,7 +109,18 @@ CXXFLAGS ?=
 CXXFLAGS += $(CXXSTD) $(WARNINGS_CXX)
 LDFLAGS ?=
 LDLIBS ?=
-LDLIBS += $(PKG_LIBS) -lGL -ldl -lm
+
+ifeq ($(WINDOWS_BUILD),1)
+  # MinGW/Windows OpenGL + GLFW backend system libraries. GLEW is compiled
+  # from source into this project for Windows, so do not link -lglew32 here.
+  LDLIBS += $(PKG_LIBS) -lopengl32 -lgdi32 -limm32 -lole32 -luuid -lwinmm -lm
+  WIN_STATIC_RUNTIME ?= 1
+  ifeq ($(WIN_STATIC_RUNTIME),1)
+    LDFLAGS += -static-libgcc -static-libstdc++
+  endif
+else
+  LDLIBS += $(PKG_LIBS) -lGL -ldl -lm
+endif
 
 ifeq ($(MODE),release)
   CFLAGS += -O2 -DNDEBUG
@@ -67,9 +134,12 @@ else
   CXXFLAGS += -O0 -g3
 endif
 
-DYNSYS_CPP_SRCS := $(SRC_DIR)/dynsys.cpp
+DYNSYS_CPP_SRCS := $(SRC_DIR)/dynsys.cpp $(SRC_DIR)/expr_ir.cpp
 DYNSYS_OBJS := $(patsubst %.cpp,$(CXX_OBJ_DIR)/%.o,$(DYNSYS_CPP_SRCS))
 DYNSYS_DEPS := $(patsubst %.cpp,$(CXX_DEP_DIR)/%.d,$(DYNSYS_CPP_SRCS))
+
+IR_TEST_CPP_SRCS := $(SRC_DIR)/expr_ir.cpp test/ir_smoke.cpp
+IR_TEST_CPP_OBJS := $(patsubst %.cpp,$(TEST_OBJ_DIR)/%.o,$(IR_TEST_CPP_SRCS))
 
 TPCAS_SRCS := \
   $(TPCAS_DIR)/src/arena.c \
@@ -86,6 +156,15 @@ DS_SRCS := \
 C_SRCS := $(TPCAS_SRCS) $(DS_SRCS)
 C_OBJS := $(patsubst %.c,$(C_OBJ_DIR)/%.o,$(C_SRCS))
 C_DEPS := $(patsubst %.c,$(C_DEP_DIR)/%.d,$(C_SRCS))
+ifeq ($(WINDOWS_BUILD),1)
+  GLEW_OBJ := $(C_OBJ_DIR)/glew/glew.o
+  GLEW_DEP := $(C_DEP_DIR)/glew/glew.d
+else
+  GLEW_OBJ :=
+  GLEW_DEP :=
+endif
+IR_TEST_C_OBJS := $(patsubst %.c,$(TEST_OBJ_DIR)/%.o,$(C_SRCS))
+IR_TEST_OBJS := $(IR_TEST_CPP_OBJS) $(IR_TEST_C_OBJS)
 
 IMGUI_CORE_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp
 IMGUI_BACKEND_SRCS := imgui_impl_glfw.cpp imgui_impl_opengl3.cpp
@@ -94,22 +173,58 @@ IMGUI_BACKEND_OBJS := $(addprefix $(CXX_OBJ_DIR)/imgui/backends/,$(IMGUI_BACKEND
 IMGUI_OBJS := $(IMGUI_CORE_OBJS) $(IMGUI_BACKEND_OBJS)
 IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 
-OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(IMGUI_OBJS)
-DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(IMGUI_DEPS)
+OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
+DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all check-deps check-legacy prune-legacy run debug release asan clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
+build: all
+
+windows build-windows:
+	$(MAKE) TARGET_OS=windows \
+	  BUILD_DIR="$(WIN_BUILD_DIR)" \
+	  TARGET="$(WIN_TARGET)" \
+	  CC="$(WIN_CC)" \
+	  CXX="$(WIN_CXX)" \
+	  AR="$(WIN_AR)" \
+	  PKG_CONFIG="$(WIN_PKG_CONFIG)" \
+	  PKGS="$(PKGS_WINDOWS)"
+
 check-deps:
+	@if [ "$(WINDOWS_BUILD)" = "1" ] && ! command -v "$(CXX)" >/dev/null 2>&1; then \
+	  echo "error: Windows cross compiler not found: $(CXX)" >&2; \
+	  echo "hint: enter the shell first: nix develop .#windows" >&2; \
+	  exit 1; \
+	fi
 	@$(PKG_CONFIG) --exists $(PKGS) || { \
 	  echo "error: missing pkg-config dependencies: $(PKGS)" >&2; \
-	  echo "hint: run 'nix develop' first, then run 'make' again." >&2; \
+	  if [ "$(WINDOWS_BUILD)" = "1" ]; then \
+	    echo "hint: run 'nix develop .#windows' first, then run 'make windows' again." >&2; \
+	  else \
+	    echo "hint: run 'nix develop' first, then run 'make' again." >&2; \
+	  fi; \
 	  exit 1; \
 	}
+	@if [ "$(WINDOWS_BUILD)" = "1" ]; then \
+	  printf '#include <cglm/cglm.h>\n' | $(CC) $(CPPFLAGS) -x c -E - >/dev/null 2>&1 || { \
+	    echo "error: cglm headers not found for the Windows build" >&2; \
+	    echo "hint: enter the updated shell with: nix develop .#windows" >&2; \
+	    echo "      or set CGLM_INCLUDE_DIR=/path/to/cglm/include" >&2; \
+	    exit 1; \
+	  }; \
+	  test -f "$(GLEW_DIR)/src/glew.c" || { \
+	    echo "error: GLEW_DIR does not contain generated GLEW source: $(GLEW_DIR)/src/glew.c" >&2; \
+	    echo "hint: use the updated flake that points glew-src at the official glew-2.2.0.tgz release archive," >&2; \
+	    echo "      then refresh the lock file with: nix flake lock --update-input glew-src" >&2; \
+	    echo "      or set GLEW_DIR=/path/to/unpacked/glew-2.2.0-release" >&2; \
+	    exit 1; \
+	  }; \
+	fi
 	@if [ -z "$(strip $(IMGUI_DIR))" ]; then \
 	  echo "error: IMGUI_DIR is not set" >&2; \
-	  echo "hint: run 'nix develop' first; the flake exports IMGUI_DIR." >&2; \
+	  echo "hint: run 'nix develop' or 'nix develop .#windows' first; the flake exports IMGUI_DIR." >&2; \
 	  echo "      or run: make IMGUI_DIR=/path/to/imgui" >&2; \
 	  exit 1; \
 	fi
@@ -117,7 +232,6 @@ check-deps:
 	  echo "error: IMGUI_DIR does not point at a Dear ImGui source tree: $(IMGUI_DIR)" >&2; \
 	  exit 1; \
 	}
-
 
 check-legacy:
 	@if [ -f "$(SRC_DIR)/dynsys.c" ]; then \
@@ -143,6 +257,10 @@ $(CXX_OBJ_DIR)/%.o: %.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
+$(GLEW_OBJ): $(GLEW_DIR)/src/glew.c
+	@$(MKDIR_P) $(dir $@) $(dir $(GLEW_DEP))
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF $(GLEW_DEP) -c $< -o $@
+
 $(CXX_OBJ_DIR)/imgui/%.o: $(IMGUI_DIR)/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
@@ -151,8 +269,39 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
+test: ir-smoke
+
+ir-smoke: $(IR_TEST_TARGET)
+	./$(IR_TEST_TARGET)
+
+$(IR_TEST_TARGET): $(IR_TEST_OBJS)
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(IR_TEST_OBJS) -lm
+
+$(TEST_OBJ_DIR)/%.o: %.c
+	@$(MKDIR_P) $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(TEST_OBJ_DIR)/%.o: %.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
 run: all
 	./$(TARGET)
+
+headless: all
+	./$(TARGET) --headless $(ARGS)
+
+headless-ast: all
+	./$(TARGET) --headless $(ARGS) --use-ast
+
+headless-smoke: all
+	./$(TARGET) --headless examples/lorenz.dyn --steps 10000
+
+bench:
+	$(MAKE) MODE=release
+	./$(TARGET) --headless examples/lorenz.dyn --steps 200000
+	./$(TARGET) --headless examples/lorenz.dyn --steps 200000 --use-ast
 
 debug:
 	$(MAKE) MODE=debug
@@ -165,24 +314,30 @@ asan:
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
-	$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/dynsys
+	$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/dynsys$(EXEEXT)
 
 uninstall:
-	$(RM) $(DESTDIR)$(BINDIR)/dynsys
+	$(RM) $(DESTDIR)$(BINDIR)/dynsys $(DESTDIR)$(BINDIR)/dynsys.exe
 
 clean:
-	$(RMDIR) $(BUILD_DIR)
+	$(RMDIR) $(BUILD_ROOT)
 
 distclean: clean
 	$(RM) result
 
 format:
-	clang-format -i $(SRC_DIR)/*.cpp
+	clang-format -i $(SRC_DIR)/*.cpp $(SRC_DIR)/*.h test/*.cpp
 
 print-vars:
 	@echo "CC=$(CC)"
 	@echo "CXX=$(CXX)"
+	@echo "AR=$(AR)"
+	@echo "PKG_CONFIG=$(PKG_CONFIG)"
+	@echo "HOST_TRIPLE=$(HOST_TRIPLE)"
+	@echo "TARGET_OS=$(TARGET_OS)"
+	@echo "WINDOWS_BUILD=$(WINDOWS_BUILD)"
 	@echo "MODE=$(MODE)"
+	@echo "BUILD_DIR=$(BUILD_DIR)"
 	@echo "TARGET=$(TARGET)"
 	@echo "C_OBJ_DIR=$(C_OBJ_DIR)"
 	@echo "CXX_OBJ_DIR=$(CXX_OBJ_DIR)"
@@ -190,16 +345,17 @@ print-vars:
 	@echo "IMGUI_DIR=$(IMGUI_DIR)"
 	@echo "PKG_CFLAGS=$(PKG_CFLAGS)"
 	@echo "PKG_LIBS=$(PKG_LIBS)"
+	@echo "LDLIBS=$(LDLIBS)"
 
 help:
 	@echo "Targets:"
-	@echo "  make             build $(TARGET)"
-	@echo "  make run         build and run"
-	@echo "  make release     optimized build"
-	@echo "  make asan        Address/UBSan build"
-	@echo "  make clean       remove build artifacts"
-	@echo "  make prune-legacy dry-run removal of old C/FreeType tree artifacts"
-	@echo "  make prune-legacy CLEAN_APPLY=1 apply legacy cleanup"
-	@echo "  make format      clang-format src/*.cpp"
+	@echo "  make                 build native $(TARGET)"
+	@echo "  make run             build and run native executable"
+	@echo "  make windows         cross-build build/windows/dynsys.exe"
+	@echo "  make build-windows   same as make windows"
+	@echo "  make test            build and run standalone IR smoke test"
+	@echo "  make headless        run headless; pass ARGS='examples/lorenz.dyn --steps 10000'"
+	@echo "  make bench           release IR/AST headless comparison on Lorenz"
+	@echo "  make release         optimized native build"
 
 -include $(DEPS)
