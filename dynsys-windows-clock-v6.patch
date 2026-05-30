@@ -1,0 +1,32 @@
+diff -ruN src/dynsys.cpp src/dynsys.cpp
+--- src/dynsys.cpp	2026-05-26 13:28:56.293865577 +0000
++++ src/dynsys.cpp	2026-05-26 13:28:56.305364398 +0000
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cerrno>
+ #include <cctype>
+ #include <cmath>
+@@ -3496,8 +3497,7 @@
+   std::printf("\n");
+ 
+   char step_err[256] = {0};
+-  struct timespec t0, t1;
+-  clock_gettime(CLOCK_MONOTONIC, &t0);
++  const auto t0 = std::chrono::steady_clock::now();
+   for (long long s = 0; s < steps; ++s) {
+     State next{};
+     if (!step_state(app, app.current, &next, step_err, sizeof step_err)) {
+@@ -3513,8 +3513,8 @@
+       std::printf("\n");
+     }
+   }
+-  clock_gettime(CLOCK_MONOTONIC, &t1);
+-  const double elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
++  const auto t1 = std::chrono::steady_clock::now();
++  const double elapsed_ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+ 
+   std::printf("final:   t=%.6f", app.current.t);
+   for (size_t i = 0; i < app.state_names.size(); ++i) {

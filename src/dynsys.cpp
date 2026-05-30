@@ -34,6 +34,9 @@ extern "C" {
 
 #include "expr_ir.h"
 
+#include "analysis.h"
+#include "expr_ir_ad.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -78,7 +81,7 @@ State make_state_like(size_t dim, double time = 0.0) {
   return State(dim, 0.0, time);
 }
 
-std::string join_names(const std::vector<std::string> &names) {
+[[maybe_unused]] std::string join_names(const std::vector<std::string> &names) {
   std::string out;
   for (size_t i = 0; i < names.size(); ++i) {
     if (i) out += ", ";
@@ -194,6 +197,10 @@ struct AppState {
   std::vector<dynsys::ir::Program> observable_programs;
   std::vector<double> param_values;
   dynsys::ir::Scratch eval_scratch;
+  /* PHASE3: scratch for the forward-mode-AD executor used by the
+   * analysis layer to build exact Jacobian columns and df/dp. Sized
+   * to the def count whenever the system recompiles. */
+  dynsys::ir::DualScratch ad_scratch;
 
   /* When true, hot-path callers (eval_rhs, step_map_state,
    * eval_plot3d, maybe_record_poincare, value_by_name) fall back to
@@ -246,6 +253,14 @@ struct AppState {
   float phase_x_max = 20.0f;
   float phase_y_min = -20.0f;
   float phase_y_max = 20.0f;
+  /* PHASE0/6: smoothed auto-bounds. The raw data extent is recomputed
+   * each frame, but the displayed window eases toward it and only grows
+   * (or shrinks slowly when the data has shrunk for a while), so a
+   * wandering or converging orbit no longer makes the view jitter or
+   * collapse frame-to-frame. */
+  bool phase_bounds_valid = false;
+  double phase_view_xmin = -1.0, phase_view_xmax = 1.0;
+  double phase_view_ymin = -1.0, phase_view_ymax = 1.0;
   int phase_grid = 21;
   bool phase_equal_aspect = true;
   bool phase_normalize_vectors = true;
@@ -308,6 +323,22 @@ struct AppState {
   std::vector<PhaseTrajectory> separatrix_curves;
   int separatrix_steps = 2500;
   double separatrix_epsilon = 1e-4;
+
+  /* PHASE1/2: general (N-D) equilibrium analysis + equilibrium
+   * continuation. fixed_eigenvalues above is kept for the legacy 2D
+   * panel; this richer classification works in any dimension. */
+  dynsys::analysis::Classification fixed_general{};
+  bool fixed_general_ready = false;
+  char cont_param[64] = "rho";
+  double cont_p_min = -10.0;
+  double cont_p_max = 110.0;
+  double cont_h0 = 0.05;
+  int cont_max_points = 600;
+  int cont_direction = 1;
+  bool cont_detect_fold = true;
+  bool cont_detect_hopf = true;
+  dynsys::analysis::Branch cont_branch{};
+  bool cont_ready = false;
 
   KeyState keys[GLFW_KEY_LAST + 1]{};
   bool mouse_left_pressed = false;
@@ -582,7 +613,7 @@ int state_index_for_name(const std::vector<std::string> &state_names, const std:
   return -1;
 }
 
-int state_index_for_name(const AppState &app, const std::string &name) {
+[[maybe_unused]] int state_index_for_name(const AppState &app, const std::string &name) {
   return state_index_for_name(app.state_names, name);
 }
 
@@ -642,7 +673,7 @@ AppState::Param *find_param(AppState &app, const std::string &name) {
   return nullptr;
 }
 
-const AppState::Param *find_param(const AppState &app, const std::string &name) {
+[[maybe_unused]] const AppState::Param *find_param(const AppState &app, const std::string &name) {
   for (const auto &param : app.params) {
     if (param.name == name) {
       return &param;
@@ -651,7 +682,7 @@ const AppState::Param *find_param(const AppState &app, const std::string &name) 
   return nullptr;
 }
 
-const AppState::Observable *find_observable(const AppState &app, const std::string &name) {
+[[maybe_unused]] const AppState::Observable *find_observable(const AppState &app, const std::string &name) {
   for (const auto &obs : app.observables) {
     if (obs.name == name) {
       return &obs;
@@ -906,7 +937,7 @@ bool eval_ast(EvalContext &ctx, const node_t *ast, double *out, char *err,
 
 bool eval_expr_at(AppState &app, node_t *expr, const State &state, double *out,
                   char *err, size_t err_cap) {
-  EvalContext ctx{app};
+  EvalContext ctx{app, State{}, {}, {}, {}, {}};
   ctx.state = state;
   ctx.active.assign(app.definitions.size(), 0);
   ctx.cached.assign(app.definitions.size(), false);
@@ -977,7 +1008,7 @@ static void add_scaled_into(const State &base, const State &k, double h,
   }
 }
 
-State add_scaled(const State &s, const State &k, double h) {
+[[maybe_unused]] State add_scaled(const State &s, const State &k, double h) {
   const size_t dim = std::max(s.v.size(), k.v.size());
   State out = make_state_like(dim, s.t + h * k.t);
   for (size_t i = 0; i < dim; ++i) {
@@ -1125,6 +1156,14 @@ std::string extract_param_expr_and_range(const std::string &rhs_raw,
 }
 
 bool compile_system(AppState &app, const char *system_text, std::string *error) {
+  /* PHASE0: remember the pre-compile state signature so we can decide,
+   * after a successful compile, what analysis to keep vs. invalidate.
+   * A located equilibrium is tied to the equations and is cleared on
+   * any recompile; user-seeded orbits are kept as long as the state
+   * variables (count + names) are unchanged, since their coordinates
+   * still mean the same thing. */
+  const std::vector<std::string> prev_state_names = app.state_names;
+
   const std::vector<std::string> lines = split_lines(system_text);
 
   std::vector<std::string> next_state_names = {"x", "y", "z"};
@@ -1593,6 +1632,8 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
    * arrays are right. Also pre-size the integrator scratch states
    * so the hot loop never reallocates. */
   dynsys::ir::scratch_init(&app.eval_scratch, app.definition_programs.size());
+  dynsys::ir::dual_scratch_init(&app.ad_scratch,
+                                app.definition_programs.size());
   resize_state(app.scratch_k1,  dim);
   resize_state(app.scratch_k2,  dim);
   resize_state(app.scratch_k3,  dim);
@@ -1710,8 +1751,24 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   app.runtime_error.clear();
   app.poincare_points.clear();
   app.have_last_section = false;
+
+  /* PHASE0: equation-tied analysis is always stale after a recompile —
+   * the located equilibrium, its Jacobian/spectrum, and the saddle
+   * separatrices were computed for the previous vector field. Clear
+   * them. */
   app.fixed_ready = false;
   app.fixed_jacobian.clear();
+  app.fixed_classification.clear();
+  app.fixed_eigenvalues.clear();
+  app.separatrix_curves.clear();
+
+  /* User-seeded extra orbits keep their meaning as long as the state
+   * variables are the same (same count and names). If the state space
+   * itself changed, their stored coordinates no longer correspond, so
+   * drop them; otherwise keep them on screen. */
+  if (app.state_names != prev_state_names) {
+    app.phase_trajectories.clear();
+  }
   return true;
 }
 
@@ -1819,6 +1876,12 @@ void allocate_points(AppState &app) {
   app.points.assign(static_cast<size_t>(app.num_points), Point{0.0f, 0.0f, 0.0f});
   app.colors.assign(static_cast<size_t>(app.num_points) * 3U, 0.0f);
   app.current_point = 0;
+  /* PHASE0: the phase/series views read app.history while the 3D view
+   * reads app.points[]. Keeping two independent length caps made the
+   * two plots disagree about where the orbit began. Tie the history
+   * cap to the 3D buffer so both views show the same span of the same
+   * orbit. */
+  app.history_limit = app.num_points;
 }
 
 void reset_lyapunov(AppState &app) {
@@ -1840,6 +1903,7 @@ void reset_simulation(AppState &app) {
   app.current_point = 0;
   app.current = app.start;
   resize_state(app.current, app.state_names.size());
+  app.phase_bounds_valid = false; /* PHASE6: re-seed the eased view */
   for (int i = 0; i < app.num_points; ++i) {
     app.points[static_cast<size_t>(i)] = Point{0.0f, 0.0f, 0.0f};
     app.colors[static_cast<size_t>(i) * 3U + 0U] = 1.0f;
@@ -1851,12 +1915,13 @@ void reset_simulation(AppState &app) {
   app.have_last_section = false;
   reset_lyapunov(app);
   app.runtime_error.clear();
-  app.phase_trajectories.clear();
-  app.separatrix_curves.clear();
-  app.fixed_ready = false;
-  app.fixed_jacobian.clear();
-  app.fixed_classification.clear();
-  app.fixed_eigenvalues.clear();
+  /* PHASE0: reset_simulation now resets ONLY the running orbit and its
+   * derived buffers. It no longer wipes the analysis layer (extra
+   * orbits, separatrices, located equilibria). That layer is cleared
+   * explicitly via clear_analysis_objects() at the points where it is
+   * genuinely invalidated (see compile_system / equation edits), so a
+   * plain reset or a parameter tweak keeps the user's analysis on
+   * screen instead of silently forgetting it. */
 }
 
 void upload_buffers(AppState &app) {
@@ -1959,7 +2024,7 @@ void step_phase_trajectories(AppState &app) {
   }
 }
 
-void clear_analysis_objects(AppState &app) {
+[[maybe_unused]] void clear_analysis_objects(AppState &app) {
   app.phase_trajectories.clear();
   app.separatrix_curves.clear();
   app.fixed_ready = false;
@@ -2266,10 +2331,31 @@ void draw_axes(AppState &app) {
   glDeleteBuffers(1, &axes_vbo);
 }
 
+/* PHASE6: a system is worth showing in the 3D OpenGL view only when it
+ * actually has three independent dimensions to look at. A 2D system
+ * (two state variables, projected as x,y,0) would just duplicate the
+ * phase plane, so we skip the 3D geometry and show a note instead. */
+bool system_is_3d(const AppState &app) {
+  return app.state_names.size() >= 3;
+}
+
 void draw_scene(AppState &app) {
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  if (!system_is_3d(app)) {
+    /* 2D (or 1D) system: the 3D backdrop would just duplicate the phase
+     * plane, so we don't render the orbit here. Instead of leaving a
+     * blank/garbage framebuffer, paint a clean hint on the background
+     * draw list pointing the user at the phase-plane panel. */
+    ImDrawList *bg = ImGui::GetBackgroundDrawList();
+    const float cx = app.window_width * 0.5f;
+    const float cy = app.window_height * 0.5f;
+    const char *msg = "2D system";
+    const char *sub = "see the \"phase plane\" tab for the 2D view";
+    bg->AddText(ImVec2(cx - 36, cy - 14), IM_COL32(150, 160, 180, 200), msg);
+    bg->AddText(ImVec2(cx - 150, cy + 6), IM_COL32(120, 130, 150, 180), sub);
+    return;
+  }
   glEnable(GL_DEPTH_TEST);
-  glUseProgram(app.shader_program);
   mat4 model, view;
   glm_mat4_identity(model);
   glm_mat4_identity(view);
@@ -2373,11 +2459,26 @@ void set_manual_phase_bounds(AppState &app, const PlotBounds &b) {
 }
 
 void zoom_phase_bounds(AppState &app, PlotBounds b, const Point2 &anchor, double factor) {
-  factor = std::max(0.05, std::min(factor, 20.0));
-  b.xmin = anchor.x + (b.xmin - anchor.x) * factor;
-  b.xmax = anchor.x + (b.xmax - anchor.x) * factor;
-  b.ymin = anchor.y + (b.ymin - anchor.y) * factor;
-  b.ymax = anchor.y + (b.ymax - anchor.y) * factor;
+  /* Zoom about the cursor: scale the span by `factor`, keeping the
+   * anchor point fixed in data space. `b` is the bounds actually being
+   * displayed (already equalized for the canvas), so writing the result
+   * straight to the manual bounds makes the zoom stick exactly — the
+   * next frame reads these manual values back without re-deriving them
+   * from data. */
+  factor = std::max(0.02, std::min(factor, 50.0));
+  const double new_w = (b.xmax - b.xmin) * factor;
+  const double new_h = (b.ymax - b.ymin) * factor;
+  /* keep anchor's fractional position within the view fixed */
+  const double fx = (b.xmax - b.xmin) > 1e-300
+                        ? (anchor.x - b.xmin) / (b.xmax - b.xmin)
+                        : 0.5;
+  const double fy = (b.ymax - b.ymin) > 1e-300
+                        ? (anchor.y - b.ymin) / (b.ymax - b.ymin)
+                        : 0.5;
+  b.xmin = anchor.x - fx * new_w;
+  b.xmax = b.xmin + new_w;
+  b.ymin = anchor.y - fy * new_h;
+  b.ymax = b.ymin + new_h;
   set_manual_phase_bounds(app, b);
 }
 
@@ -2487,6 +2588,38 @@ PlotBounds current_phase_bounds(AppState &app, size_t ix, size_t iy) {
   const double padx = 0.06 * (b.xmax - b.xmin);
   const double pady = 0.06 * (b.ymax - b.ymin);
   b.xmin -= padx; b.xmax += padx; b.ymin -= pady; b.ymax += pady;
+
+  /* PHASE6: stable auto-fit. Rather than snapping to the exact data
+   * extent every frame (which made the view twitch as the orbit moved)
+   * or easing (which lagged), we hold a fixed view and only grow it
+   * when the data actually leaves it, with a small margin so we don't
+   * grow on every step. The view never shrinks on its own — use
+   * double-click to refit. This matches how pplane shows a steady
+   * window you can watch the orbit fill. */
+  if (app.phase_auto_bounds) {
+    if (!app.phase_bounds_valid) {
+      app.phase_view_xmin = b.xmin; app.phase_view_xmax = b.xmax;
+      app.phase_view_ymin = b.ymin; app.phase_view_ymax = b.ymax;
+      app.phase_bounds_valid = true;
+    } else {
+      /* Grow to include new data, with a 10% margin added when growing
+       * so we make room in chunks instead of nudging every frame. */
+      auto grow_lo = [](double cur, double want) {
+        if (want < cur) return want - 0.10 * std::fabs(cur - want) - 1e-9;
+        return cur;
+      };
+      auto grow_hi = [](double cur, double want) {
+        if (want > cur) return want + 0.10 * std::fabs(want - cur) + 1e-9;
+        return cur;
+      };
+      app.phase_view_xmin = grow_lo(app.phase_view_xmin, b.xmin);
+      app.phase_view_xmax = grow_hi(app.phase_view_xmax, b.xmax);
+      app.phase_view_ymin = grow_lo(app.phase_view_ymin, b.ymin);
+      app.phase_view_ymax = grow_hi(app.phase_view_ymax, b.ymax);
+    }
+    b.xmin = app.phase_view_xmin; b.xmax = app.phase_view_xmax;
+    b.ymin = app.phase_view_ymin; b.ymax = app.phase_view_ymax;
+  }
   return b;
 }
 
@@ -2504,42 +2637,107 @@ void draw_arrow(ImDrawList *draw, ImVec2 a, ImVec2 b, ImU32 color) {
   draw->AddTriangleFilled(b, p1, p2, color);
 }
 
-void draw_nullcline_for_component(AppState &app, ImDrawList *draw, const PlotBounds &bounds, const ImVec2 &p0, float w, float h, size_t ix, size_t iy, size_t component, ImU32 color) {
-  const int grid = std::max(8, std::min(app.phase_grid, 80));
+/* PHASE6: pplane-style nullclines via proper marching squares.
+ *
+ * We sample the chosen vector-field component on a regular grid of
+ * (grid+1) x (grid+1) NODES once (so each node is evaluated a single
+ * time and adjacent cells share node values — no seams, ~4x fewer
+ * evals than the old per-cell sampling). For each cell we then emit
+ * the marching-squares contour of f == 0 using the full 16-case
+ * table, including both diagonals for the ambiguous saddle cases, and
+ * draw it as a smooth thick polyline so it reads like pplane's
+ * nullclines rather than a scatter of disconnected ticks. */
+void draw_nullcline_for_component(AppState &app, ImDrawList *draw,
+                                  const PlotBounds &bounds, const ImVec2 &p0,
+                                  float w, float h, size_t ix, size_t iy,
+                                  size_t component, ImU32 color) {
+  const int grid = std::max(8, std::min(app.phase_grid, 120));
+  const int nx = grid + 1;
+  const int ny = grid + 1;
   const double dx = (bounds.xmax - bounds.xmin) / static_cast<double>(grid);
   const double dy = (bounds.ymax - bounds.ymin) / static_cast<double>(grid);
   char err[256] = {0};
-  for (int gy = 0; gy < grid; ++gy) {
-    for (int gx = 0; gx < grid; ++gx) {
-      struct Sample { double x, y, f; bool ok; } s4[4];
-      const double xs[2] = {bounds.xmin + gx * dx, bounds.xmin + (gx + 1) * dx};
-      const double ys[2] = {bounds.ymin + gy * dy, bounds.ymin + (gy + 1) * dy};
-      const int corners[4][2] = {{0,0},{1,0},{1,1},{0,1}};
-      for (int k = 0; k < 4; ++k) {
-        State st = app.current;
-        resize_state(st, app.state_names.size());
-        set_state_at(st, ix, xs[corners[k][0]]);
-        set_state_at(st, iy, ys[corners[k][1]]);
-        double f = 0.0;
-        const bool ok = eval_phase_component(app, st, component, &f, err, sizeof(err)) && std::isfinite(f);
-        s4[k] = Sample{xs[corners[k][0]], ys[corners[k][1]], f, ok};
-      }
-      std::vector<Point2> crosses;
-      const int edges[4][2] = {{0,1},{1,2},{2,3},{3,0}};
-      for (const auto &edge : edges) {
-        const Sample &a = s4[edge[0]];
-        const Sample &b = s4[edge[1]];
-        if (!a.ok || !b.ok) continue;
-        if ((a.f <= 0.0 && b.f >= 0.0) || (a.f >= 0.0 && b.f <= 0.0)) {
-          const double denom = std::fabs(a.f) + std::fabs(b.f);
-          const double t = denom > 0.0 ? std::fabs(a.f) / denom : 0.5;
-          crosses.push_back(Point2{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t});
-        }
-      }
-      if (crosses.size() >= 2) {
-        const Point2 a = plot_to_screen(bounds, p0, w, h, crosses[0].x, crosses[0].y);
-        const Point2 b = plot_to_screen(bounds, p0, w, h, crosses[1].x, crosses[1].y);
-        draw->AddLine(ImVec2(static_cast<float>(a.x), static_cast<float>(a.y)), ImVec2(static_cast<float>(b.x), static_cast<float>(b.y)), color, 1.4f);
+
+  /* Sample nodes once. */
+  std::vector<double> f(static_cast<size_t>(nx) * ny, 0.0);
+  std::vector<uint8_t> ok(static_cast<size_t>(nx) * ny, 0);
+  State st = app.current;
+  resize_state(st, app.state_names.size());
+  for (int j = 0; j < ny; ++j) {
+    const double y = bounds.ymin + j * dy;
+    for (int i = 0; i < nx; ++i) {
+      const double x = bounds.xmin + i * dx;
+      set_state_at(st, ix, x);
+      set_state_at(st, iy, y);
+      double val = 0.0;
+      const bool good =
+          eval_phase_component(app, st, component, &val, err, sizeof(err)) &&
+          std::isfinite(val);
+      const size_t idx = static_cast<size_t>(j) * nx + i;
+      f[idx] = val;
+      ok[idx] = good ? 1u : 0u;
+    }
+  }
+
+  auto node = [&](int i, int j) -> double { return f[static_cast<size_t>(j) * nx + i]; };
+  auto good = [&](int i, int j) -> bool { return ok[static_cast<size_t>(j) * nx + i] != 0; };
+  auto screen = [&](double x, double y) {
+    const Point2 q = plot_to_screen(bounds, p0, w, h, x, y);
+    return ImVec2(static_cast<float>(q.x), static_cast<float>(q.y));
+  };
+  /* Zero-crossing point along an edge between values fa, fb. */
+  auto interp = [](double a, double fa, double b, double fb) -> double {
+    const double denom = fb - fa;
+    if (std::fabs(denom) < 1e-300) return 0.5 * (a + b);
+    return a + (b - a) * (-fa / denom);
+  };
+
+  const float thickness = 2.2f;
+  for (int j = 0; j < grid; ++j) {
+    const double y0 = bounds.ymin + j * dy;
+    const double y1 = y0 + dy;
+    for (int i = 0; i < grid; ++i) {
+      if (!good(i, j) || !good(i + 1, j) || !good(i + 1, j + 1) ||
+          !good(i, j + 1))
+        continue;
+      const double x0 = bounds.xmin + i * dx;
+      const double x1 = x0 + dx;
+      const double f00 = node(i, j);       /* bottom-left  */
+      const double f10 = node(i + 1, j);   /* bottom-right */
+      const double f11 = node(i + 1, j + 1); /* top-right  */
+      const double f01 = node(i, j + 1);   /* top-left     */
+
+      /* Marching-squares case index (corner sign bits). */
+      int c = 0;
+      if (f00 > 0.0) c |= 1;
+      if (f10 > 0.0) c |= 2;
+      if (f11 > 0.0) c |= 4;
+      if (f01 > 0.0) c |= 8;
+      if (c == 0 || c == 15) continue; /* no crossing */
+
+      /* Edge crossing points (only computed when needed):
+       *   bottom: (x0..x1, y0)   right: (x1, y0..y1)
+       *   top:    (x0..x1, y1)   left:  (x0, y0..y1) */
+      const ImVec2 eb = screen(interp(x0, f00, x1, f10), y0);
+      const ImVec2 er = screen(x1, interp(y0, f10, y1, f11));
+      const ImVec2 et = screen(interp(x0, f01, x1, f11), y1);
+      const ImVec2 el = screen(x0, interp(y0, f00, y1, f01));
+
+      auto seg = [&](const ImVec2 &a, const ImVec2 &b) {
+        draw->AddLine(a, b, color, thickness);
+      };
+
+      switch (c) {
+        case 1: case 14: seg(el, eb); break;
+        case 2: case 13: seg(eb, er); break;
+        case 3: case 12: seg(el, er); break;
+        case 4: case 11: seg(er, et); break;
+        case 6: case 9:  seg(eb, et); break;
+        case 7: case 8:  seg(el, et); break;
+        /* Ambiguous saddle cells: connect both diagonals. */
+        case 5:  seg(el, eb); seg(er, et); break;
+        case 10: seg(eb, er); seg(el, et); break;
+        default: break;
       }
     }
   }
@@ -2595,6 +2793,8 @@ void seed_phase_circle(AppState &app, const PlotBounds &bounds, size_t ix, size_
   }
 }
 
+Point2 eigenvector_2x2(double a, double b, double c, double d, double lambda);
+
 void draw_fixed_point_marker(AppState &app, ImDrawList *draw, const PlotBounds &bounds, const ImVec2 &p0,
                              float w, float h, size_t ix, size_t iy) {
   if (!app.fixed_ready || !app.phase_show_fixed_points) return;
@@ -2608,6 +2808,49 @@ void draw_fixed_point_marker(AppState &app, ImDrawList *draw, const PlotBounds &
   draw->AddCircle(q, 7.0f, color, 24, 2.0f);
   draw->AddLine(ImVec2(q.x - 5, q.y), ImVec2(q.x + 5, q.y), color, 1.3f);
   draw->AddLine(ImVec2(q.x, q.y - 5), ImVec2(q.x, q.y + 5), color, 1.3f);
+
+  /* PHASE6: draw the linearized eigendirections at a 2D fixed point.
+   * Each real eigenvalue's eigenvector becomes a short ray, colored by
+   * stability (green = stable, orange = unstable). This turns the
+   * classification into something you can see in the plane, the way a
+   * hand-drawn phase portrait shows the slow/fast/saddle directions. */
+  if (ix < 2 && iy < 2 && app.fixed_jacobian.size() == 4 &&
+      app.fixed_eigenvalues.size() == 2) {
+    const double a = app.fixed_jacobian[0], b = app.fixed_jacobian[1];
+    const double c = app.fixed_jacobian[2], d = app.fixed_jacobian[3];
+    const double ray_px = 46.0; /* on-screen ray half-length */
+    for (int k = 0; k < 2; ++k) {
+      const auto &ev = app.fixed_eigenvalues[static_cast<size_t>(k)];
+      if (std::fabs(ev.second) > 1e-9) continue; /* complex: no real dir */
+      const Point2 v = eigenvector_2x2(a, b, c, d, ev.first);
+      /* map the data-space direction to screen direction (y flips) */
+      const double sx = v.x / std::max(1e-12, bounds.xmax - bounds.xmin) * w;
+      const double sy = -v.y / std::max(1e-12, bounds.ymax - bounds.ymin) * h;
+      const double len = std::sqrt(sx * sx + sy * sy);
+      if (len < 1e-9) continue;
+      const double ux = sx / len, uy = sy / len;
+      const ImU32 dir_col = ev.first < 0.0 ? IM_COL32(120, 220, 135, 230)
+                                           : IM_COL32(255, 190, 80, 230);
+      const ImVec2 a1(q.x + static_cast<float>(ux * ray_px),
+                      q.y + static_cast<float>(uy * ray_px));
+      const ImVec2 a2(q.x - static_cast<float>(ux * ray_px),
+                      q.y - static_cast<float>(uy * ray_px));
+      draw->AddLine(q, a1, dir_col, 2.0f);
+      draw->AddLine(q, a2, dir_col, 2.0f);
+      /* small arrowheads indicating flow direction (in for stable) */
+      const double sgn = ev.first < 0.0 ? -1.0 : 1.0;
+      const ImVec2 tip(q.x + static_cast<float>(sgn * ux * ray_px),
+                       q.y + static_cast<float>(sgn * uy * ray_px));
+      const double ah = 6.0;
+      const ImVec2 b1(tip.x - static_cast<float>(sgn * ux * ah + uy * ah * 0.6),
+                      tip.y - static_cast<float>(sgn * uy * ah - ux * ah * 0.6));
+      const ImVec2 b2(tip.x - static_cast<float>(sgn * ux * ah - uy * ah * 0.6),
+                      tip.y - static_cast<float>(sgn * uy * ah + ux * ah * 0.6));
+      draw->AddLine(tip, b1, dir_col, 2.0f);
+      draw->AddLine(tip, b2, dir_col, 2.0f);
+    }
+  }
+
   if (!app.fixed_classification.empty()) {
     draw->AddText(ImVec2(q.x + 9, q.y - 10), color, app.fixed_classification.c_str());
   }
@@ -2674,6 +2917,7 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
     ImGuiIO &io = ImGui::GetIO();
     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
       app.phase_auto_bounds = true;
+      app.phase_bounds_valid = false; /* snap to data on explicit auto-fit */
     } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
       State seed = phase_seed_state(app, ix, iy, mouse_data.x, mouse_data.y);
       if (io.KeyShift) {
@@ -2683,7 +2927,9 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
       }
     }
     if (io.MouseWheel != 0.0f) {
-      const double factor = std::pow(0.88, static_cast<double>(io.MouseWheel));
+      /* wheel up -> zoom in (shrink span). 0.8 per notch is responsive
+       * without being twitchy. */
+      const double factor = std::pow(0.8, static_cast<double>(io.MouseWheel));
       zoom_phase_bounds(app, bounds, mouse_data, factor);
     }
   }
@@ -2734,9 +2980,20 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
   }
 
   if (app.phase_show_nullclines && app.mode == SystemMode::ODE) {
-    draw_nullcline_for_component(app, draw, bounds, p0, w, h, ix, iy, ix, IM_COL32(255, 130, 95, 210));
-    if (iy != ix) draw_nullcline_for_component(app, draw, bounds, p0, w, h, ix, iy, iy, IM_COL32(120, 220, 135, 210));
-    draw->AddText(ImVec2(p0.x + 8, p0.y + 8), IM_COL32(240, 240, 240, 210), "red: x-nullcline, green: y-nullcline");
+    /* pplane convention: one nullcline per state variable, where that
+     * variable's rate is zero. Solid, saturated colors; a legend that
+     * names the actual variables. */
+    const ImU32 col_x = IM_COL32(255, 110, 80, 235);
+    const ImU32 col_y = IM_COL32(90, 210, 130, 235);
+    draw_nullcline_for_component(app, draw, bounds, p0, w, h, ix, iy, ix, col_x);
+    if (iy != ix)
+      draw_nullcline_for_component(app, draw, bounds, p0, w, h, ix, iy, iy, col_y);
+    char legend[160];
+    std::snprintf(legend, sizeof(legend),
+                  "nullclines —  %s' = 0 (red)   %s' = 0 (green)",
+                  app.state_names[ix].c_str(), app.state_names[iy].c_str());
+    draw->AddText(ImVec2(p0.x + 8, p0.y + 8), IM_COL32(235, 235, 240, 230),
+                  legend);
   }
 
   if (app.phase_show_trajectory) {
@@ -3117,11 +3374,217 @@ void find_fixed_point(AppState &app) {
   app.fixed_ready = true;
   app.separatrix_curves.clear();
   app.fixed_classification = classify_fixed_jacobian_2d(app);
-  if (app.state_names.size() == 2) {
+
+  /* PHASE1: general N-D classification via the from-scratch eigensolver.
+   * Works in any dimension and supersedes the 2D-only trace/det path
+   * for the spectrum and the saddle/Hopf/fold flags. */
+  app.fixed_general_ready = false;
+  if (!app.fixed_jacobian.empty()) {
+    app.fixed_general =
+        dynsys::analysis::classify_equilibrium(app.fixed_jacobian, n);
+    app.fixed_general_ready = true;
+  }
+
+  if (app.fixed_general_ready) {
+    app.analysis_message =
+        std::string("fixed point search completed: ") + app.fixed_general.label;
+  } else if (app.state_names.size() == 2) {
     app.analysis_message = std::string("fixed point search completed: ") + app.fixed_classification;
   } else {
     app.analysis_message = "fixed point search completed";
   }
+}
+
+/* ============================================================
+ * PHASE1/2/3: general analysis bridge.
+ *
+ * build_model wraps the compiled system as a dynsys::analysis::Model.
+ * The vector field temporarily installs the continuation parameter
+ * value, evaluates the RHS through the existing IR path, and restores
+ * the parameter. The Jacobian is supplied by the analysis core's
+ * finite-difference path for now; the forward-mode-AD-over-IR
+ * implementation (Phase 3) will set model.jacobian_x without changing
+ * any caller. n_state is fixed; the parameter is z[n].
+ * ============================================================ */
+dynsys::analysis::Model build_model(AppState &app, AppState::Param *param) {
+  dynsys::analysis::Model model;
+  model.n = app.state_names.size();
+
+  /* Capture by value of the pointer; the closures run synchronously
+   * during continuation, while `app` and `param` stay alive. */
+  model.vector_field = [&app, param](const double *x, double p, double *f_out,
+                                     std::string *err) -> bool {
+    const size_t n = app.state_names.size();
+    const double saved = param->value;
+    param->value = p;
+    sync_param_values(app);
+    State s = make_state_like(n, app.current.t);
+    for (size_t i = 0; i < n; ++i) set_state_at(s, i, x[i]);
+    State deriv{};
+    char buf[256] = {0};
+    const bool ok = eval_rhs(app, s, &deriv, buf, sizeof(buf));
+    param->value = saved;
+    sync_param_values(app);
+    if (!ok) {
+      if (err) *err = buf;
+      return false;
+    }
+    for (size_t i = 0; i < n; ++i) f_out[i] = state_at(deriv, i);
+    return true;
+  };
+  /* PHASE3: exact Jacobian and df/dp via forward-mode AD over the IR.
+   * For column j we evaluate every equation program once with the dual
+   * seed on state variable j; the derivative component is J[row][j].
+   * df/dp seeds the active continuation parameter instead. This makes
+   * the continuation engine's linear algebra exact rather than
+   * finite-difference-noisy, with no change to any caller. */
+  size_t param_index = 0;
+  for (size_t i = 0; i < app.params.size(); ++i)
+    if (&app.params[i] == param) param_index = i;
+
+  model.jacobian_x = [&app, param, param_index](
+                         const double *x, double p, double *jac_out,
+                         std::string *err) -> bool {
+    const size_t n = app.state_names.size();
+    if (app.equation_programs.size() != n) {
+      if (err) *err = "equations are not compiled";
+      return false;
+    }
+    const double saved = param->value;
+    param->value = p;
+    sync_param_values(app);
+
+    State s = make_state_like(n, app.current.t);
+    for (size_t i = 0; i < n; ++i) set_state_at(s, i, x[i]);
+
+    dynsys::ir::RunContext rc;
+    rc.state = s.v.data();
+    rc.n_state = s.v.size();
+    rc.t = s.t;
+    rc.params = app.param_values.data();
+    rc.n_params = app.param_values.size();
+    rc.defs = app.definition_programs.data();
+    rc.n_defs = app.definition_programs.size();
+
+    char buf[256] = {0};
+    bool ok = true;
+    for (size_t col = 0; col < n && ok; ++col) {
+      dynsys::ir::DualSeed seed{dynsys::ir::DualSeed::Kind::State, col};
+      for (size_t row = 0; row < n; ++row) {
+        double v = 0.0, d = 0.0;
+        if (!dynsys::ir::run_dual(app.equation_programs[row], rc, seed,
+                                  app.ad_scratch, &v, &d, buf, sizeof(buf))) {
+          ok = false;
+          break;
+        }
+        jac_out[row * n + col] = d;
+      }
+    }
+    param->value = saved;
+    sync_param_values(app);
+    (void)param_index;
+    if (!ok && err) *err = buf;
+    return ok;
+  };
+
+  model.dfdp = [&app, param, param_index](const double *x, double p,
+                                          double *dfdp_out,
+                                          std::string *err) -> bool {
+    const size_t n = app.state_names.size();
+    if (app.equation_programs.size() != n) {
+      if (err) *err = "equations are not compiled";
+      return false;
+    }
+    const double saved = param->value;
+    param->value = p;
+    sync_param_values(app);
+
+    State s = make_state_like(n, app.current.t);
+    for (size_t i = 0; i < n; ++i) set_state_at(s, i, x[i]);
+
+    dynsys::ir::RunContext rc;
+    rc.state = s.v.data();
+    rc.n_state = s.v.size();
+    rc.t = s.t;
+    rc.params = app.param_values.data();
+    rc.n_params = app.param_values.size();
+    rc.defs = app.definition_programs.data();
+    rc.n_defs = app.definition_programs.size();
+
+    char buf[256] = {0};
+    bool ok = true;
+    dynsys::ir::DualSeed seed{dynsys::ir::DualSeed::Kind::Param, param_index};
+    for (size_t row = 0; row < n; ++row) {
+      double v = 0.0, d = 0.0;
+      if (!dynsys::ir::run_dual(app.equation_programs[row], rc, seed,
+                                app.ad_scratch, &v, &d, buf, sizeof(buf))) {
+        ok = false;
+        break;
+      }
+      dfdp_out[row] = d;
+    }
+    param->value = saved;
+    sync_param_values(app);
+    if (!ok && err) *err = buf;
+    return ok;
+  };
+
+  return model;
+}
+
+void run_equilibrium_continuation(AppState &app) {
+  if (app.mode != SystemMode::ODE) {
+    app.analysis_message = "continuation currently applies to ODE mode only";
+    return;
+  }
+  if (!app.fixed_ready) {
+    app.analysis_message = "find a fixed point before starting continuation";
+    return;
+  }
+  AppState::Param *param = find_param(app, app.cont_param);
+  if (param == nullptr) {
+    app.analysis_message =
+        std::string("unknown continuation parameter: ") + app.cont_param;
+    return;
+  }
+
+  dynsys::analysis::Model model = build_model(app, param);
+  std::vector<double> x0(model.n, 0.0);
+  for (size_t i = 0; i < model.n; ++i) x0[i] = state_at(app.fixed_point, i);
+
+  dynsys::analysis::ContinuationSettings settings;
+  settings.h0 = app.cont_h0;
+  settings.max_points = app.cont_max_points;
+  settings.p_min = app.cont_p_min;
+  settings.p_max = app.cont_p_max;
+  settings.direction = app.cont_direction;
+  settings.detect_fold = app.cont_detect_fold;
+  settings.detect_hopf = app.cont_detect_hopf;
+
+  const double p0 = param->value;
+  app.cont_branch =
+      dynsys::analysis::continue_equilibrium(model, x0, p0, settings);
+  app.cont_ready = app.cont_branch.ok;
+
+  /* Restore the live parameter — the model closures already restore it
+   * per call, but be explicit. */
+  sync_param_values(app);
+
+  size_t n_fold = 0, n_hopf = 0;
+  for (size_t i : app.cont_branch.special_indices) {
+    if (app.cont_branch.points[i].special ==
+        dynsys::analysis::SpecialPointKind::Fold)
+      ++n_fold;
+    else if (app.cont_branch.points[i].special ==
+             dynsys::analysis::SpecialPointKind::Hopf)
+      ++n_hopf;
+  }
+  char msg[256];
+  std::snprintf(msg, sizeof(msg),
+                "continuation: %zu points, %zu fold(s), %zu Hopf point(s) — %s",
+                app.cont_branch.points.size(), n_fold, n_hopf,
+                app.cont_branch.message.c_str());
+  app.analysis_message = msg;
 }
 
 [[maybe_unused]] void run_bifurcation(AppState &app) {
@@ -3266,7 +3729,7 @@ void draw_gui(AppState &app) {
       reset_simulation(app);
       upload_buffers(app);
     }
-    ImGui::SliderInt("history buffer", &app.history_limit, 100, 50000);
+    ImGui::Text("history buffer: %d (tied to 3D point buffer)", app.history_limit);
   }
 
   if (ImGui::CollapsingHeader("Analysis", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -3297,6 +3760,32 @@ void draw_gui(AppState &app) {
         }
         ImGui::TextWrapped("%s", ev.c_str());
       }
+
+      /* PHASE1: general N-D classification + full complex spectrum. */
+      if (app.fixed_general_ready) {
+        ImGui::Separator();
+        ImGui::TextWrapped("general classification: %s",
+                           app.fixed_general.label.c_str());
+        std::string spec = "spectrum:";
+        for (const auto &z : app.fixed_general.eigenvalues) {
+          char buf[96];
+          if (std::fabs(z.imag()) < 1e-12)
+            std::snprintf(buf, sizeof(buf), " %.6g", z.real());
+          else
+            std::snprintf(buf, sizeof(buf), " %.6g%+.6gi", z.real(), z.imag());
+          spec += buf;
+        }
+        ImGui::TextWrapped("%s", spec.c_str());
+        ImGui::Text("stable: %d   unstable: %d   marginal: %d",
+                    app.fixed_general.n_stable, app.fixed_general.n_unstable,
+                    app.fixed_general.n_center);
+        if (app.fixed_general.hopf_candidate)
+          ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
+                             "Hopf candidate (complex pair near imaginary axis)");
+        if (app.fixed_general.fold_candidate)
+          ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                             "fold candidate (real eigenvalue near zero)");
+      }
       ImGui::InputDouble("separatrix epsilon", &app.separatrix_epsilon, 1e-5, 1e-4, "%.1e");
       ImGui::SliderInt("separatrix steps", &app.separatrix_steps, 100, 20000);
       if (ImGui::Button("Trace saddle separatrices")) trace_separatrices(app);
@@ -3319,11 +3808,93 @@ void draw_gui(AppState &app) {
     if (!app.analysis_message.empty()) ImGui::TextWrapped("%s", app.analysis_message.c_str());
   }
 
-  if (ImGui::CollapsingHeader("Continuation / bifurcation roadmap")) {
-    ImGui::TextWrapped("Bifurcation scanning from v2 was intentionally removed from the active UI. For MatCont-style work we need continuation objects, branch state, event detection, and a stronger system language rather than a one-shot parameter sweep.");
-    ImGui::BulletText("v4 active: pplane-style interaction, multi-orbits, fixed point classification, saddle separatrices");
-    ImGui::BulletText("later: Lisp-like model language, continuation commands, branch storage, codimension-1 events");
-    ImGui::BulletText("reserved commands: continue equilibrium, continue cycle, locate fold/Hopf/period-doubling");
+  if (ImGui::CollapsingHeader("Equilibrium continuation", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::TextWrapped(
+        "Pseudo-arclength continuation of the located equilibrium as one "
+        "parameter varies, with fold and Hopf detection. Find a fixed point "
+        "first, then continue.");
+    ImGui::InputText("continuation parameter", app.cont_param,
+                     sizeof(app.cont_param));
+    ImGui::InputDouble("param min", &app.cont_p_min, 0.1, 1.0, "%.4g");
+    ImGui::SameLine();
+    ImGui::InputDouble("param max", &app.cont_p_max, 0.1, 1.0, "%.4g");
+    ImGui::InputDouble("initial step h0", &app.cont_h0, 0.01, 0.1, "%.4g");
+    ImGui::SliderInt("max points", &app.cont_max_points, 50, 5000);
+    int dir_idx = app.cont_direction > 0 ? 0 : 1;
+    const char *dirs[] = {"increasing first", "decreasing first"};
+    if (ImGui::Combo("direction", &dir_idx, dirs, 2))
+      app.cont_direction = dir_idx == 0 ? 1 : -1;
+    ImGui::Checkbox("detect fold", &app.cont_detect_fold);
+    ImGui::SameLine();
+    ImGui::Checkbox("detect Hopf", &app.cont_detect_hopf);
+
+    if (ImGui::Button("Continue equilibrium")) run_equilibrium_continuation(app);
+    ImGui::SameLine();
+    if (ImGui::Button("Clear branch")) {
+      app.cont_branch = dynsys::analysis::Branch{};
+      app.cont_ready = false;
+    }
+
+    if (app.cont_ready && !app.cont_branch.points.empty()) {
+      ImGui::Text("branch: %zu points", app.cont_branch.points.size());
+      /* Special points table. */
+      if (!app.cont_branch.special_indices.empty()) {
+        ImGui::Text("special points:");
+        for (size_t i : app.cont_branch.special_indices) {
+          const auto &bp = app.cont_branch.points[i];
+          const char *kind =
+              bp.special == dynsys::analysis::SpecialPointKind::Fold ? "FOLD"
+              : bp.special == dynsys::analysis::SpecialPointKind::Hopf
+                  ? "HOPF"
+                  : "end";
+          ImGui::BulletText("%s at %s = %.6g", kind, app.cont_param, bp.p);
+        }
+      }
+      /* Simple stability-vs-parameter strip: draw the branch as a
+       * polyline of (p, first-coordinate), colored by stability. */
+      ImDrawList *draw = ImGui::GetWindowDrawList();
+      ImVec2 p0 = ImGui::GetCursorScreenPos();
+      const float bw = ImGui::GetContentRegionAvail().x;
+      const float bh = 160.0f;
+      ImVec2 p1(p0.x + bw, p0.y + bh);
+      draw->AddRectFilled(p0, p1, IM_COL32(18, 18, 22, 220));
+      draw->AddRect(p0, p1, IM_COL32(110, 110, 120, 200));
+      double pmn = 1e300, pmx = -1e300, xmn = 1e300, xmx = -1e300;
+      for (const auto &bp : app.cont_branch.points) {
+        pmn = std::min(pmn, bp.p);
+        pmx = std::max(pmx, bp.p);
+        const double xv = bp.x.empty() ? 0.0 : bp.x[0];
+        xmn = std::min(xmn, xv);
+        xmx = std::max(xmx, xv);
+      }
+      const double pr = (pmx - pmn) > 1e-12 ? (pmx - pmn) : 1.0;
+      const double xr = (xmx - xmn) > 1e-12 ? (xmx - xmn) : 1.0;
+      auto to_screen = [&](double p, double x) {
+        return ImVec2(
+            static_cast<float>(p0.x + 6 + (bw - 12) * (p - pmn) / pr),
+            static_cast<float>(p1.y - 6 - (bh - 12) * (x - xmn) / xr));
+      };
+      for (size_t i = 1; i < app.cont_branch.points.size(); ++i) {
+        const auto &a = app.cont_branch.points[i - 1];
+        const auto &b = app.cont_branch.points[i];
+        const ImU32 col = b.stable ? IM_COL32(120, 220, 135, 235)
+                                   : IM_COL32(255, 130, 95, 235);
+        draw->AddLine(to_screen(a.p, a.x.empty() ? 0 : a.x[0]),
+                      to_screen(b.p, b.x.empty() ? 0 : b.x[0]), col, 2.0f);
+      }
+      for (size_t i : app.cont_branch.special_indices) {
+        const auto &bp = app.cont_branch.points[i];
+        const ImU32 col =
+            bp.special == dynsys::analysis::SpecialPointKind::Hopf
+                ? IM_COL32(120, 210, 255, 255)
+                : IM_COL32(255, 210, 80, 255);
+        draw->AddCircle(to_screen(bp.p, bp.x.empty() ? 0 : bp.x[0]), 5.0f, col,
+                        16, 2.0f);
+      }
+      draw->AddText(ImVec2(p0.x + 8, p0.y + 6), IM_COL32(200, 200, 210, 220),
+                    "green: stable  red: unstable  (vertical: first state var)");
+      ImGui::Dummy(ImVec2(bw, bh + 4));
+    }
   }
 
   if (ImGui::CollapsingHeader("Exports")) {
@@ -3334,6 +3905,13 @@ void draw_gui(AppState &app) {
   }
 
   if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!system_is_3d(app)) {
+      ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
+                         "2D system: the 3D view is hidden (it would just "
+                         "duplicate the phase plane).");
+      ImGui::TextDisabled("Use the 'phase plane' tab as the 2D view. The 3D "
+                          "controls below apply once a 3rd state is declared.");
+    }
     ImGui::Checkbox("axes", &app.show_axes); ImGui::SameLine(); ImGui::Checkbox("center cross", &app.show_center_cross);
     if (ImGui::Checkbox("orthographic 3D", &app.orthographic_3d)) update_projection(app);
     if (ImGui::SliderFloat("zoom", &app.zoom, 0.05f, 100.0f, "%.3g")) update_projection(app);

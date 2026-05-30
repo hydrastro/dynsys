@@ -53,6 +53,9 @@ C_DEP_DIR  := $(BUILD_DIR)/dep-c
 CXX_DEP_DIR:= $(BUILD_DIR)/dep-cxx
 TARGET     := $(BUILD_DIR)/dynsys$(EXEEXT)
 IR_TEST_TARGET := $(BUILD_DIR)/ir_smoke$(EXEEXT)
+ANALYSIS_TEST_TARGET := $(BUILD_DIR)/analysis_smoke$(EXEEXT)
+AD_TEST_TARGET := $(BUILD_DIR)/ad_smoke$(EXEEXT)
+NULLCLINE_TEST_TARGET := $(BUILD_DIR)/nullcline_smoke$(EXEEXT)
 TEST_OBJ_DIR := $(BUILD_DIR)/obj-test
 
 PREFIX ?= /usr/local
@@ -143,11 +146,15 @@ else ifeq ($(MODE),asan)
   CXXFLAGS += -O1 -g3 -fno-omit-frame-pointer -fsanitize=address,undefined
   LDFLAGS += -fsanitize=address,undefined
 else
-  CFLAGS += -O0 -g3
-  CXXFLAGS += -O0 -g3
+  # -Og keeps full debuggability while providing the minimal optimization
+  # that glibc's _FORTIFY_SOURCE (injected by the nix stdenv) requires;
+  # plain -O0 triggers a "_FORTIFY_SOURCE requires compiling with
+  # optimization" warning on every translation unit.
+  CFLAGS += -Og -g3
+  CXXFLAGS += -Og -g3
 endif
 
-DYNSYS_CPP_SRCS := $(SRC_DIR)/dynsys.cpp $(SRC_DIR)/expr_ir.cpp
+DYNSYS_CPP_SRCS := $(SRC_DIR)/dynsys.cpp $(SRC_DIR)/expr_ir.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/expr_ir_ad.cpp
 DYNSYS_OBJS := $(patsubst %.cpp,$(CXX_OBJ_DIR)/%.o,$(DYNSYS_CPP_SRCS))
 DYNSYS_DEPS := $(patsubst %.cpp,$(CXX_DEP_DIR)/%.d,$(DYNSYS_CPP_SRCS))
 
@@ -189,7 +196,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -282,7 +289,35 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: ir-smoke
+test: test-analysis test-ad test-nullcline
+
+test-analysis: $(ANALYSIS_TEST_TARGET)
+	./$(ANALYSIS_TEST_TARGET)
+
+$(ANALYSIS_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/analysis_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/analysis_smoke.cpp -o $@ -lm
+
+test-nullcline: $(NULLCLINE_TEST_TARGET)
+	./$(NULLCLINE_TEST_TARGET)
+
+$(NULLCLINE_TEST_TARGET): test/nullcline_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/nullcline_smoke.cpp -o $@ -lm
+
+test-ad: $(AD_TEST_TARGET)
+	./$(AD_TEST_TARGET)
+
+AD_TPCAS_C := $(TPCAS_DIR)/src/ast.c $(TPCAS_DIR)/src/arena.c \
+  $(DS_DIR)/common.c $(DS_DIR)/status.c $(DS_DIR)/error.c \
+  $(DS_DIR)/diagnostic.c $(DS_DIR)/context.c $(DS_DIR)/allocators.c
+AD_INCLUDES := -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds
+$(AD_TEST_TARGET): $(SRC_DIR)/expr_ir.cpp $(SRC_DIR)/expr_ir_ad.cpp test/ad_smoke.cpp $(AD_TPCAS_C)
+	@$(MKDIR_P) $(dir $@) $(BUILD_DIR)/ad-cobj
+	@for c in $(AD_TPCAS_C); do \
+	  $(CC) $(CSTD) -O2 $(AD_INCLUDES) -c $$c -o $(BUILD_DIR)/ad-cobj/`basename $${c%.c}`.o || exit 1; \
+	done
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 $(AD_INCLUDES) $(SRC_DIR)/expr_ir.cpp $(SRC_DIR)/expr_ir_ad.cpp test/ad_smoke.cpp $(BUILD_DIR)/ad-cobj/*.o -o $@ -lm
 
 ir-smoke: $(IR_TEST_TARGET)
 	./$(IR_TEST_TARGET)
