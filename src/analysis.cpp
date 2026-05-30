@@ -744,4 +744,100 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
   return branch;
 }
 
+/* ---- 2D fixed-point scanning -------------------------------- */
+
+std::vector<FixedPoint2D> scan_fixed_points_2d(const PlanarField &field,
+                                               double xmin, double xmax,
+                                               double ymin, double ymax,
+                                               int seeds,
+                                               double dedup_tol_frac) {
+  std::vector<FixedPoint2D> out;
+  if (xmax <= xmin || ymax <= ymin) return out;
+  seeds = std::max(3, std::min(seeds, 41));
+  const double w = xmax - xmin, h = ymax - ymin;
+  const double dedup = dedup_tol_frac * std::sqrt(w * w + h * h);
+
+  /* finite-difference 2x2 Jacobian of the planar field */
+  auto jac = [&](double x, double y, double J[4]) -> bool {
+    const double hx = 1e-6 * (std::fabs(x) + 1e-3);
+    const double hy = 1e-6 * (std::fabs(y) + 1e-3);
+    double up, vp, um, vm;
+    if (!field.eval(x + hx, y, &up, &vp) || !field.eval(x - hx, y, &um, &vm))
+      return false;
+    J[0] = (up - um) / (2 * hx);  /* du/dx */
+    J[2] = (vp - vm) / (2 * hx);  /* dv/dx */
+    if (!field.eval(x, y + hy, &up, &vp) || !field.eval(x, y - hy, &um, &vm))
+      return false;
+    J[1] = (up - um) / (2 * hy);  /* du/dy */
+    J[3] = (vp - vm) / (2 * hy);  /* dv/dy */
+    return true;
+  };
+
+  for (int gj = 0; gj < seeds; ++gj) {
+    for (int gi = 0; gi < seeds; ++gi) {
+      double x = xmin + (gi + 0.5) * w / seeds;
+      double y = ymin + (gj + 0.5) * h / seeds;
+      bool ok = true;
+      /* Newton, up to 40 iters */
+      for (int it = 0; it < 40; ++it) {
+        double u, v;
+        if (!field.eval(x, y, &u, &v)) { ok = false; break; }
+        if (std::hypot(u, v) < 1e-11) break;
+        double J[4];
+        if (!jac(x, y, J)) { ok = false; break; }
+        const double det = J[0] * J[3] - J[1] * J[2];
+        if (std::fabs(det) < 1e-14) { ok = false; break; }
+        /* solve J [dx;dy] = -[u;v] */
+        const double dx = (-u * J[3] + v * J[1]) / det;
+        const double dy = (-v * J[0] + u * J[2]) / det;
+        x += dx;
+        y += dy;
+        if (!std::isfinite(x) || !std::isfinite(y)) { ok = false; break; }
+        if (std::hypot(dx, dy) < 1e-12) break;
+      }
+      if (!ok || !std::isfinite(x) || !std::isfinite(y)) continue;
+      /* must be inside the region (allow small margin) and an actual root */
+      double u, v;
+      if (!field.eval(x, y, &u, &v) || std::hypot(u, v) > 1e-6) continue;
+      if (x < xmin - 0.05 * w || x > xmax + 0.05 * w ||
+          y < ymin - 0.05 * h || y > ymax + 0.05 * h)
+        continue;
+      /* dedup */
+      bool dup = false;
+      for (const auto &p : out)
+        if (std::hypot(p.x - x, p.y - y) < dedup) { dup = true; break; }
+      if (dup) continue;
+
+      FixedPoint2D fp;
+      fp.x = x;
+      fp.y = y;
+      double J[4];
+      if (!jac(x, y, J)) continue;
+      fp.jacobian = {J[0], J[1], J[2], J[3]};
+      Classification cl = classify_equilibrium(fp.jacobian, 2);
+      fp.eigenvalues = cl.eigenvalues;
+      fp.label = cl.label;
+      fp.is_saddle = cl.is_saddle;
+      /* real eigendirections for manifold drawing */
+      for (const Complex &lam : fp.eigenvalues) {
+        if (std::fabs(lam.imag()) > 1e-9) {
+          fp.directions.clear();
+          break;
+        }
+        /* (J - lambda I) v = 0  -> v = (J01, lambda-J00) or (lambda-J11, J10) */
+        double vx = J[1];
+        double vy = lam.real() - J[0];
+        if (std::fabs(vx) + std::fabs(vy) < 1e-12) {
+          vx = lam.real() - J[3];
+          vy = J[2];
+        }
+        const double n = std::hypot(vx, vy);
+        if (n > 1e-12) fp.directions.push_back({vx / n, vy / n});
+      }
+      out.push_back(std::move(fp));
+    }
+  }
+  return out;
+}
+
 }  // namespace dynsys::analysis

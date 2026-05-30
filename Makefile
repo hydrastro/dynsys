@@ -56,6 +56,8 @@ IR_TEST_TARGET := $(BUILD_DIR)/ir_smoke$(EXEEXT)
 ANALYSIS_TEST_TARGET := $(BUILD_DIR)/analysis_smoke$(EXEEXT)
 AD_TEST_TARGET := $(BUILD_DIR)/ad_smoke$(EXEEXT)
 NULLCLINE_TEST_TARGET := $(BUILD_DIR)/nullcline_smoke$(EXEEXT)
+DIM_TEST_TARGET := $(BUILD_DIR)/dim_detect_smoke$(EXEEXT)
+FP_TEST_TARGET := $(BUILD_DIR)/fixedpoints_smoke$(EXEEXT)
 TEST_OBJ_DIR := $(BUILD_DIR)/obj-test
 
 PREFIX ?= /usr/local
@@ -196,7 +198,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -289,7 +291,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline
+test: test-analysis test-ad test-nullcline test-dim test-fp
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -304,6 +306,20 @@ test-nullcline: $(NULLCLINE_TEST_TARGET)
 $(NULLCLINE_TEST_TARGET): test/nullcline_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/nullcline_smoke.cpp -o $@ -lm
+
+test-dim: $(DIM_TEST_TARGET)
+	./$(DIM_TEST_TARGET)
+
+$(DIM_TEST_TARGET): test/dim_detect_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/dim_detect_smoke.cpp -o $@ -lm
+
+test-fp: $(FP_TEST_TARGET)
+	./$(FP_TEST_TARGET)
+
+$(FP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp -o $@ -lm
 
 test-ad: $(AD_TEST_TARGET)
 	./$(AD_TEST_TARGET)

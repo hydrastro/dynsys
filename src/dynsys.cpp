@@ -248,6 +248,7 @@ struct AppState {
   bool phase_show_trajectory = true;
   bool phase_show_vector_field = true;
   bool phase_show_nullclines = true;
+  bool phase_show_nullcline_arrows = true;
   bool phase_auto_bounds = true;
   float phase_x_min = -20.0f;
   float phase_x_max = 20.0f;
@@ -279,6 +280,29 @@ struct AppState {
   GLuint cbo = 0;
   GLuint shader_program = 0;
   mat4 projection{};
+
+  /* PHASE6-UI: offscreen render target for the 3D scene, so it lives in
+   * a real ImGui panel (as a texture) instead of being the fullscreen
+   * GL backdrop. Sized to the panel each frame; recreated on resize. */
+  GLuint scene_fbo = 0;
+  GLuint scene_tex = 0;
+  GLuint scene_depth = 0;
+  int scene_tex_w = 0;
+  int scene_tex_h = 0;
+  bool scene_hovered = false; /* is the mouse over the 3D panel image? */
+
+  /* PHASE6-UI: dimensionality model. effective dimension is auto-detected
+   * (a state whose dynamics are trivial — dz=0 for ODEs, z_next=z for
+   * maps — doesn't count), but the user can force a choice. */
+  enum class DimOverride { Auto, Force2D, Force3D };
+  DimOverride dim_override = DimOverride::Auto;
+  int detected_dim = 3; /* recomputed at compile time */
+
+  /* PHASE6-UI: which plot fills the window background. */
+  enum class ActiveView { Phase2D, Scene3D };
+  ActiveView active_view = ActiveView::Phase2D;
+  bool show_side_panel = true;
+  float window_toolbar_h = 32.0f;
 
   std::vector<Point> points;
   std::vector<float> colors;
@@ -339,6 +363,17 @@ struct AppState {
   bool cont_detect_hopf = true;
   dynsys::analysis::Branch cont_branch{};
   bool cont_ready = false;
+
+  /* PHASE6-UI: auto-scanned fixed points for the phase plane (pplane
+   * style). Recomputed when the view/params change, not every frame. */
+  std::vector<dynsys::analysis::FixedPoint2D> phase_fixed_points;
+  bool phase_auto_fixed_points = true;
+  bool phase_show_manifolds = true;
+  std::vector<float> custom_orbit_ic; /* typed initial conditions for "add orbit" */
+  double phase_fp_scan_xmin = 0, phase_fp_scan_xmax = 0;
+  double phase_fp_scan_ymin = 0, phase_fp_scan_ymax = 0;
+  int phase_fp_scan_px = -1, phase_fp_scan_py = -1; /* axis pair when scanned */
+  double phase_fp_scan_param_sig = 0; /* sum of params, cheap change check */
 
   KeyState keys[GLFW_KEY_LAST + 1]{};
   bool mouse_left_pressed = false;
@@ -1211,6 +1246,8 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   bool explicit_mode = false;
   SystemMode next_mode = SystemMode::ODE;
   bool next_poincare_enabled = false;
+  bool next_view2d_set = false;
+  double next_view2d[4] = {0, 0, 0, 0};
   node_t *next_section_body = nullptr;
   node_t *next_section_x_body = nullptr;
   node_t *next_section_y_body = nullptr;
@@ -1356,6 +1393,26 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
         next_plot3d_bodies[axis] = parse_expr(fields[axis], "line " + std::to_string(line_no + 1) + " plot3d axis");
         if (next_plot3d_bodies[axis] == nullptr) { arena_destroy(&next_arena); return false; }
       }
+      continue;
+    }
+    if (lhs == "view2d" || lhs == "view") {
+      /* Optional initial 2D window: view2d = xmin, xmax, ymin, ymax.
+       * Gives a preset (or user system) a good fixed starting view
+       * instead of auto-growing from the orbit. */
+      const auto fields = split_commas(rhs);
+      double vals[4];
+      bool okv = fields.size() == 4;
+      for (size_t k = 0; okv && k < 4; ++k)
+        okv = parse_number_literal(fields[k].c_str(), &vals[k]);
+      if (!okv) {
+        *error = "line " + std::to_string(line_no + 1) +
+                 ": view2d must be four numbers: xmin, xmax, ymin, ymax";
+        arena_destroy(&next_arena);
+        return false;
+      }
+      next_view2d_set = true;
+      next_view2d[0] = vals[0]; next_view2d[1] = vals[1];
+      next_view2d[2] = vals[2]; next_view2d[3] = vals[3];
       continue;
     }
     if (lhs == "section" || lhs == "poincare") {
@@ -1736,6 +1793,45 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
    * (see draw_gui). */
   sync_param_values(app);
 
+  /* PHASE6-UI: detect the effective dimension. Starting from the top
+   * state index, a dimension counts as "dummy" (not a real dimension to
+   * visualise in 3D) when its dynamics are trivial across several random
+   * probes: derivative ~ 0 for an ODE, or next == current for a map.
+   * We shrink detected_dim past contiguous dummy top dimensions only, so
+   * e.g. a 3-state map with z_next = z detects as 2D, while a genuine
+   * 3D system stays 3D. */
+  {
+    app.detected_dim = static_cast<int>(dim);
+    auto trivial_top = [&](size_t k) -> bool {
+      const unsigned seeds[4] = {1u, 7u, 13u, 29u};
+      for (unsigned s : seeds) {
+        State probe = make_state_like(dim, 0.0);
+        unsigned r = s;
+        for (size_t i = 0; i < dim; ++i) {
+          r = r * 1664525u + 1013904223u;
+          set_state_at(probe, i, (static_cast<double>(r % 2000u) / 1000.0) - 1.0);
+        }
+        char e[128] = {0};
+        if (app.mode == SystemMode::Map) {
+          State nxt{};
+          if (!step_map_state(app, probe, &nxt, e, sizeof(e))) return false;
+          if (std::fabs(state_at(nxt, k) - state_at(probe, k)) > 1e-9) return false;
+        } else {
+          State d{};
+          if (!eval_rhs(app, probe, &d, e, sizeof(e))) return false;
+          if (std::fabs(state_at(d, k)) > 1e-9) return false;
+        }
+      }
+      return true;
+    };
+    for (size_t k = dim; k-- > 1;) { /* never drop below 1 dim */
+      if (trivial_top(k))
+        app.detected_dim = static_cast<int>(k);
+      else
+        break;
+    }
+  }
+
   for (size_t i = 0; i < dim; ++i) {
     if (initial_bodies[i] != nullptr) {
       double v = 0.0;
@@ -1751,6 +1847,18 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   app.runtime_error.clear();
   app.poincare_points.clear();
   app.have_last_section = false;
+
+  /* PHASE6-UI: apply an explicit initial 2D window if the system gave one
+   * (view2d = xmin,xmax,ymin,ymax). This makes presets open with a good
+   * fixed view instead of auto-growing. */
+  if (next_view2d_set) {
+    app.phase_auto_bounds = false;
+    app.phase_x_min = static_cast<float>(next_view2d[0]);
+    app.phase_x_max = static_cast<float>(next_view2d[1]);
+    app.phase_y_min = static_cast<float>(next_view2d[2]);
+    app.phase_y_max = static_cast<float>(next_view2d[3]);
+    app.phase_bounds_valid = false;
+  }
 
   /* PHASE0: equation-tied analysis is always stale after a recompile —
    * the located equilibrium, its Jacobian/spectrum, and the saddle
@@ -1809,6 +1917,7 @@ mode = ode
 integrator = rk4
 param mu = 1.0 [0,5]
 plot3d = x, y, 0
+view2d = -4, 4, -6, 6
 observe energy_like = 0.5 * (x*x + y*y)
 initial x = 2
 initial y = 0
@@ -1819,6 +1928,7 @@ dy = mu * (1 - x*x) * y - x
 state prey, predator
 mode = ode
 integrator = rk4
+view2d = 0, 4, 0, 4
 param alpha = 1.1 [0,3]
 param beta = 0.4 [0,2]
 param delta = 0.1 [0,1]
@@ -1831,6 +1941,7 @@ dpredator = delta * prey * predator - gamma * predator
 )dyn", {10.0,5.0,0.0,0}, 0.01, 3, Integrator::RK4,1.0f,0,0,0},
     {"Damped pendulum", "Phase-plane examples", R"dyn(# Autonomous damped pendulum
 state theta, omega
+view2d = -6.5, 6.5, -5, 5
 mode = ode
 integrator = rk4
 param damping = 0.15 [0,2]
@@ -1844,7 +1955,7 @@ domega = 0 - sin(theta) - damping * omega
     {"Logistic map", "Discrete maps", "# Logistic map embedded in 3D\nmode = map\nparam r = 3.9 [0,4]\nx_next = r * x * (1 - x)\ny_next = x\nz_next = z\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Ikeda map", "Discrete maps", "# Ikeda map\nmode = map\nparam u = 0.918 [0,1]\ntheta = 0.4 - 6 / (1 + x*x + y*y)\nx_next = 1 + u * (x * cos(theta) - y * sin(theta))\ny_next = u * (x * sin(theta) + y * cos(theta))\nz_next = z\n", {0.1,0.1,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Tinkerbell map", "Discrete maps", "# Tinkerbell map\nmode = map\nparam a = 0.9 [0,2]\nparam b = 0 - 0.6013 [-2,2]\nparam c = 2.0 [0,4]\nparam d = 0.5 [0,2]\nx_next = x*x - y*y + a*x + b*y\ny_next = 2*x*y + c*x + d*y\nz_next = z\n", {0.1,0.1,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
-    {"Henon map 2D", "N-dimensional examples", "# Hénon map as a true 2D state\nstate x, y\nmode = map\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nplot3d = x, y, 0\nx_next = 1 - a * x * x + y\ny_next = b * x\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Henon map 2D", "N-dimensional examples", "# Hénon map as a true 2D state\nstate x, y\nmode = map\nview2d = -1.5, 1.5, -0.5, 0.5\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nplot3d = x, y, 0\nx_next = 1 - a * x * x + y\ny_next = b * x\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"4D coupled oscillator demo", "N-dimensional examples", "# Four-dimensional demo system\nstate x, y, z, w\nmode = ode\nintegrator = rk4\nparam a = 0.1 [0,1]\nplot3d = x, y, w\nobserve r4 = sqrt(x*x + y*y + z*z + w*w)\nsection = w\nsection_direction = positive\nsection_plot = x, z\ninitial x = 0.1\ninitial y = 0\ninitial z = 0\ninitial w = 0.2\ndx = y\ndy = 0 - x - a*y + z\ndz = w\ndw = 0 - z - a*w + x\n", {0.1,0.0,0.0,0}, 0.01, 3, Integrator::RK4,1.0f,0,0,0},
 };
 
@@ -1989,6 +2100,13 @@ void restart_main_from_state(AppState &app, const State &seed) {
   app.runtime_error.clear();
 }
 
+/* PHASE6: seed an extra orbit as a COMPLETE curve through the point,
+ * integrated both backward and forward in time the way pplane draws an
+ * orbit through a click — instead of a forward-only curve that slowly
+ * grows one step per frame and looks half-finished. The result is a
+ * static trajectory (active=false) so it doesn't keep marching. */
+bool step_ode_state(AppState &app, const State &in, State *out, char *err, size_t err_cap);
+
 void add_phase_trajectory(AppState &app, const State &seed, const char *label_prefix = "orbit") {
   if (static_cast<int>(app.phase_trajectories.size()) >= app.phase_max_extra_trajectories) {
     app.phase_trajectories.erase(app.phase_trajectories.begin());
@@ -1997,10 +2115,64 @@ void add_phase_trajectory(AppState &app, const State &seed, const char *label_pr
   char label[64];
   std::snprintf(label, sizeof(label), "%s %zu", label_prefix, app.phase_trajectories.size() + 1);
   traj.label = label;
-  traj.current = seed;
-  resize_state(traj.current, app.state_names.size());
   traj.color = trajectory_color(app.phase_trajectories.size());
-  push_phase_history(app, traj, traj.current);
+
+  State start = seed;
+  resize_state(start, app.state_names.size());
+  traj.current = start;
+
+  const int half = std::max(50, app.phase_trace_limit / 2);
+
+  /* For ODEs, trace backward then forward by temporarily flipping dt,
+   * and assemble one continuous polyline. For maps, only forward makes
+   * sense, so we iterate the map forward. */
+  std::deque<State> backward, forward;
+  char err[256] = {0};
+
+  if (app.mode == SystemMode::ODE) {
+    const double dt0 = app.dt;
+    /* backward */
+    app.dt = -std::fabs(dt0);
+    State s = start;
+    for (int i = 0; i < half; ++i) {
+      State nx{};
+      if (!step_ode_state(app, s, &nx, err, sizeof(err))) break;
+      bool finite = true;
+      for (double v : nx.v) finite = finite && std::isfinite(v);
+      if (!finite) break;
+      backward.push_front(nx);
+      s = nx;
+    }
+    /* forward */
+    app.dt = std::fabs(dt0);
+    s = start;
+    for (int i = 0; i < half; ++i) {
+      State nx{};
+      if (!step_ode_state(app, s, &nx, err, sizeof(err))) break;
+      bool finite = true;
+      for (double v : nx.v) finite = finite && std::isfinite(v);
+      if (!finite) break;
+      forward.push_back(nx);
+      s = nx;
+    }
+    app.dt = dt0;
+  } else {
+    State s = start;
+    for (int i = 0; i < 2 * half; ++i) {
+      State nx{};
+      if (!step_state(app, s, &nx, err, sizeof(err))) break;
+      forward.push_back(nx);
+      s = nx;
+    }
+  }
+
+  for (const State &s : backward) traj.history.push_back(s);
+  traj.history.push_back(start);
+  for (const State &s : forward) traj.history.push_back(s);
+  /* leave the live cursor at the forward end, but mark inactive so it
+   * doesn't keep integrating every frame. */
+  traj.current = traj.history.empty() ? start : traj.history.back();
+  traj.active = false;
   app.phase_trajectories.push_back(std::move(traj));
 }
 
@@ -2185,8 +2357,9 @@ void process_keyboard(AppState &app, GLFWwindow *window) {
   if (key_pressed(app, window, GLFW_KEY_S, 0.015)) app.angle_x -= 5.0f;
   if (key_pressed(app, window, GLFW_KEY_A, 0.015)) app.angle_y -= 5.0f;
   if (key_pressed(app, window, GLFW_KEY_D, 0.015)) app.angle_y += 5.0f;
-  if (key_pressed(app, window, GLFW_KEY_EQUAL, 0.015)) { app.zoom = std::min(app.zoom * 1.1f, 100.0f); update_projection(app); }
-  if (key_pressed(app, window, GLFW_KEY_MINUS, 0.015)) { app.zoom = std::max(app.zoom / 1.1f, 0.05f); update_projection(app); }
+  /* +/- zoom is handled per-view in render_phase_background /
+   * render_scene_background (about cursor or center), so we no longer
+   * also handle it here — doing both double-stepped the zoom. */
   if (key_pressed(app, window, GLFW_KEY_SPACE, 0.1)) app.paused = !app.paused;
   if (key_pressed(app, window, GLFW_KEY_X, 0.1)) app.show_axes = !app.show_axes;
   if (key_pressed(app, window, GLFW_KEY_Z, 0.1)) app.show_center_cross = !app.show_center_cross;
@@ -2335,27 +2508,80 @@ void draw_axes(AppState &app) {
  * actually has three independent dimensions to look at. A 2D system
  * (two state variables, projected as x,y,0) would just duplicate the
  * phase plane, so we skip the 3D geometry and show a note instead. */
-bool system_is_3d(const AppState &app) {
-  return app.state_names.size() >= 3;
+/* PHASE6-UI: effective dimensionality.
+ *   detected_dim is computed at compile time (see compute_detected_dim):
+ *   it's the number of state variables whose dynamics are non-trivial.
+ *   A map carrying z_next = z, or an ODE with dz = 0, has a dummy 3rd
+ *   dimension and detects as 2D. The user can override Auto with an
+ *   explicit Force2D / Force3D. */
+int effective_dimension(const AppState &app) {
+  switch (app.dim_override) {
+    case AppState::DimOverride::Force2D: return std::min<int>(2, static_cast<int>(app.state_names.size()));
+    case AppState::DimOverride::Force3D: return static_cast<int>(app.state_names.size());
+    case AppState::DimOverride::Auto:
+    default: return app.detected_dim;
+  }
 }
 
-void draw_scene(AppState &app) {
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-  if (!system_is_3d(app)) {
-    /* 2D (or 1D) system: the 3D backdrop would just duplicate the phase
-     * plane, so we don't render the orbit here. Instead of leaving a
-     * blank/garbage framebuffer, paint a clean hint on the background
-     * draw list pointing the user at the phase-plane panel. */
-    ImDrawList *bg = ImGui::GetBackgroundDrawList();
-    const float cx = app.window_width * 0.5f;
-    const float cy = app.window_height * 0.5f;
-    const char *msg = "2D system";
-    const char *sub = "see the \"phase plane\" tab for the 2D view";
-    bg->AddText(ImVec2(cx - 36, cy - 14), IM_COL32(150, 160, 180, 200), msg);
-    bg->AddText(ImVec2(cx - 150, cy + 6), IM_COL32(120, 130, 150, 180), sub);
-    return;
+bool system_is_3d(const AppState &app) {
+  return effective_dimension(app) >= 3 && app.state_names.size() >= 3;
+}
+
+/* PHASE6-UI: (re)create the offscreen color+depth target at a given
+ * pixel size. Returns false if FBO setup is incomplete. */
+bool ensure_scene_fbo(AppState &app, int w, int h) {
+  w = std::max(1, w);
+  h = std::max(1, h);
+  if (app.scene_fbo != 0 && app.scene_tex_w == w && app.scene_tex_h == h)
+    return true;
+
+  if (app.scene_fbo == 0) glGenFramebuffers(1, &app.scene_fbo);
+  if (app.scene_tex == 0) glGenTextures(1, &app.scene_tex);
+  if (app.scene_depth == 0) glGenRenderbuffers(1, &app.scene_depth);
+
+  glBindTexture(GL_TEXTURE_2D, app.scene_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+               nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glBindRenderbuffer(GL_RENDERBUFFER, app.scene_depth);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, app.scene_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         app.scene_tex, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                            GL_RENDERBUFFER, app.scene_depth);
+  const bool ok =
+      glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  if (ok) {
+    app.scene_tex_w = w;
+    app.scene_tex_h = h;
   }
+  return ok;
+}
+
+/* Build the model/view/projection for the 3D scene at the given aspect
+ * and emit the geometry. Assumes the correct framebuffer + viewport are
+ * already bound. */
+void render_scene_geometry(AppState &app, float aspect) {
   glEnable(GL_DEPTH_TEST);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glUseProgram(app.shader_program);
+
+  mat4 projection;
+  if (app.orthographic_3d) {
+    const float hh = 25.0f / std::max(app.zoom, 0.001f);
+    glm_ortho(-hh * aspect, hh * aspect, -hh, hh, -10000.0f, 10000.0f,
+              projection);
+  } else {
+    glm_perspective(glm_rad(45.0f), aspect, 0.01f, 10000.0f, projection);
+  }
+
   mat4 model, view;
   glm_mat4_identity(model);
   glm_mat4_identity(view);
@@ -2367,7 +2593,7 @@ void draw_scene(AppState &app) {
   vec3 view_translation{}; set_vec3(view_translation, 0.0f, 0.0f, -app.camera_distance); glm_translate(view, view_translation);
   glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "model"), 1, GL_FALSE, reinterpret_cast<float *>(model));
   glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "view"), 1, GL_FALSE, reinterpret_cast<float *>(view));
-  glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "projection"), 1, GL_FALSE, reinterpret_cast<float *>(app.projection));
+  glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "projection"), 1, GL_FALSE, reinterpret_cast<float *>(projection));
   glBindBuffer(GL_ARRAY_BUFFER, app.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(app.points.size() * sizeof(Point)), app.points.data());
   glBindBuffer(GL_ARRAY_BUFFER, app.cbo);
@@ -2376,7 +2602,59 @@ void draw_scene(AppState &app) {
   draw_axes(app);
 }
 
-void draw_center_cross(const AppState &app) {
+/* Render the 3D scene into the offscreen texture at the panel's pixel
+ * size. Called from the GUI when the 3D tab is visible. After this the
+ * default framebuffer is rebound. */
+void render_scene_to_fbo(AppState &app, int w, int h) {
+  if (!ensure_scene_fbo(app, w, h)) return;
+  glBindFramebuffer(GL_FRAMEBUFFER, app.scene_fbo);
+  glViewport(0, 0, w, h);
+  const float aspect =
+      static_cast<float>(std::max(1, w)) / static_cast<float>(std::max(1, h));
+  render_scene_geometry(app, aspect);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+/* PHASE6-UI: render the 3D scene directly to the full window backbuffer
+ * (no FBO needed when it's the background), and handle drag-rotate /
+ * wheel-zoom when the cursor isn't over a panel. Called from the main
+ * loop before the GUI when the active view is the 3D scene. */
+void render_scene_background(AppState &app) {
+  glViewport(0, 0, app.window_width, app.window_height);
+  const float aspect = static_cast<float>(app.window_width) /
+                       std::max(1.0f, static_cast<float>(app.window_height));
+  render_scene_geometry(app, aspect);
+
+  ImGuiIO &io = ImGui::GetIO();
+  if (!io.WantCaptureMouse) {
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+      app.angle_y += io.MouseDelta.x * 0.4f;
+      app.angle_x += io.MouseDelta.y * 0.4f;
+    }
+    if (io.MouseWheel != 0.0f) {
+      app.zoom *= std::pow(1.15f, io.MouseWheel);
+      app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
+      update_projection(app);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)) {
+      app.zoom = std::min(app.zoom * 1.1f, 100.0f); update_projection(app);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)) {
+      app.zoom = std::max(app.zoom / 1.1f, 0.05f); update_projection(app);
+    }
+  }
+}
+
+/* Fallback flat clear (used before the GUI when the 2D phase plane is
+ * the active background — the phase plane itself paints an opaque
+ * backdrop via the ImGui background draw list). */
+void draw_scene(AppState &app) {
+  (void)app;
+  glDisable(GL_DEPTH_TEST);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+[[maybe_unused]] void draw_center_cross(const AppState &app) {
   if (!app.show_center_cross) return;
   ImDrawList *draw_list = ImGui::GetForegroundDrawList();
   const ImVec2 center(static_cast<float>(app.window_width) * 0.5f, static_cast<float>(app.window_height) * 0.5f);
@@ -2450,7 +2728,31 @@ PlotBounds equalize_bounds_for_canvas(PlotBounds b, float w, float h) {
   return b;
 }
 
-void set_manual_phase_bounds(AppState &app, const PlotBounds &b) {
+/* PHASE6-UI: guarantee finite, correctly-ordered bounds with a sane
+ * minimum span. This is the single choke point that prevents a bad
+ * zoom/pan (or a stray NaN) from collapsing the view to nothing or
+ * poisoning every subsequent frame with NaN coordinates. */
+PlotBounds sanitize_bounds(PlotBounds b) {
+  auto fix = [](double &lo, double &hi) {
+    if (!std::isfinite(lo) || !std::isfinite(hi)) { lo = -10.0; hi = 10.0; }
+    if (hi < lo) std::swap(lo, hi);
+    double span = hi - lo;
+    if (!(span > 1e-9)) { /* collapsed or tiny */
+      const double c = std::isfinite(0.5 * (lo + hi)) ? 0.5 * (lo + hi) : 0.0;
+      lo = c - 0.5; hi = c + 0.5;
+    }
+    /* clamp absurd magnitudes that would also break rendering */
+    const double LIM = 1e12;
+    if (lo < -LIM) lo = -LIM;
+    if (hi > LIM) hi = LIM;
+  };
+  fix(b.xmin, b.xmax);
+  fix(b.ymin, b.ymax);
+  return b;
+}
+
+void set_manual_phase_bounds(AppState &app, const PlotBounds &b_in) {
+  const PlotBounds b = sanitize_bounds(b_in);
   app.phase_auto_bounds = false;
   app.phase_x_min = static_cast<float>(b.xmin);
   app.phase_x_max = static_cast<float>(b.xmax);
@@ -2458,13 +2760,14 @@ void set_manual_phase_bounds(AppState &app, const PlotBounds &b) {
   app.phase_y_max = static_cast<float>(b.ymax);
 }
 
-void zoom_phase_bounds(AppState &app, PlotBounds b, const Point2 &anchor, double factor) {
-  /* Zoom about the cursor: scale the span by `factor`, keeping the
-   * anchor point fixed in data space. `b` is the bounds actually being
-   * displayed (already equalized for the canvas), so writing the result
-   * straight to the manual bounds makes the zoom stick exactly — the
-   * next frame reads these manual values back without re-deriving them
-   * from data. */
+void zoom_phase_bounds(AppState &app, PlotBounds b, const Point2 &anchor_in, double factor) {
+  /* Guard against a non-finite anchor (which could come from a prior bad
+   * frame) — fall back to the view center so zoom can always recover. */
+  Point2 anchor = anchor_in;
+  if (!std::isfinite(anchor.x) || !std::isfinite(anchor.y)) {
+    anchor.x = 0.5 * (b.xmin + b.xmax);
+    anchor.y = 0.5 * (b.ymin + b.ymax);
+  }
   factor = std::max(0.02, std::min(factor, 50.0));
   const double new_w = (b.xmax - b.xmin) * factor;
   const double new_h = (b.ymax - b.ymin) * factor;
@@ -2620,7 +2923,7 @@ PlotBounds current_phase_bounds(AppState &app, size_t ix, size_t iy) {
     b.xmin = app.phase_view_xmin; b.xmax = app.phase_view_xmax;
     b.ymin = app.phase_view_ymin; b.ymax = app.phase_view_ymax;
   }
-  return b;
+  return sanitize_bounds(b);
 }
 
 void draw_arrow(ImDrawList *draw, ImVec2 a, ImVec2 b, ImU32 color) {
@@ -2693,6 +2996,7 @@ void draw_nullcline_for_component(AppState &app, ImDrawList *draw,
   };
 
   const float thickness = 2.2f;
+  std::vector<ImVec2> seg_mid; /* midpoints for direction arrows */
   for (int j = 0; j < grid; ++j) {
     const double y0 = bounds.ymin + j * dy;
     const double y1 = y0 + dy;
@@ -2725,6 +3029,7 @@ void draw_nullcline_for_component(AppState &app, ImDrawList *draw,
 
       auto seg = [&](const ImVec2 &a, const ImVec2 &b) {
         draw->AddLine(a, b, color, thickness);
+        seg_mid.push_back(ImVec2(0.5f * (a.x + b.x), 0.5f * (a.y + b.y)));
       };
 
       switch (c) {
@@ -2739,6 +3044,37 @@ void draw_nullcline_for_component(AppState &app, ImDrawList *draw,
         case 10: seg(eb, er); seg(el, et); break;
         default: break;
       }
+    }
+  }
+
+  /* PHASE6-UI: pplane-style direction arrows ALONG the nullcline. On a
+   * nullcline one component of the field is zero, so the flow is parallel
+   * to one axis there; pplane marks this with little arrows. We sample
+   * the full field at a thinned set of segment midpoints and draw a short
+   * arrow in the flow direction, in the nullcline's color. */
+  if (app.phase_show_nullcline_arrows && !seg_mid.empty()) {
+    const double bx = bounds.xmax - bounds.xmin;
+    const double by = bounds.ymax - bounds.ymin;
+    const float arrow_px = 12.0f;
+    const size_t stride = std::max<size_t>(1, seg_mid.size() / 24);
+    for (size_t k = 0; k < seg_mid.size(); k += stride) {
+      /* convert midpoint back to data coords */
+      const double xd = bounds.xmin + (seg_mid[k].x - p0.x) / std::max(1.0f, w) * bx;
+      const double yd = bounds.ymax - (seg_mid[k].y - p0.y) / std::max(1.0f, h) * by;
+      State s2 = app.current;
+      resize_state(s2, app.state_names.size());
+      set_state_at(s2, ix, xd);
+      set_state_at(s2, iy, yd);
+      double vx = 0.0, vy = 0.0;
+      char e2[128] = {0};
+      if (!eval_phase_vector(app, s2, ix, iy, &vx, &vy, e2, sizeof(e2))) continue;
+      const double mag = std::sqrt(vx * vx + vy * vy);
+      if (mag < 1e-12 || !std::isfinite(mag)) continue;
+      /* screen-space direction (y flips); normalize to a fixed length */
+      const double sxv = vx / mag, syv = -vy / mag;
+      const ImVec2 tip(seg_mid[k].x + static_cast<float>(sxv) * arrow_px,
+                       seg_mid[k].y + static_cast<float>(syv) * arrow_px);
+      draw_arrow(draw, seg_mid[k], tip, color);
     }
   }
 }
@@ -2856,7 +3192,98 @@ void draw_fixed_point_marker(AppState &app, ImDrawList *draw, const PlotBounds &
   }
 }
 
-void draw_phase_plane(AppState &app, ImVec2 size) {
+/* PHASE6-UI: build a planar field for the current axis pair (other state
+ * variables held at the app's current values) and rescan all fixed
+ * points when the view, axis pair, or parameters have changed. Throttled
+ * by signature comparison so it isn't recomputed every frame. */
+void maybe_rescan_fixed_points(AppState &app, const PlotBounds &b, size_t ix,
+                               size_t iy) {
+  if (!app.phase_auto_fixed_points || app.mode != SystemMode::ODE ||
+      app.state_names.size() < 2) {
+    app.phase_fixed_points.clear();
+    return;
+  }
+  double psig = 0.0;
+  for (double v : app.param_values) psig += v;
+
+  const bool same =
+      app.phase_fp_scan_px == static_cast<int>(ix) &&
+      app.phase_fp_scan_py == static_cast<int>(iy) &&
+      std::fabs(app.phase_fp_scan_xmin - b.xmin) < 1e-9 * (1 + std::fabs(b.xmin)) &&
+      std::fabs(app.phase_fp_scan_xmax - b.xmax) < 1e-9 * (1 + std::fabs(b.xmax)) &&
+      std::fabs(app.phase_fp_scan_ymin - b.ymin) < 1e-9 * (1 + std::fabs(b.ymin)) &&
+      std::fabs(app.phase_fp_scan_ymax - b.ymax) < 1e-9 * (1 + std::fabs(b.ymax)) &&
+      std::fabs(app.phase_fp_scan_param_sig - psig) < 1e-12 * (1 + std::fabs(psig));
+  if (same) return;
+
+  dynsys::analysis::PlanarField field;
+  field.eval = [&app, ix, iy](double x, double y, double *u, double *v) -> bool {
+    State s = app.current;
+    resize_state(s, app.state_names.size());
+    set_state_at(s, ix, x);
+    set_state_at(s, iy, y);
+    double vx = 0.0, vy = 0.0;
+    char err[128] = {0};
+    if (!eval_phase_vector(app, s, ix, iy, &vx, &vy, err, sizeof(err)))
+      return false;
+    *u = vx;
+    *v = vy;
+    return true;
+  };
+  app.phase_fixed_points = dynsys::analysis::scan_fixed_points_2d(
+      field, b.xmin, b.xmax, b.ymin, b.ymax, 13);
+  app.phase_fp_scan_px = static_cast<int>(ix);
+  app.phase_fp_scan_py = static_cast<int>(iy);
+  app.phase_fp_scan_xmin = b.xmin; app.phase_fp_scan_xmax = b.xmax;
+  app.phase_fp_scan_ymin = b.ymin; app.phase_fp_scan_ymax = b.ymax;
+  app.phase_fp_scan_param_sig = psig;
+}
+
+/* Draw all auto-scanned fixed points with stability color, label, and
+ * (for real eigenvalues) the stable/unstable eigendirection manifolds. */
+void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
+                            const PlotBounds &bounds, const ImVec2 &p0, float w,
+                            float h) {
+  for (const auto &fp : app.phase_fixed_points) {
+    const Point2 ps = plot_to_screen(bounds, p0, w, h, fp.x, fp.y);
+    const ImVec2 q(static_cast<float>(ps.x), static_cast<float>(ps.y));
+    ImU32 color = IM_COL32(230, 230, 235, 255);
+    if (fp.is_saddle) color = IM_COL32(255, 95, 95, 255);
+    else if (fp.label.find("stable") != std::string::npos &&
+             fp.label.find("unstable") == std::string::npos)
+      color = IM_COL32(120, 220, 135, 255);
+    else if (fp.label.find("unstable") != std::string::npos)
+      color = IM_COL32(255, 190, 80, 255);
+    else if (fp.label.find("center") != std::string::npos)
+      color = IM_COL32(120, 210, 255, 255);
+
+    /* eigendirection manifolds */
+    if (app.phase_show_manifolds && fp.directions.size() == 2 &&
+        fp.eigenvalues.size() == 2) {
+      const double ray = 60.0;
+      for (size_t k = 0; k < 2; ++k) {
+        const double lam = fp.eigenvalues[k].real();
+        const auto &d = fp.directions[k];
+        const double sx = d.first / std::max(1e-12, bounds.xmax - bounds.xmin) * w;
+        const double sy = -d.second / std::max(1e-12, bounds.ymax - bounds.ymin) * h;
+        const double n = std::hypot(sx, sy);
+        if (n < 1e-9) continue;
+        const double ux = sx / n, uy = sy / n;
+        const ImU32 mc = lam < 0.0 ? IM_COL32(120, 220, 135, 200)
+                                   : IM_COL32(255, 150, 80, 200);
+        draw->AddLine(ImVec2(q.x + static_cast<float>(ux * ray), q.y + static_cast<float>(uy * ray)),
+                      ImVec2(q.x - static_cast<float>(ux * ray), q.y - static_cast<float>(uy * ray)),
+                      mc, 1.6f);
+      }
+    }
+
+    draw->AddCircleFilled(q, 5.0f, color);
+    draw->AddCircle(q, 5.0f, IM_COL32(20, 20, 24, 255), 16, 1.5f);
+    draw->AddText(ImVec2(q.x + 8, q.y - 6), color, fp.label.c_str());
+  }
+}
+
+[[maybe_unused]] void draw_phase_plane(AppState &app, ImVec2 size) {
   if (app.state_names.empty()) {
     ImGui::TextDisabled("No state variables declared.");
     return;
@@ -2883,12 +3310,17 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
   ImGui::Checkbox("trajectory", &app.phase_show_trajectory); ImGui::SameLine();
   ImGui::Checkbox("vector field", &app.phase_show_vector_field); ImGui::SameLine();
   ImGui::Checkbox("nullclines", &app.phase_show_nullclines);
-  ImGui::Checkbox("fixed points", &app.phase_show_fixed_points); ImGui::SameLine();
-  ImGui::Checkbox("separatrices", &app.phase_show_separatrices); ImGui::SameLine();
+  ImGui::Checkbox("auto fixed points", &app.phase_auto_fixed_points); ImGui::SameLine();
+  ImGui::Checkbox("manifolds", &app.phase_show_manifolds); ImGui::SameLine();
+  ImGui::Checkbox("separatrices", &app.phase_show_separatrices);
   ImGui::Checkbox("equal aspect", &app.phase_equal_aspect);
   ImGui::Checkbox("auto bounds", &app.phase_auto_bounds); ImGui::SameLine();
   ImGui::Checkbox("normalized vectors", &app.phase_normalize_vectors); ImGui::SameLine();
   ImGui::SliderInt("grid", &app.phase_grid, 8, 40);
+  if (app.phase_auto_fixed_points && app.mode == SystemMode::ODE) {
+    ImGui::TextDisabled("equilibria in view: %zu (auto-found & classified)",
+                        app.phase_fixed_points.size());
+  }
   if (!app.phase_auto_bounds) {
     ImGui::InputFloat("x min", &app.phase_x_min, 0.1f, 1.0f, "%.4g"); ImGui::SameLine();
     ImGui::InputFloat("x max", &app.phase_x_max, 0.1f, 1.0f, "%.4g");
@@ -2903,7 +3335,10 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
   PlotBounds bounds = current_phase_bounds(app, ix, iy);
   if (app.phase_equal_aspect) bounds = equalize_bounds_for_canvas(bounds, w, h);
 
-  ImGui::TextDisabled("left click: restart main orbit | shift+left: add orbit | right drag: pan | wheel: zoom | double click: auto-fit");
+  /* PHASE6-UI: auto-find every equilibrium in the current view. */
+  maybe_rescan_fixed_points(app, bounds, ix, iy);
+
+  ImGui::TextDisabled("L-click: restart orbit | shift+L: add orbit | R-drag: pan | wheel or +/-: zoom | dbl-click: auto-fit");
   ImGui::InvisibleButton("phase_canvas", ImVec2(w, h), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
   const bool hovered = ImGui::IsItemHovered();
   const bool active = ImGui::IsItemActive();
@@ -2932,6 +3367,15 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
       const double factor = std::pow(0.8, static_cast<double>(io.MouseWheel));
       zoom_phase_bounds(app, bounds, mouse_data, factor);
     }
+    /* PHASE6-UI: keyboard zoom for the phase plane, about the view
+     * center. +/= zoom in, -/_ zoom out. (The arrow/WASD camera keys
+     * only affect the 3D view; the 2D plane has its own bounds.) */
+    const Point2 view_center{0.5 * (bounds.xmin + bounds.xmax),
+                             0.5 * (bounds.ymin + bounds.ymax)};
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
+      zoom_phase_bounds(app, bounds, view_center, 0.83);
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract))
+      zoom_phase_bounds(app, bounds, view_center, 1.20);
   }
   if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
     ImGuiIO &io = ImGui::GetIO();
@@ -3008,7 +3452,12 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
     }
   }
 
-  draw_fixed_point_marker(app, draw, bounds, p0, w, h, ix, iy);
+  /* PHASE6-UI: all auto-scanned equilibria with manifolds (pplane-style).
+   * Falls back to the single Newton-found marker if auto-scan is off. */
+  if (app.phase_auto_fixed_points)
+    draw_auto_fixed_points(app, draw, bounds, p0, w, h);
+  else
+    draw_fixed_point_marker(app, draw, bounds, p0, w, h, ix, iy);
   const Point2 cp = plot_to_screen(bounds, p0, w, h, state_at(app.current, ix), state_at(app.current, iy));
   draw->AddCircleFilled(ImVec2(static_cast<float>(cp.x), static_cast<float>(cp.y)), 4.0f, IM_COL32(255, 255, 255, 255));
 
@@ -3045,6 +3494,153 @@ void draw_phase_plane(AppState &app, ImVec2 size) {
     }
     ImGui::TreePop();
   }
+}
+
+/* ============================================================
+ * PHASE6-UI: fullscreen background phase plane.
+ *
+ * Renders the 2D phase portrait across the whole window using the
+ * background draw list (behind all panels), and handles interaction by
+ * reading the mouse directly — but only when no ImGui panel wants it
+ * (io.WantCaptureMouse). This is why dragging/zooming the plot no longer
+ * moves any window: the plot isn't inside a window at all.
+ *
+ * Standard pplane-style mouse scheme:
+ *   left-click           : add an orbit through the clicked point
+ *   left-drag            : pan the view
+ *   wheel / + / -        : zoom (about cursor for wheel, center for keys)
+ *   double-click         : auto-fit to data
+ * Orbits accumulate; they are only removed by an explicit Clear.
+ * ============================================================ */
+void render_phase_background(AppState &app) {
+  if (app.state_names.size() < 2) return;
+  app.phase_x_index = std::max(0, std::min(app.phase_x_index, static_cast<int>(app.state_names.size() - 1)));
+  app.phase_y_index = std::max(0, std::min(app.phase_y_index, static_cast<int>(app.state_names.size() - 1)));
+  if (app.phase_y_index == app.phase_x_index)
+    app.phase_y_index = (app.phase_x_index + 1) % static_cast<int>(app.state_names.size());
+  const size_t ix = static_cast<size_t>(app.phase_x_index);
+  const size_t iy = static_cast<size_t>(app.phase_y_index);
+
+  const ImVec2 p0(0.0f, 0.0f);
+  const float w = static_cast<float>(app.window_width);
+  const float h = static_cast<float>(app.window_height);
+  const ImVec2 p1(w, h);
+
+  PlotBounds bounds = current_phase_bounds(app, ix, iy);
+  if (app.phase_equal_aspect) bounds = equalize_bounds_for_canvas(bounds, w, h);
+  maybe_rescan_fixed_points(app, bounds, ix, iy);
+
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  ImGuiIO &io = ImGui::GetIO();
+  const ImVec2 mouse = io.MousePos;
+  const Point2 mouse_data = screen_to_plot(bounds, p0, w, h, mouse);
+  const bool over_plot = !io.WantCaptureMouse; /* cursor not over a panel */
+
+  /* --- interaction (only when the cursor is over the plot, not UI) --- */
+  if (over_plot) {
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+      app.phase_auto_bounds = true;
+      app.phase_bounds_valid = false;
+    } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.KeyShift) {
+      /* standard pplane: click drops an orbit through the point.
+       * (Shift+click is reserved for the live "main" orbit restart.) */
+      add_phase_trajectory(app, phase_seed_state(app, ix, iy, mouse_data.x, mouse_data.y));
+    } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && io.KeyShift) {
+      restart_main_from_state(app, phase_seed_state(app, ix, iy, mouse_data.x, mouse_data.y));
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+        !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      const double dx = -static_cast<double>(io.MouseDelta.x) / std::max(1.0f, w) * (bounds.xmax - bounds.xmin);
+      const double dy = static_cast<double>(io.MouseDelta.y) / std::max(1.0f, h) * (bounds.ymax - bounds.ymin);
+      pan_phase_bounds(app, bounds, dx, dy);
+    }
+    if (io.MouseWheel != 0.0f)
+      zoom_phase_bounds(app, bounds, mouse_data, std::pow(0.8, static_cast<double>(io.MouseWheel)));
+    const Point2 center{0.5 * (bounds.xmin + bounds.xmax), 0.5 * (bounds.ymin + bounds.ymax)};
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
+      zoom_phase_bounds(app, bounds, center, 0.83);
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract))
+      zoom_phase_bounds(app, bounds, center, 1.20);
+  }
+
+  /* --- drawing --- */
+  draw->AddRectFilled(p0, p1, IM_COL32(16, 17, 22, 255)); /* opaque backdrop */
+  draw_plot_grid(draw, p0, w, h, bounds);
+  draw->PushClipRect(p0, p1, true);
+
+  if (app.phase_show_vector_field) {
+    const int grid = std::max(6, std::min(app.phase_grid, 48));
+    char err[256] = {0};
+    const double bx = bounds.xmax - bounds.xmin;
+    const double by = bounds.ymax - bounds.ymin;
+    for (int gy = 0; gy < grid; ++gy) {
+      for (int gx = 0; gx < grid; ++gx) {
+        const double x = bounds.xmin + (gx + 0.5) * bx / grid;
+        const double y = bounds.ymin + (gy + 0.5) * by / grid;
+        State st = app.current;
+        resize_state(st, app.state_names.size());
+        set_state_at(st, ix, x);
+        set_state_at(st, iy, y);
+        double vx = 0.0, vy = 0.0;
+        if (!eval_phase_vector(app, st, ix, iy, &vx, &vy, err, sizeof(err))) continue;
+        const double len = std::sqrt(vx * vx + vy * vy);
+        if (len <= 1e-14 || !std::isfinite(len)) continue;
+        const double max_len_data = 0.34 * std::min(bx, by) / grid;
+        double nvx = vx, nvy = vy;
+        if (app.phase_normalize_vectors) { nvx = vx / len * max_len_data; nvy = vy / len * max_len_data; }
+        else { const double s = max_len_data / (1.0 + len); nvx *= s; nvy *= s; }
+        /* speed-colored arrows: slow=blue, fast=warm */
+        const double tcol = std::min(1.0, len / (4.0 * (max_len_data / std::max(1e-9, max_len_data))) * 0.0 + std::min(1.0, len / 5.0));
+        const int rr = static_cast<int>(90 + 150 * tcol);
+        const int gg = static_cast<int>(140 - 40 * tcol);
+        const int bb = static_cast<int>(190 - 120 * tcol);
+        const Point2 a = plot_to_screen(bounds, p0, w, h, x - 0.5 * nvx, y - 0.5 * nvy);
+        const Point2 b = plot_to_screen(bounds, p0, w, h, x + 0.5 * nvx, y + 0.5 * nvy);
+        draw_arrow(draw, ImVec2((float)a.x, (float)a.y), ImVec2((float)b.x, (float)b.y),
+                   IM_COL32(rr, gg, bb, 150));
+      }
+    }
+  }
+
+  if (app.phase_show_nullclines && app.mode == SystemMode::ODE) {
+    draw_nullcline_for_component(app, draw, bounds, p0, w, h, ix, iy, ix, IM_COL32(255, 110, 80, 235));
+    if (iy != ix)
+      draw_nullcline_for_component(app, draw, bounds, p0, w, h, ix, iy, iy, IM_COL32(90, 210, 130, 235));
+    char legend[160];
+    std::snprintf(legend, sizeof(legend), "nullclines:  %s' = 0 (red)   %s' = 0 (green)",
+                  app.state_names[ix].c_str(), app.state_names[iy].c_str());
+    draw->AddText(ImVec2(p0.x + 12, p0.y + 40), IM_COL32(235, 235, 240, 230), legend);
+  }
+  if (app.mode == SystemMode::Map && app.phase_show_nullclines) {
+    /* Maps have no vector field, so nullclines / equilibria in the
+     * continuous sense don't apply — make that explicit instead of
+     * silently drawing nothing. */
+    draw->AddText(ImVec2(p0.x + 12, p0.y + 40), IM_COL32(220, 200, 140, 230),
+                  "nullclines/fixed-point fields apply to ODEs; this is a map "
+                  "(showing iterated points)");
+  }
+
+  if (app.phase_show_trajectory) {
+    draw_trajectory_curve(draw, bounds, p0, w, h, app.history, ix, iy, 0xff5fcdffu, 1.8f);
+    for (const auto &traj : app.phase_trajectories)
+      if (traj.visible) draw_trajectory_curve(draw, bounds, p0, w, h, traj.history, ix, iy, fade_color(traj.color, 235), 1.4f);
+  }
+  if (app.phase_show_separatrices)
+    for (const auto &curve : app.separatrix_curves)
+      if (curve.visible) draw_trajectory_curve(draw, bounds, p0, w, h, curve.history, ix, iy, fade_color(curve.color, 245), 1.8f);
+
+  if (app.phase_auto_fixed_points) draw_auto_fixed_points(app, draw, bounds, p0, w, h);
+  else draw_fixed_point_marker(app, draw, bounds, p0, w, h, ix, iy);
+
+  const Point2 cp = plot_to_screen(bounds, p0, w, h, state_at(app.current, ix), state_at(app.current, iy));
+  draw->AddCircleFilled(ImVec2((float)cp.x, (float)cp.y), 4.0f, IM_COL32(255, 255, 255, 255));
+
+  if (over_plot) {
+    char coord[160];
+    std::snprintf(coord, sizeof(coord), "%s=%.5g, %s=%.5g", app.state_names[ix].c_str(), mouse_data.x, app.state_names[iy].c_str(), mouse_data.y);
+    draw->AddText(ImVec2(mouse.x + 14, mouse.y + 14), IM_COL32(230, 230, 235, 240), coord);
+  }
+  draw->PopClipRect();
 }
 
 void draw_series_plot(AppState &app, const char *title, const char *value_name, ImVec2 size) {
@@ -3626,10 +4222,135 @@ void run_equilibrium_continuation(AppState &app) {
   app.analysis_message = "bifurcation scan completed";
 }
 
+/* PHASE6-UI: the 3D view as an ImGui panel. Renders the scene to the
+ * offscreen texture at the panel's pixel size, shows it as an image,
+ * and handles drag-to-rotate and wheel-to-zoom while the image is
+ * hovered — so the 3D controls live with the 3D view instead of being
+ * global window-background interactions. */
+[[maybe_unused]] void draw_scene_panel(AppState &app) {
+  ImGui::Checkbox("axes", &app.show_axes);
+  ImGui::SameLine();
+  if (ImGui::Checkbox("orthographic", &app.orthographic_3d)) update_projection(app);
+  ImGui::SameLine();
+  if (ImGui::SmallButton("reset view")) {
+    app.angle_x = 0.0f; app.angle_y = 0.0f; app.zoom = 1.0f;
+    app.scene_scale = 0.05f; app.camera_distance = 50.0f;
+    app.center_x = app.center_y = app.center_z = 0.0f;
+    update_projection(app);
+  }
+
+  ImVec2 avail = ImGui::GetContentRegionAvail();
+  const int pw = std::max(64, static_cast<int>(avail.x));
+  const int ph = std::max(64, static_cast<int>(avail.y));
+  render_scene_to_fbo(app, pw, ph);
+
+  const ImVec2 img_pos = ImGui::GetCursorScreenPos();
+  /* Flip V so the GL texture (origin bottom-left) shows upright. */
+  /* ImTextureID is an integer in this ImGui build and a pointer in
+   * others. A C-style cast through uintptr_t compiles for both (it
+   * selects the valid integer- or pointer-conversion); static_cast and
+   * reinterpret_cast each only work for one of the two configurations.
+   * This is the idiom ImGui's own examples use for GL texture names. */
+  ImGui::Image((ImTextureID)(uintptr_t)app.scene_tex,
+               ImVec2(static_cast<float>(pw), static_cast<float>(ph)),
+               ImVec2(0, 1), ImVec2(1, 0));
+
+  const bool hovered = ImGui::IsItemHovered();
+  app.scene_hovered = hovered;
+  ImGuiIO &io = ImGui::GetIO();
+  if (hovered) {
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+      app.angle_y += io.MouseDelta.x * 0.4f;
+      app.angle_x += io.MouseDelta.y * 0.4f;
+    }
+    if (io.MouseWheel != 0.0f) {
+      app.zoom *= std::pow(1.15f, io.MouseWheel);
+      app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
+      update_projection(app);
+    }
+  }
+  (void)img_pos;
+  ImGui::TextDisabled(
+      "drag: rotate   wheel: zoom   (this is the real 3D view)");
+}
+
+/* PHASE6-UI: top toolbar — view switch, run controls, key stats. Fixed,
+ * full width, non-movable, drawn on top of the background plot. */
+void draw_top_toolbar(AppState &app) {
+  const float bar_h = 0.0f; (void)bar_h;
+  ImGui::SetNextWindowPos(ImVec2(0, 0));
+  ImGui::SetNextWindowSize(ImVec2(static_cast<float>(app.window_width), 0));
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                           ImGuiWindowFlags_NoTitleBar |
+                           ImGuiWindowFlags_NoScrollbar |
+                           ImGuiWindowFlags_NoCollapse |
+                           ImGuiWindowFlags_NoBringToFrontOnFocus;
+  ImGui::Begin("##toolbar", nullptr, flags);
+
+  /* Visible build stamp: if you don't see this line at the top of the
+   * window, you are running an OLD binary — rebuild (make clean && make).*/
+  ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f), "dynsys NEW-UI");
+  ImGui::SameLine();
+  ImGui::TextDisabled("(full-window plot)"); ImGui::SameLine();
+  ImGui::TextUnformatted("|"); ImGui::SameLine();
+
+  if (ImGui::Button(app.show_side_panel ? "<< panel" : "panel >>"))
+    app.show_side_panel = !app.show_side_panel;
+  ImGui::SameLine();
+  ImGui::TextUnformatted("|"); ImGui::SameLine();
+
+  /* View switch — 3D only offered when the system is 3D. */
+  const bool can3d = system_is_3d(app);
+  if (ImGui::RadioButton("2D phase", app.active_view == AppState::ActiveView::Phase2D))
+    app.active_view = AppState::ActiveView::Phase2D;
+  ImGui::SameLine();
+  if (can3d) {
+    if (ImGui::RadioButton("3D", app.active_view == AppState::ActiveView::Scene3D))
+      app.active_view = AppState::ActiveView::Scene3D;
+  } else {
+    ImGui::BeginDisabled();
+    bool dummy = false;
+    ImGui::RadioButton("3D", dummy);
+    ImGui::EndDisabled();
+    app.active_view = AppState::ActiveView::Phase2D;
+  }
+  ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
+
+  if (ImGui::Button(app.paused ? "Play" : "Pause")) app.paused = !app.paused;
+  ImGui::SameLine();
+  if (ImGui::Button("Reset")) reset_simulation(app);
+  ImGui::SameLine();
+  if (app.active_view == AppState::ActiveView::Phase2D) {
+    if (ImGui::Button("Clear orbits")) { app.phase_trajectories.clear(); app.separatrix_curves.clear(); }
+    ImGui::SameLine();
+  }
+  ImGui::TextDisabled("  %d FPS | %s | %dD%s", app.fps, mode_name(app.mode),
+                      effective_dimension(app),
+                      app.active_view == AppState::ActiveView::Phase2D
+                          ? "  | click: add orbit, drag: pan, wheel/+/-: zoom"
+                          : "  | drag: rotate, wheel/+/-: zoom");
+  app.window_toolbar_h = ImGui::GetWindowHeight();
+  ImGui::End();
+}
+
 void draw_gui(AppState &app) {
-  ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(470, 760), ImGuiCond_FirstUseEver);
-  ImGui::Begin("dynsys laboratory");
+  /* PHASE6-UI: render the active background plot first (behind panels). */
+  if (!(system_is_3d(app) && app.active_view == AppState::ActiveView::Scene3D))
+    render_phase_background(app);
+
+  draw_top_toolbar(app);
+
+  if (!app.show_side_panel) {
+    /* Side panel hidden: still need the analysis plots window? No — the
+     * background is the plot. Show nothing else. */
+    return;
+  }
+
+  const float top = app.window_toolbar_h > 0 ? app.window_toolbar_h : 32.0f;
+  ImGui::SetNextWindowPos(ImVec2(0, top), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(440, static_cast<float>(app.window_height) - top), ImGuiCond_FirstUseEver);
+  ImGuiWindowFlags side_flags = ImGuiWindowFlags_NoMove;
+  ImGui::Begin("controls", nullptr, side_flags);
 
   ImGui::Text("FPS: %d | mode: %s | integrator: %s | dim: %zu", app.fps, mode_name(app.mode), integrator_name(app.integrator), app.state_names.size());
   std::string state_line = "t " + std::to_string(app.current.t);
@@ -3643,6 +4364,75 @@ void draw_gui(AppState &app) {
     ImGui::Text("largest Lyapunov estimate: %.6g (%lld samples)", app.lyapunov_estimate, app.lyapunov_samples);
   }
   ImGui::Separator();
+
+  /* PHASE6-UI: phase-plane controls (axes, layers, seeding) — the plot
+   * itself is the window background; this drives it. Shown in 2D view. */
+  if (app.active_view == AppState::ActiveView::Phase2D &&
+      app.state_names.size() >= 2) {
+    if (ImGui::CollapsingHeader("Phase plane", ImGuiTreeNodeFlags_DefaultOpen)) {
+      const int ns = static_cast<int>(app.state_names.size());
+      app.phase_x_index = std::max(0, std::min(app.phase_x_index, ns - 1));
+      app.phase_y_index = std::max(0, std::min(app.phase_y_index, ns - 1));
+      if (ImGui::BeginCombo("x axis", app.state_names[(size_t)app.phase_x_index].c_str())) {
+        for (int i = 0; i < ns; ++i)
+          if (ImGui::Selectable(app.state_names[(size_t)i].c_str(), i == app.phase_x_index)) app.phase_x_index = i;
+        ImGui::EndCombo();
+      }
+      if (ImGui::BeginCombo("y axis", app.state_names[(size_t)app.phase_y_index].c_str())) {
+        for (int i = 0; i < ns; ++i)
+          if (ImGui::Selectable(app.state_names[(size_t)i].c_str(), i == app.phase_y_index)) app.phase_y_index = i;
+        ImGui::EndCombo();
+      }
+      ImGui::Checkbox("vector field", &app.phase_show_vector_field); ImGui::SameLine();
+      ImGui::Checkbox("nullclines", &app.phase_show_nullclines);
+      ImGui::Checkbox("nullcline arrows", &app.phase_show_nullcline_arrows);
+      ImGui::Checkbox("trajectories", &app.phase_show_trajectory); ImGui::SameLine();
+      ImGui::Checkbox("auto fixed points", &app.phase_auto_fixed_points);
+      ImGui::Checkbox("manifolds", &app.phase_show_manifolds); ImGui::SameLine();
+      ImGui::Checkbox("separatrices", &app.phase_show_separatrices);
+      ImGui::Checkbox("equal aspect", &app.phase_equal_aspect); ImGui::SameLine();
+      ImGui::Checkbox("normalize arrows", &app.phase_normalize_vectors);
+      ImGui::Checkbox("auto-fit bounds", &app.phase_auto_bounds);
+      ImGui::SliderInt("grid density", &app.phase_grid, 8, 48);
+      if (app.phase_auto_fixed_points && app.mode == SystemMode::ODE)
+        ImGui::TextDisabled("equilibria in view: %zu (auto-classified)", app.phase_fixed_points.size());
+      ImGui::Text("orbits: %zu", app.phase_trajectories.size());
+      /* Seeding uses the current view bounds for the active axis pair. */
+      PlotBounds vb = current_phase_bounds(app, (size_t)app.phase_x_index, (size_t)app.phase_y_index);
+      if (ImGui::Button("Seed 5x5 grid")) seed_phase_grid(app, vb, (size_t)app.phase_x_index, (size_t)app.phase_y_index, 5, 5);
+      ImGui::SameLine();
+      if (ImGui::Button("Seed circle")) seed_phase_circle(app, vb, (size_t)app.phase_x_index, (size_t)app.phase_y_index, 16);
+      ImGui::SameLine();
+      if (ImGui::Button("Clear orbits")) { app.phase_trajectories.clear(); app.separatrix_curves.clear(); }
+
+      /* PHASE6-UI: add an orbit from EXACT typed initial conditions. */
+      if (ImGui::TreeNode("Add custom orbit")) {
+        if (app.custom_orbit_ic.size() != app.state_names.size()) {
+          app.custom_orbit_ic.assign(app.state_names.size(), 0.0f);
+          for (size_t i = 0; i < app.state_names.size(); ++i)
+            app.custom_orbit_ic[i] = static_cast<float>(state_at(app.current, i));
+        }
+        for (size_t i = 0; i < app.state_names.size(); ++i) {
+          ImGui::PushID(static_cast<int>(i));
+          ImGui::InputFloat(app.state_names[i].c_str(), &app.custom_orbit_ic[i], 0.0f, 0.0f, "%.5g");
+          ImGui::PopID();
+        }
+        if (ImGui::Button("Add orbit at these values")) {
+          State seed = app.current;
+          resize_state(seed, app.state_names.size());
+          for (size_t i = 0; i < app.state_names.size(); ++i)
+            set_state_at(seed, i, app.custom_orbit_ic[i]);
+          add_phase_trajectory(app, seed);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Use current state")) {
+          for (size_t i = 0; i < app.state_names.size(); ++i)
+            app.custom_orbit_ic[i] = static_cast<float>(state_at(app.current, i));
+        }
+        ImGui::TreePop();
+      }
+    }
+  }
 
   if (ImGui::Button(app.paused ? "Resume" : "Pause")) app.paused = !app.paused;
   ImGui::SameLine();
@@ -3674,6 +4464,24 @@ void draw_gui(AppState &app) {
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu defs, %zu params, %zu observables", app.definitions.size(), app.params.size(), app.observables.size());
+
+    /* PHASE6-UI: dimensionality. Show what was auto-detected and let the
+     * user override it. This controls whether the 3D view is offered and
+     * how the system is treated, fixing "2D things treated as 3D" while
+     * keeping the user in charge. */
+    ImGui::Text("dimension: %d state vars, detected %d effective%s",
+                static_cast<int>(app.state_names.size()), app.detected_dim,
+                app.detected_dim < static_cast<int>(app.state_names.size())
+                    ? " (has a trivial/dummy dimension)"
+                    : "");
+    int dim_mode = static_cast<int>(app.dim_override);
+    const char *dim_modes[] = {"Auto (detected)", "Force 2D (phase only)",
+                               "Force 3D"};
+    if (ImGui::Combo("treat as", &dim_mode, dim_modes, 3))
+      app.dim_override = static_cast<AppState::DimOverride>(dim_mode);
+    ImGui::SameLine();
+    ImGui::TextDisabled("now: %dD", effective_dimension(app));
+
     if (ImGui::TreeNode("Syntax")) {
       ImGui::TextWrapped("state x, y, z, w declares any dimension. ODEs use dx/dt or dx for every state variable; maps use x_next or x'.");
       ImGui::TextWrapped("plot3d = x, y, z chooses the 3D projection. param rho = 28 [0,100] creates a live slider.");
@@ -3904,13 +4712,18 @@ void draw_gui(AppState &app) {
     if (ImGui::Button("Export Poincare CSV")) export_poincare_csv(app);
   }
 
-  if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+  if (ImGui::CollapsingHeader("3D view controls")) {
     if (!system_is_3d(app)) {
       ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
-                         "2D system: the 3D view is hidden (it would just "
-                         "duplicate the phase plane).");
-      ImGui::TextDisabled("Use the 'phase plane' tab as the 2D view. The 3D "
-                          "controls below apply once a 3rd state is declared.");
+                         "This system is %dD — the 3D view tab is hidden.",
+                         effective_dimension(app));
+      ImGui::TextDisabled(
+          "Use the 'phase plane' tab. To force a 3D view, set 'treat as' to "
+          "Force 3D in the System editor.");
+    } else {
+      ImGui::TextDisabled(
+          "The 3D scene is the '3D view' tab (drag to rotate, wheel to zoom). "
+          "These are fine controls for the same camera.");
     }
     ImGui::Checkbox("axes", &app.show_axes); ImGui::SameLine(); ImGui::Checkbox("center cross", &app.show_center_cross);
     if (ImGui::Checkbox("orthographic 3D", &app.orthographic_3d)) update_projection(app);
@@ -3930,37 +4743,28 @@ void draw_gui(AppState &app) {
   }
 
   if (ImGui::CollapsingHeader("Keyboard / mouse help")) {
-    ImGui::TextWrapped("Mouse drag rotates, wheel zooms using stable model scaling. WASD rotate, +/- zoom, space pause, C reset, X axes, Z cross, comma/period speed, M/slash halve/double speed, V/B halve/double dt, Esc quit.");
+    ImGui::TextWrapped("2D phase: left-click adds an orbit through the point, "
+                       "shift+click restarts the live orbit, left-drag pans, "
+                       "wheel or +/- zooms, double-click auto-fits. "
+                       "3D: drag rotates, wheel or +/- zooms. "
+                       "Space play/pause, C reset, Esc quit.");
   }
-  ImGui::End();
 
-  ImGui::SetNextWindowPos(ImVec2(500, 12), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(560, 760), ImGuiCond_FirstUseEver);
-  ImGui::Begin("analysis plots");
-  if (ImGui::BeginTabBar("plots")) {
-    if (ImGui::BeginTabItem("phase plane")) {
-      draw_phase_plane(app, ImVec2(-FLT_MIN, 520));
-      ImGui::EndTabItem();
+  /* PHASE6-UI: time series and Poincare live in the side panel now that
+   * the phase/3D plots are the window background. */
+  if (ImGui::CollapsingHeader("Time series")) {
+    for (const auto &name : app.state_names) {
+      std::string title = name + "(t)";
+      draw_series_plot(app, title.c_str(), name.c_str(), ImVec2(-FLT_MIN, 90));
     }
-    if (ImGui::BeginTabItem("time series")) {
-      for (const auto &name : app.state_names) {
-        std::string title = name + "(t)";
-        draw_series_plot(app, title.c_str(), name.c_str(), ImVec2(-FLT_MIN, 120));
-      }
-      for (const auto &obs : app.observables) {
-        draw_series_plot(app, obs.name.c_str(), obs.name.c_str(), ImVec2(-FLT_MIN, 120));
-      }
-      ImGui::EndTabItem();
-    }
-    if (ImGui::BeginTabItem("Poincare")) {
-      draw_scatter_plot("Poincare section", app.poincare_points, ImVec2(-FLT_MIN, 500));
-      ImGui::EndTabItem();
-    }
-    ImGui::EndTabBar();
+    for (const auto &obs : app.observables)
+      draw_series_plot(app, obs.name.c_str(), obs.name.c_str(), ImVec2(-FLT_MIN, 90));
   }
-  ImGui::End();
+  if (ImGui::CollapsingHeader("Poincare section")) {
+    draw_scatter_plot("Poincare section", app.poincare_points, ImVec2(-FLT_MIN, 300));
+  }
 
-  draw_center_cross(app);
+  ImGui::End(); /* controls side panel */
 }
 
 bool init_glfw_window(AppState &app, GLFWwindow **out_window) {
@@ -4150,7 +4954,17 @@ int main(int argc, char **argv) {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
-    draw_scene(app);
+    /* PHASE6-UI: the active plot is the full-window background. For 3D we
+     * render geometry straight to the backbuffer now; for 2D we clear and
+     * the phase plane paints itself via the ImGui background draw list
+     * inside draw_gui. */
+    const bool want_3d = system_is_3d(app) &&
+                         app.active_view == AppState::ActiveView::Scene3D;
+    if (want_3d) {
+      render_scene_background(app);
+    } else {
+      draw_scene(app);
+    }
     draw_gui(app);
     ImGui::Render();
     glViewport(0, 0, app.window_width, app.window_height);
@@ -4161,6 +4975,9 @@ int main(int argc, char **argv) {
   glDeleteBuffers(1, &app.vbo);
   glDeleteBuffers(1, &app.cbo);
   glDeleteProgram(app.shader_program);
+  if (app.scene_fbo) glDeleteFramebuffers(1, &app.scene_fbo);
+  if (app.scene_tex) glDeleteTextures(1, &app.scene_tex);
+  if (app.scene_depth) glDeleteRenderbuffers(1, &app.scene_depth);
   shutdown_imgui();
   glfwDestroyWindow(window);
   glfwTerminate();

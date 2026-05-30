@@ -154,4 +154,35 @@ struct Branch {
 Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
                             double p0, const ContinuationSettings &settings);
 
+/* ---- 2D fixed-point scanning (pplane-style) ----------------- *
+ * Find ALL equilibria of a planar vector field inside a rectangle by
+ * launching Newton from a grid of seeds, deduplicating the converged
+ * roots, and classifying each. AppState-free: the field is supplied as
+ * a callback f(x,y) -> (u,v). */
+struct PlanarField {
+  /* write (u, v) = f(x, y); return false on eval error. */
+  std::function<bool(double x, double y, double *u, double *v)> eval;
+};
+
+struct FixedPoint2D {
+  double x = 0.0, y = 0.0;
+  std::vector<double> jacobian;      /* 2x2 row-major */
+  std::vector<Complex> eigenvalues;  /* 2 entries */
+  std::string label;                 /* saddle / stable node / ... */
+  bool is_saddle = false;
+  /* Real eigenvector directions (unit), present when the eigenvalues are
+   * real; used to draw stable/unstable manifolds. dir[k] pairs with
+   * eigenvalues[k]; empty when complex. */
+  std::vector<std::pair<double, double>> directions;
+};
+
+/* Scan [xmin,xmax] x [ymin,ymax] with a seeds x seeds grid of Newton
+ * starts. `dedup_tol` is in data units (points closer than this are the
+ * same root). Returns the distinct classified equilibria found. */
+std::vector<FixedPoint2D> scan_fixed_points_2d(const PlanarField &field,
+                                               double xmin, double xmax,
+                                               double ymin, double ymax,
+                                               int seeds = 11,
+                                               double dedup_tol_frac = 0.01);
+
 }  // namespace dynsys::analysis
