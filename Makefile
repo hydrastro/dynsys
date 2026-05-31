@@ -202,6 +202,11 @@ IR_TEST_C_OBJS := $(patsubst %.c,$(TEST_OBJ_DIR)/%.o,$(C_SRCS))
 IR_TEST_OBJS := $(IR_TEST_CPP_OBJS) $(IR_TEST_C_OBJS)
 PARAMSYNC_OBJS := $(TEST_OBJ_DIR)/test/paramsync_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
 BOXDIM_TEST_TARGET := $(BUILD_DIR)/boxdim_smoke$(EXEEXT)
+IFS_TEST_TARGET := $(BUILD_DIR)/ifs_smoke$(EXEEXT)
+LC_TEST_TARGET := $(BUILD_DIR)/limitcycle_smoke$(EXEEXT)
+LCSWEEP_TEST_TARGET := $(BUILD_DIR)/lcsweep_smoke$(EXEEXT)
+IFSMODEL_TEST_TARGET := $(BUILD_DIR)/ifsmodel_smoke$(EXEEXT)
+IFSPARAM_TEST_TARGET := $(BUILD_DIR)/ifsparam_smoke$(EXEEXT)
 
 IMGUI_CORE_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp
 IMGUI_BACKEND_SRCS := imgui_impl_glfw.cpp imgui_impl_opengl3.cpp
@@ -306,7 +311,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -542,4 +547,39 @@ test-boxdim: $(BOXDIM_TEST_TARGET)
 $(BOXDIM_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp -o $@ -lm
+
+test-ifs: $(IFS_TEST_TARGET)
+	./$(IFS_TEST_TARGET)
+
+$(IFS_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifs_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifs_smoke.cpp -o $@ -lm
+
+test-limitcycle: $(LC_TEST_TARGET)
+	./$(LC_TEST_TARGET)
+
+$(LC_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/limitcycle_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/limitcycle_smoke.cpp -o $@ -lm
+
+test-lcsweep: $(LCSWEEP_TEST_TARGET)
+	./$(LCSWEEP_TEST_TARGET)
+
+$(LCSWEEP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/lcsweep_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/lcsweep_smoke.cpp -o $@ -lm
+
+test-ifsmodel: $(IFSMODEL_TEST_TARGET)
+	./$(IFSMODEL_TEST_TARGET)
+
+$(IFSMODEL_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifsmodel_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsmodel_smoke.cpp -o $@ -lm
+
+test-ifsparam: $(IFSPARAM_TEST_TARGET)
+	./$(IFSPARAM_TEST_TARGET)
+
+$(IFSPARAM_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp -o $@ -lm
 

@@ -106,6 +106,7 @@ struct KeyState {
 enum class SystemMode {
   ODE,
   Map,
+  IFS,  /* iterated function system: affine maps + chaos game */
 };
 
 enum class Integrator {
@@ -124,8 +125,32 @@ enum class SectionDirection {
   Negative,
 };
 
+/* Infer a reasonable [lo,hi] slider range for a value that has no declared
+ * range, based on its current magnitude. Symmetric around 0 for small
+ * values, widened to a round number so dragging feels natural. */
+void auto_slider_range(double value, double *lo, double *hi) {
+  const double a = std::fabs(value);
+  double span;
+  if (a < 1e-9) span = 1.0;               /* zero-ish: a unit window */
+  else {
+    /* round the magnitude up to 1/2/5 x 10^k, then use a few of them */
+    const double mag = std::pow(10.0, std::floor(std::log10(a)));
+    const double n = a / mag;
+    const double step = n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10;
+    span = 4.0 * step * mag;
+  }
+  if (value >= 0) { *lo = 0.0; *hi = span; if (value > span) *hi = value * 1.5; }
+  else { *hi = 0.0; *lo = -span; if (value < -span) *lo = value * 1.5; }
+  /* if the value sits at an edge, pad both sides so it isn't pinned */
+  if (*hi - *lo < 1e-9) { *lo = value - 1.0; *hi = value + 1.0; }
+}
+
 const char *mode_name(SystemMode mode) {
-  return mode == SystemMode::Map ? "map" : "ode";
+  switch (mode) {
+    case SystemMode::Map: return "map";
+    case SystemMode::IFS: return "ifs";
+    default: return "ode";
+  }
 }
 
 const char *integrator_name(Integrator integrator) {
@@ -165,6 +190,11 @@ struct AppState {
     double max_value = 10.0;
     bool has_range = false;
     int line = 0;
+    /* UI scratch (auto-slider): when the model declared no [min,max], we
+     * synthesize an editable range from the value's magnitude. */
+    double ui_lo = 0.0, ui_hi = 0.0;
+    bool ui_range_init = false;
+    bool ui_show_exact = false;
   };
 
   struct Observable {
@@ -225,6 +255,22 @@ struct AppState {
   State scratch_k1, scratch_k2, scratch_k3, scratch_k4, scratch_mid;
 
   SystemMode mode = SystemMode::ODE;
+  /* PHASE C: when mode == IFS, the system is a list of affine maps run via
+   * the chaos game (no state-vector ODE/map equations). The maps may have
+   * coefficients that are EXPRESSIONS in the parameters (e.g. a rotation
+   * angle), so we store parsed ASTs and evaluate them against the current
+   * parameter values at render time. ifs_maps holds the last evaluated
+   * numeric maps (for chaos_game / dimension). */
+  std::vector<dynsys::analysis::AffineMap> ifs_maps;
+  struct IFSMapExpr { node_t *a=nullptr,*b=nullptr,*c=nullptr,*d=nullptr,*e=nullptr,*f=nullptr,*p=nullptr; };
+  std::vector<IFSMapExpr> ifs_map_exprs;   /* parsed coefficient expressions */
+  arena_t ifs_arena{};                     /* owns the ifs_map_exprs ASTs */
+  bool ifs_arena_init = false;
+  /* true when every coefficient is a plain constant (no parameter
+   * expressions): then the maps can be edited directly as numbers in the
+   * IFS maps panel. When false (parametrized), the panel shows evaluated
+   * values read-only and you tweak via the parameter sliders. */
+  bool ifs_maps_editable = false;
   Integrator integrator = Integrator::RK4;
   /* PHASE B: adaptive-step controls (RKF45 / DOPRI45). The visible dt is
    * the target output step; adaptive methods subdivide internally to meet
@@ -321,7 +367,7 @@ struct AppState {
   /* PHASE6-UI: which plot fills the window background. */
   /* PHASE-A: the active system exposes a set of full-area views; the
    * toolbar offers only the ones valid for its dimension/mode. */
-  enum class ActiveView { Line1D, Phase2D, Scene3D, Bifurcation, Fractal, Scene3DBridge, Basins, ParamScan2D, Continuation };
+  enum class ActiveView { Line1D, Phase2D, Scene3D, Bifurcation, Fractal, Scene3DBridge, Basins, ParamScan2D, Continuation, IFS, LimitCycle };
   ActiveView active_view = ActiveView::Phase2D;
   bool show_side_panel = true;
   float window_toolbar_h = 32.0f;
@@ -365,6 +411,39 @@ struct AppState {
   double boxdim_r2 = 0.0;
   long boxdim_n_points = 0;
   std::string boxdim_msg;
+
+  /* PHASE D step 2 (foundation): limit-cycle period & amplitude of the
+   * current trajectory (oscillating ODEs). */
+  bool lc_ready = false;
+  double lc_period = 0.0;
+  double lc_amplitude = 0.0;
+  std::string lc_msg;
+
+  /* PHASE D step 2: limit-cycle continuation diagram. Sweep a parameter,
+   * measure the periodic orbit's period & amplitude at each value, and plot
+   * both curves vs the parameter (amplitude growing from zero marks a Hopf
+   * bifurcation). */
+  char lcc_param[64] = {0};
+  double lcc_p_min = 0.0, lcc_p_max = 3.0;
+  int lcc_slices = 80;
+  bool lcc_has_data = false;
+  bool lcc_autorun_done = false;
+  std::string lcc_msg;
+  std::vector<double> lcc_pp;       /* parameter value per slice */
+  std::vector<double> lcc_period;   /* measured period (NaN where no cycle) */
+  std::vector<double> lcc_amp;      /* measured amplitude (0 where no cycle) */
+  double lcc_amp_max = 1.0, lcc_period_max = 1.0; /* for axis scaling */
+
+  /* PHASE C: IFS / chaos game view. A built-in gallery of iterated function
+   * systems (fern, Sierpinski, dragon, tree), rendered via the chaos game
+   * into a density texture (reusing the fractal/basin texture pipeline). */
+  int ifs_selected = 0;          /* index into the built-in IFS gallery */
+  long ifs_iterations = 400000;
+  GLuint ifs_tex = 0;
+  int ifs_tex_w = 0, ifs_tex_h = 0;
+  bool ifs_dirty = true;
+  double ifs_box_dim = 0.0;      /* measured dimension of the current attractor */
+  bool ifs_box_dim_ready = false;
 
   char export_path[256] = "dynsys_export.csv";
   char bif_param[64] = "rho";
@@ -1491,6 +1570,125 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
 
   const std::vector<std::string> lines = split_lines(system_text);
 
+  /* PHASE C: IFS systems are parsed separately — they're a list of affine
+   * maps run via the chaos game, with no state-vector equations. Detect
+   * `mode = ifs` first and handle it here, so we don't run the ODE/map
+   * equation machinery (which would reject the lack of x' = ... lines). */
+  {
+    bool is_ifs = false;
+    for (const std::string &raw : lines) {
+      const std::string ln = trim_copy(raw);
+      if (ln.empty() || ln[0] == '#') continue;
+      const size_t eq = ln.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string lhs = trim_copy(ln.substr(0, eq));
+      const std::string rhs = trim_copy(ln.substr(eq + 1));
+      if ((lhs == "mode" || lhs == "type") && rhs == "ifs") { is_ifs = true; break; }
+    }
+    if (is_ifs) {
+      /* Parse parameters (so an IFS can be parametrized) and affine maps
+       * whose coefficients are EXPRESSIONS (so a coefficient can reference a
+       * parameter, e.g. a rotation angle). Coefficients are evaluated to
+       * numbers at render time against the current parameter values. */
+      if (app.ifs_arena_init) { arena_destroy(&app.ifs_arena); app.ifs_arena_init = false; }
+      arena_init(&app.ifs_arena, 256 * 1024);
+      app.ifs_arena_init = true;
+
+      std::vector<AppState::Param> ifs_params;
+      std::vector<AppState::IFSMapExpr> map_exprs;
+      bool ok = true;
+      std::string local_err;
+
+      auto parse_field = [&](const std::string &expr, const std::string &label) -> node_t * {
+        node_t *n = parse_expression_or_fail(&app.ifs_arena, expr, label, &local_err);
+        if (!n) ok = false;
+        return n;
+      };
+
+      for (size_t i = 0; i < lines.size() && ok; ++i) {
+        std::string ln = trim_copy(strip_line_comment(lines[i]));
+        if (ln.empty()) continue;
+        /* param name = value [min,max] — reuse the same surface syntax */
+        if (starts_with(ln, "param ")) {
+          const std::string rest = trim_copy(ln.substr(6));
+          const size_t eq = rest.find('=');
+          if (eq == std::string::npos) { local_err = "line " + std::to_string(i + 1) + ": expected 'param name = value [min,max]'"; ok = false; break; }
+          std::string name = trim_copy(rest.substr(0, eq));
+          std::string rhs = trim_copy(rest.substr(eq + 1));
+          AppState::Param p; p.name = name; p.line = (int)i + 1;
+          /* optional [min,max] */
+          const size_t lb = rhs.find('[');
+          if (lb != std::string::npos) {
+            const size_t rb = rhs.find(']', lb);
+            if (rb != std::string::npos) {
+              std::string range = rhs.substr(lb + 1, rb - lb - 1);
+              rhs = trim_copy(rhs.substr(0, lb));
+              const size_t comma = range.find(',');
+              if (comma != std::string::npos) {
+                try { p.min_value = std::stod(trim_copy(range.substr(0, comma)));
+                      p.max_value = std::stod(trim_copy(range.substr(comma + 1)));
+                      p.has_range = true; } catch (...) {}
+              }
+            }
+          }
+          try { p.value = std::stod(trim_copy(rhs)); } catch (...) { local_err = "line " + std::to_string(i + 1) + ": IFS param value must be a number"; ok = false; break; }
+          p.default_value = p.value;
+          ifs_params.push_back(p);
+          continue;
+        }
+        const size_t eqp = ln.find('=');
+        if (eqp == std::string::npos) continue;
+        const std::string lhs = trim_copy(ln.substr(0, eqp));
+        const std::string rhs = trim_copy(ln.substr(eqp + 1));
+        if (lhs == "mode" || lhs == "type") continue;
+        if (lhs == "ifs_map" || lhs == "map") {
+          /* split into 6 or 7 comma-separated EXPRESSION fields */
+          std::vector<std::string> fields; std::string cur;
+          for (char ch : rhs + ",") { if (ch == ',') { fields.push_back(trim_copy(cur)); cur.clear(); } else cur += ch; }
+          while (!fields.empty() && fields.back().empty()) fields.pop_back();
+          if (fields.size() < 6) { local_err = "line " + std::to_string(i + 1) + ": ifs_map needs 6 fields a,b,c,d,e,f (+ optional p)"; ok = false; break; }
+          AppState::IFSMapExpr m;
+          m.a = parse_field(fields[0], "ifs a"); m.b = parse_field(fields[1], "ifs b");
+          m.c = parse_field(fields[2], "ifs c"); m.d = parse_field(fields[3], "ifs d");
+          m.e = parse_field(fields[4], "ifs e"); m.f = parse_field(fields[5], "ifs f");
+          if (fields.size() >= 7 && !fields[6].empty()) m.p = parse_field(fields[6], "ifs p");
+          map_exprs.push_back(m);
+        }
+      }
+      if (!ok) { *error = local_err; arena_destroy(&app.ifs_arena); app.ifs_arena_init = false; return false; }
+      if (map_exprs.empty()) { *error = "an IFS needs at least one 'ifs_map = a,b,c,d,e,f' line"; arena_destroy(&app.ifs_arena); app.ifs_arena_init = false; return false; }
+
+      /* commit the IFS system */
+      app.mode = SystemMode::IFS;
+      app.ifs_map_exprs = std::move(map_exprs);
+      app.state_names = {"x", "y"};
+      app.params = std::move(ifs_params);
+      app.definitions.clear();
+      app.observables.clear();
+      app.parse_error.clear();
+      app.detected_dim = 2;
+      sync_param_values(app);             /* make param values available to eval */
+      /* the maps are directly editable iff there are no parameters AND every
+       * coefficient is a literal number (so editing a value can't fight an
+       * expression). */
+      app.ifs_maps_editable = app.params.empty();
+      auto is_literal = [](node_t *n) -> bool {
+        if (!n) return true; /* absent p is fine */
+        if (n->kind != NODE_CONST) return false;
+        if (!n->cnst.name) return false;
+        char *end = nullptr; std::strtod(n->cnst.name, &end);
+        return end && *end == '\0';
+      };
+      for (const auto &me : app.ifs_map_exprs)
+        if (!(is_literal(me.a) && is_literal(me.b) && is_literal(me.c) && is_literal(me.d) &&
+              is_literal(me.e) && is_literal(me.f) && is_literal(me.p))) { app.ifs_maps_editable = false; break; }
+      app.ifs_dirty = true;
+      app.ifs_selected = -1;
+      app.ifs_maps.clear();               /* evaluated lazily at render time */
+      return true;
+    }
+  }
+
   std::vector<std::string> next_state_names = {"x", "y", "z"};
   for (size_t line_no = 0; line_no < lines.size(); ++line_no) {
     const std::string line = trim_copy(strip_line_comment(lines[line_no]));
@@ -1653,8 +1851,9 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
       explicit_mode = true;
       if (rhs == "ode" || rhs == "continuous") next_mode = SystemMode::ODE;
       else if (rhs == "map" || rhs == "discrete") next_mode = SystemMode::Map;
+      else if (rhs == "ifs") next_mode = SystemMode::IFS;
       else {
-        *error = "line " + std::to_string(line_no + 1) + ": mode must be 'ode' or 'map'";
+        *error = "line " + std::to_string(line_no + 1) + ": mode must be 'ode', 'map', or 'ifs'";
         arena_destroy(&next_arena);
         return false;
       }
@@ -1959,6 +2158,11 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   app.equations = std::move(next_equations);
   app.next_equations = std::move(next_next_equations);
   app.mode = next_mode;
+  /* leaving IFS (or recompiling as ODE/map): drop any IFS maps/expressions
+   * so nothing stale lingers (their arena is freed too). */
+  app.ifs_map_exprs.clear();
+  app.ifs_maps.clear();
+  if (app.ifs_arena_init) { arena_destroy(&app.ifs_arena); app.ifs_arena_init = false; }
   app.poincare_enabled = next_poincare_enabled;
   app.section_body = next_section_body;
   app.section_x_body = next_section_x_body;
@@ -2204,6 +2408,7 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
     app.bif_view_valid = false;
     app.bif_autorun_done = false; /* let the new system auto-run its sweep on entry */
     app.cont_autorun_done = false; /* and re-trace continuation on entry */
+    app.lcc_autorun_done = false; app.lcc_has_data = false; /* re-sweep LC on a new system */
   }
   return true;
 }
@@ -2384,6 +2589,9 @@ domega = 0 - sin(theta)
     {"Complex quadratic (Mandelbrot/Julia)", "Fractals", "# z -> z^2 + c  (x+iy)^2 + (cx+i cy)\n# Fractal view: parameter space = Mandelbrot, state space = Julia.\nstate x, y\nmode = map\nparam cx = 0 [-2,2]\nparam cy = 0 [-2,2]\nview2d = -2, 2, -2, 2\nx_next = x*x - y*y + cx\ny_next = 2*x*y + cy\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Henon map 2D", "N-dimensional examples", "# Hénon map as a true 2D state\nstate x, y\nmode = map\nview2d = -1.5, 1.5, -0.5, 0.5\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nplot3d = x, y, 0\nx_next = 1 - a * x * x + y\ny_next = b * x\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"4D coupled oscillator demo", "N-dimensional examples", "# Four-dimensional demo system\nstate x, y, z, w\nmode = ode\nintegrator = rk4\nparam a = 0.1 [0,1]\nplot3d = x, y, w\nobserve r4 = sqrt(x*x + y*y + z*z + w*w)\nsection = w\nsection_direction = positive\nsection_plot = x, z\ninitial x = 0.1\ninitial y = 0\ninitial z = 0\ninitial w = 0.2\ndx = y\ndy = 0 - x - a*y + z\ndz = w\ndw = 0 - z - a*w + x\n", {0.1,0.0,0.0,0}, 0.01, 3, Integrator::RK4,1.0f,0,0,0},
+    {"Barnsley fern (IFS)", "Fractals", "# Barnsley fern — an iterated function system.\n# Four affine maps a,b,c,d,e,f with selection probability p.\n# Opens in the IFS view; the chaos game draws the attractor.\nmode = ifs\nifs_map = 0, 0, 0, 0.16, 0, 0, 0.01\nifs_map = 0.85, 0.04, -0.04, 0.85, 0, 1.6, 0.85\nifs_map = 0.2, -0.26, 0.23, 0.22, 0, 1.6, 0.07\nifs_map = -0.15, 0.28, 0.26, 0.24, 0, 0.44, 0.07\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Sierpinski triangle (IFS)", "Fractals", "# Sierpinski triangle as an IFS (three half-scale maps).\nmode = ifs\nifs_map = 0.5, 0, 0, 0.5, 0, 0, 0.333\nifs_map = 0.5, 0, 0, 0.5, 0.5, 0, 0.333\nifs_map = 0.5, 0, 0, 0.5, 0.25, 0.5, 0.334\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Spiral IFS (parametrized)", "Fractals", "# A PARAMETRIZED IFS: drag 'theta' (rotation) and 's' (scale) in the\n# Parameters panel and watch the attractor change live.\n# Coefficients are EXPRESSIONS in the parameters.\nmode = ifs\nparam theta = 0.6 [0, 3.14159]\nparam s = 0.62 [0.3, 0.72]\nifs_map = s*cos(theta), 0 - s*sin(theta), s*sin(theta), s*cos(theta), 0, 0, 0.5\nifs_map = s*cos(theta), 0 - s*sin(theta), s*sin(theta), s*cos(theta), 0.5, 0, 0.5\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
 };
 
 constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
@@ -2561,6 +2769,7 @@ void restart_main_from_state(AppState &app, const State &seed) {
 bool step_ode_state(AppState &app, const State &in, State *out, char *err, size_t err_cap);
 void run_bifurcation(AppState &app); /* PHASE B+: used by the in-view control strip */
 void run_continuation(AppState &app); /* PHASE D: equilibrium branch tracer */
+void run_lc_continuation(AppState &app); /* PHASE D step 2: limit-cycle sweep */
 
 void add_phase_trajectory(AppState &app, const State &seed, const char *label_prefix = "orbit") {
   if (static_cast<int>(app.phase_trajectories.size()) >= app.phase_max_extra_trajectories) {
@@ -3002,8 +3211,34 @@ bool system_is_3d(const AppState &app) {
  *   3D scene       : >= 3 effective dimensions
  *   bifurcation    : any system that has at least one parameter
  * (effective dimension respects the Force2D/Force3D override.) */
+/* Human-readable reason a view applies (or what it needs). Paired with
+ * view_valid so the UI can explain *why* a view is unavailable instead of
+ * silently greying it out — making the consistency model legible. */
+const char *view_requirement(AppState::ActiveView v) {
+  switch (v) {
+    case AppState::ActiveView::Line1D:      return "1-D systems (one state variable)";
+    case AppState::ActiveView::Phase2D:     return "2 or more state variables";
+    case AppState::ActiveView::Scene3D:     return "3-D systems (three state variables)";
+    case AppState::ActiveView::Bifurcation: return "a system with at least one parameter";
+    case AppState::ActiveView::Fractal:     return "a 2-D map (escape-time iteration)";
+    case AppState::ActiveView::Scene3DBridge: return "a 1-D map (the logistic/Mandelbrot bridge)";
+    case AppState::ActiveView::Basins:      return "2+ state variables (and ideally several attractors)";
+    case AppState::ActiveView::ParamScan2D: return "at least two parameters";
+    case AppState::ActiveView::Continuation: return "an ODE with a parameter (equilibrium tracing)";
+    case AppState::ActiveView::IFS:         return "always available (a self-contained fractal gallery)";
+    case AppState::ActiveView::LimitCycle:  return "an ODE with a parameter (periodic-orbit tracing)";
+  }
+  return "";
+}
+
 bool view_valid(const AppState &app, AppState::ActiveView v) {
   const int d = effective_dimension(app);
+  /* IFS systems are a list of affine maps run via the chaos game: they are
+   * a planar object, so they display in the 2D phase view (like any other
+   * system shows there). No ODE/map-specific views apply (no vector field,
+   * parameter, or equilibria). */
+  if (app.mode == SystemMode::IFS)
+    return v == AppState::ActiveView::Phase2D;
   switch (v) {
     case AppState::ActiveView::Line1D:      return d == 1;
     case AppState::ActiveView::Phase2D:     return d >= 2;
@@ -3011,20 +3246,19 @@ bool view_valid(const AppState &app, AppState::ActiveView v) {
     case AppState::ActiveView::Bifurcation: return !app.params.empty();
     case AppState::ActiveView::Fractal:     return app.mode == SystemMode::Map && app.state_names.size() >= 2;
     case AppState::ActiveView::Scene3DBridge:
-      /* The Mandelbrot<->bifurcation bridge is meaningful for 1D maps (the
-       * logistic family), whose period-doubling cascade embeds in the
-       * Mandelbrot needle. It isn't relevant to general ODEs/maps, so only
-       * offer it there. */
       return app.mode == SystemMode::Map && effective_dimension(app) == 1;
     case AppState::ActiveView::Basins:      return app.state_names.size() >= 2;
     case AppState::ActiveView::ParamScan2D: return app.params.size() >= 2;
     case AppState::ActiveView::Continuation: return app.mode == SystemMode::ODE && !app.params.empty();
+    case AppState::ActiveView::IFS: return true; /* the standalone gallery is always available */
+    case AppState::ActiveView::LimitCycle: return app.mode == SystemMode::ODE && !app.params.empty();
   }
   return false;
 }
 
 /* A sensible default view for a freshly compiled system. */
 AppState::ActiveView default_view_for(const AppState &app) {
+  if (app.mode == SystemMode::IFS) return AppState::ActiveView::Phase2D;
   const int d = effective_dimension(app);
   if (d <= 1) return AppState::ActiveView::Line1D;
   if (d >= 3) return AppState::ActiveView::Scene3D;
@@ -4557,6 +4791,174 @@ void render_fractal_background(AppState &app) {
 }
 
 /* ============================================================
+ * PHASE C: IFS / chaos game.
+ * A built-in gallery of iterated function systems; the chaos game renders
+ * each attractor into a density texture. The fractal dimension of the
+ * result is measured with box_counting_dimension (cross-checking it).
+ * ============================================================ */
+struct IFSPreset {
+  const char *name;
+  std::vector<dynsys::analysis::AffineMap> maps;
+};
+
+const std::vector<IFSPreset> &ifs_gallery() {
+  static const std::vector<IFSPreset> g = {
+    { "Barnsley fern", {
+        {0.0,  0.0,  0.0,  0.16, 0.0, 0.0,  0.01},
+        {0.85, 0.04, -0.04,0.85, 0.0, 1.6,  0.85},
+        {0.2, -0.26, 0.23, 0.22, 0.0, 1.6,  0.07},
+        {-0.15,0.28, 0.26, 0.24, 0.0, 0.44, 0.07} } },
+    { "Sierpinski triangle", {
+        {0.5,0,0,0.5, 0.0,  0.0, 1.0/3},
+        {0.5,0,0,0.5, 0.5,  0.0, 1.0/3},
+        {0.5,0,0,0.5, 0.25, 0.5, 1.0/3} } },
+    { "Dragon curve", {
+        {0.824074, 0.281482, -0.212346, 0.864198, -1.882290, -0.110607, 0.787473},
+        {0.088272, 0.520988, -0.463889, -0.377778, 0.785360, 8.095795, 0.212527} } },
+    { "Fractal tree", {
+        {0.0,  0.0,  0.0,  0.5,  0.0, 0.0,  0.05},
+        {0.42,-0.42, 0.42, 0.42, 0.0, 0.2,  0.40},
+        {0.42, 0.42,-0.42, 0.42, 0.0, 0.2,  0.40},
+        {0.1,  0.0,  0.0,  0.1,  0.0, 0.2,  0.15} } },
+    { "Maple leaf", {
+        {0.14, 0.01, 0.0,  0.51, -0.08, -1.31, 0.10},
+        {0.43, 0.52, -0.45,0.5,  1.49,  -0.75, 0.35},
+        {0.45,-0.49, 0.47, 0.47, -1.62, -0.74, 0.35},
+        {0.49, 0.0,  0.0,  0.51, 0.02,  1.62,  0.20} } },
+  };
+  return g;
+}
+
+/* Evaluate the IFS coefficient expressions against the current parameter
+ * values into numeric affine maps. Called when the maps are dirty (system
+ * compiled or a parameter changed). Returns false on an eval error. */
+bool evaluate_ifs_maps(AppState &app) {
+  app.ifs_maps.clear();
+  if (app.ifs_map_exprs.empty()) return false;
+  State dummy = app.start; resize_state(dummy, app.state_names.size());
+  char err[128] = {0};
+  auto ev = [&](node_t *n, double fallback) -> double {
+    if (!n) return fallback;
+    double v = fallback;
+    if (!eval_expr_at(app, n, dummy, &v, err, sizeof(err))) return fallback;
+    return std::isfinite(v) ? v : fallback;
+  };
+  for (const auto &me : app.ifs_map_exprs) {
+    dynsys::analysis::AffineMap m;
+    m.a = ev(me.a, 0); m.b = ev(me.b, 0); m.c = ev(me.c, 0);
+    m.d = ev(me.d, 0); m.e = ev(me.e, 0); m.f = ev(me.f, 0);
+    m.p = ev(me.p, 0);
+    app.ifs_maps.push_back(m);
+  }
+  return true;
+}
+
+void render_ifs_background(AppState &app) {
+  const float w = (float)app.window_width, h = (float)app.window_height;
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), IM_COL32(10, 11, 15, 255));
+
+  const auto &gallery = ifs_gallery();
+  /* For a loaded IFS model, (re)evaluate the coefficient expressions against
+   * the current parameter values whenever the maps are dirty — this is what
+   * lets an IFS respond to its parameters. */
+  const bool is_ifs_model = (app.mode == SystemMode::IFS && !app.ifs_map_exprs.empty());
+  /* Re-evaluate from expressions only when the maps are parameter-driven.
+   * When they're directly editable (all-constant), the user's edits live in
+   * app.ifs_maps and we must NOT overwrite them — just evaluate once to
+   * populate, then leave them alone. */
+  if (is_ifs_model) {
+    if (app.ifs_maps_editable) { if (app.ifs_maps.empty()) evaluate_ifs_maps(app); }
+    else if (app.ifs_dirty || app.ifs_maps.empty()) evaluate_ifs_maps(app);
+  }
+
+  const bool use_model = (app.mode == SystemMode::IFS && !app.ifs_maps.empty());
+  std::vector<dynsys::analysis::AffineMap> maps_to_use;
+  std::string ifs_name;
+  if (use_model) {
+    maps_to_use = app.ifs_maps;
+    ifs_name = app.params.empty() ? "loaded IFS model"
+                                  : "loaded IFS model (parametrized)";
+  } else {
+    if (app.ifs_selected < 0) app.ifs_selected = 0;
+    if (app.ifs_selected >= (int)gallery.size()) app.ifs_selected = (int)gallery.size() - 1;
+    maps_to_use = gallery[(size_t)app.ifs_selected].maps;
+    ifs_name = gallery[(size_t)app.ifs_selected].name;
+  }
+
+  const int CW = std::max(64, (int)w);
+  const int CH = std::max(64, (int)h);
+
+  if (app.ifs_dirty || app.ifs_tex == 0 || app.ifs_tex_w != CW || app.ifs_tex_h != CH) {
+    /* run the chaos game */
+    dynsys::analysis::IFSResult R =
+        dynsys::analysis::chaos_game(maps_to_use, app.ifs_iterations, 12345u);
+    if (R.ok && !R.xs.empty()) {
+      /* measure the dimension (cross-check) */
+      std::vector<double> xs(R.xs.begin(), R.xs.end()), ys(R.ys.begin(), R.ys.end());
+      auto D = dynsys::analysis::box_counting_dimension(xs, ys, 12);
+      app.ifs_box_dim = D.dimension; app.ifs_box_dim_ready = D.ok;
+
+      /* fit the attractor into the window with a margin, preserving aspect */
+      const double spanx = std::max(1e-9, R.xmax - R.xmin);
+      const double spany = std::max(1e-9, R.ymax - R.ymin);
+      const double margin = 0.06;
+      const double sx = (CW * (1 - 2 * margin)) / spanx;
+      const double sy = (CH * (1 - 2 * margin)) / spany;
+      const double s = std::min(sx, sy);
+      const double cx = 0.5 * (R.xmin + R.xmax), cy = 0.5 * (R.ymin + R.ymax);
+
+      /* density accumulation */
+      std::vector<float> dens((size_t)CW * CH, 0.0f);
+      float dmax = 0.0f;
+      for (size_t i = 0; i < R.xs.size(); ++i) {
+        const int px = (int)(CW * 0.5 + (R.xs[i] - cx) * s);
+        const int py = (int)(CH * 0.5 - (R.ys[i] - cy) * s); /* flip y */
+        if (px < 0 || px >= CW || py < 0 || py >= CH) continue;
+        float &c = dens[(size_t)py * CW + px];
+        c += 1.0f; if (c > dmax) dmax = c;
+      }
+      /* colorize: green-ish for botanical sets, gamma-lifted density */
+      std::vector<uint32_t> img((size_t)CW * CH, 0xff0a0b0fu);
+      const float inv = dmax > 0 ? 1.0f / std::log(1.0f + dmax) : 0.0f;
+      for (size_t i = 0; i < img.size(); ++i) {
+        const float c = dens[i];
+        if (c <= 0) continue;
+        float t = std::log(1.0f + c) * inv;
+        t = std::pow(t, 0.6f);
+        const int r = (int)(40 + 120 * t);
+        const int g = (int)(120 + 135 * t);
+        const int b = (int)(70 + 80 * t);
+        img[i] = 0xff000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+      }
+      if (app.ifs_tex == 0) glGenTextures(1, &app.ifs_tex);
+      glBindTexture(GL_TEXTURE_2D, app.ifs_tex);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      app.ifs_tex_w = CW; app.ifs_tex_h = CH;
+    }
+    app.ifs_dirty = false;
+  }
+
+  if (app.ifs_tex != 0)
+    draw->AddImage((ImTextureID)(uintptr_t)app.ifs_tex, ImVec2(0, 0), ImVec2(w, h));
+
+  char hud[256];
+  if (app.ifs_box_dim_ready)
+    std::snprintf(hud, sizeof(hud), "IFS chaos game — %s   |  %ld points  |  measured box-dimension D = %.3f",
+                  ifs_name.c_str(), app.ifs_iterations, app.ifs_box_dim);
+  else
+    std::snprintf(hud, sizeof(hud), "IFS chaos game — %s   |  %ld points", ifs_name.c_str(), app.ifs_iterations);
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, h - 24), IM_COL32(150, 150, 160, 200),
+                use_model ? "IFS attractor (mode = ifs) — rendered via the chaos game"
+                          : "IFS attractor — load a 'mode = ifs' model (e.g. the Barnsley fern preset)");
+}
+
+/* ============================================================
  * PHASE B/C: basins of attraction.
  * Integrate from a grid of initial conditions over the current 2D view;
  * color each pixel by which attractor its trajectory settles onto
@@ -5470,6 +5872,132 @@ void render_continuation_background(AppState &app) {
   draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
 }
 
+/* ============================================================
+ * PHASE D step 2: limit-cycle continuation diagram.
+ * x-axis = parameter; left axis (green) = oscillation amplitude;
+ * right axis (orange) = period. Amplitude rising from zero marks a Hopf
+ * bifurcation; gaps mean "no cycle here" (settled to a fixed point).
+ * ============================================================ */
+void render_lc_continuation_background(AppState &app) {
+  const float w = (float)app.window_width, h = (float)app.window_height;
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), IM_COL32(12, 13, 17, 255));
+
+  if (app.mode != SystemMode::ODE) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
+                  "Limit-cycle continuation is for ODE systems.");
+    return;
+  }
+  if (app.params.empty()) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
+                  "This system has no parameter to sweep.");
+    return;
+  }
+  if (!app.lcc_has_data) {
+    if (!app.lcc_autorun_done) {
+      app.lcc_autorun_done = true;
+      if (app.lcc_param[0] == '\0' && !app.params.empty())
+        std::snprintf(app.lcc_param, sizeof(app.lcc_param), "%s", app.params[0].name.c_str());
+      run_lc_continuation(app);
+    }
+    if (!app.lcc_has_data) {
+      draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
+                    "Limit-cycle continuation. Pick a parameter & range in the toolbar, then 'Sweep'.");
+      draw->AddText(ImVec2(20, 68), IM_COL32(185, 185, 195, 220),
+                    "Integrates at each parameter, measures the cycle's period & amplitude.");
+      if (!app.lcc_msg.empty() && app.lcc_msg != "ok")
+        draw->AddText(ImVec2(20, 92), IM_COL32(255, 200, 120, 230), app.lcc_msg.c_str());
+      return;
+    }
+  }
+
+  const float pad_l = 64.0f, pad_r = 64.0f, pad_b = 42.0f, pad_t = 38.0f;
+  const float plot_w = std::max(16.0f, w - pad_l - pad_r);
+  const float plot_h = std::max(16.0f, h - pad_t - pad_b);
+
+  double pmin = app.lcc_pp.front(), pmax = app.lcc_pp.back();
+  if (pmax <= pmin) pmax = pmin + 1e-9;
+  const double amp_hi = app.lcc_amp_max * 1.08 + 1e-9;
+  const double per_hi = app.lcc_period_max * 1.08 + 1e-9;
+
+  auto sx = [&](double p){ return pad_l + (float)((p - pmin) / (pmax - pmin)) * plot_w; };
+  auto sy_amp = [&](double a){ return pad_t + plot_h - (float)((a / amp_hi)) * plot_h; };
+  auto sy_per = [&](double t){ return pad_t + plot_h - (float)((t / per_hi)) * plot_h; };
+
+  /* axes box */
+  const ImU32 axcol = IM_COL32(140, 140, 150, 200);
+  draw->AddRect(ImVec2(pad_l, pad_t), ImVec2(pad_l + plot_w, pad_t + plot_h), axcol);
+
+  auto nice_step = [](double range, int target){
+    double raw = range / std::max(1, target);
+    double mag = std::pow(10.0, std::floor(std::log10(raw)));
+    double nn = raw / mag; double st = nn < 1.5 ? 1 : nn < 3 ? 2 : nn < 7 ? 5 : 10;
+    return st * mag;
+  };
+  /* x ticks (parameter) */
+  const double xs = nice_step(pmax - pmin, 8);
+  for (double xv = std::ceil(pmin / xs) * xs; xv <= pmax; xv += xs) {
+    const float X = sx(xv);
+    draw->AddLine(ImVec2(X, pad_t + plot_h), ImVec2(X, pad_t + plot_h + 4), axcol);
+    char b[32]; std::snprintf(b, sizeof(b), "%.4g", xv);
+    draw->AddText(ImVec2(X - 12, pad_t + plot_h + 6), IM_COL32(190,190,200,220), b);
+  }
+  /* left y ticks (amplitude, green) */
+  const double as = nice_step(amp_hi, 5);
+  for (double av = 0; av <= amp_hi; av += as) {
+    const float Y = sy_amp(av);
+    draw->AddLine(ImVec2(pad_l - 4, Y), ImVec2(pad_l, Y), IM_COL32(90,210,120,200));
+    char b[32]; std::snprintf(b, sizeof(b), "%.3g", av);
+    draw->AddText(ImVec2(6, Y - 7), IM_COL32(120,220,150,220), b);
+  }
+  /* right y ticks (period, orange) */
+  const double ps = nice_step(per_hi, 5);
+  for (double pv = 0; pv <= per_hi; pv += ps) {
+    const float Y = sy_per(pv);
+    draw->AddLine(ImVec2(pad_l + plot_w, Y), ImVec2(pad_l + plot_w + 4, Y), IM_COL32(240,170,80,200));
+    char b[32]; std::snprintf(b, sizeof(b), "%.3g", pv);
+    draw->AddText(ImVec2(pad_l + plot_w + 8, Y - 7), IM_COL32(245,180,90,220), b);
+  }
+
+  /* amplitude curve (green): connect consecutive points that both have a
+   * cycle; leave gaps where there's no oscillation. Mark cycle points. */
+  const ImU32 col_amp = IM_COL32(90, 230, 120, 255);
+  for (size_t i = 1; i < app.lcc_pp.size(); ++i) {
+    const double a0 = app.lcc_amp[i-1], a1 = app.lcc_amp[i];
+    const bool c0 = std::isfinite(app.lcc_period[i-1]) && a0 > 0;
+    const bool c1 = std::isfinite(app.lcc_period[i]) && a1 > 0;
+    if (c0 && c1)
+      draw->AddLine(ImVec2(sx(app.lcc_pp[i-1]), sy_amp(a0)), ImVec2(sx(app.lcc_pp[i]), sy_amp(a1)), col_amp, 2.0f);
+  }
+  /* period curve (orange) */
+  const ImU32 col_per = IM_COL32(240, 170, 80, 255);
+  for (size_t i = 1; i < app.lcc_pp.size(); ++i) {
+    const double t0 = app.lcc_period[i-1], t1 = app.lcc_period[i];
+    if (std::isfinite(t0) && std::isfinite(t1))
+      draw->AddLine(ImVec2(sx(app.lcc_pp[i-1]), sy_per(t0)), ImVec2(sx(app.lcc_pp[i]), sy_per(t1)), col_per, 1.8f);
+  }
+  /* dots on cycle points (amplitude) */
+  int n_cycle = 0;
+  for (size_t i = 0; i < app.lcc_pp.size(); ++i) {
+    if (std::isfinite(app.lcc_period[i]) && app.lcc_amp[i] > 0) {
+      draw->AddCircleFilled(ImVec2(sx(app.lcc_pp[i]), sy_amp(app.lcc_amp[i])), 2.2f, col_amp);
+      ++n_cycle;
+    }
+  }
+
+  /* labels */
+  char xlabel[96]; std::snprintf(xlabel, sizeof(xlabel), "parameter %s", app.lcc_param);
+  draw->AddText(ImVec2(pad_l + plot_w * 0.5f - 40, pad_t + plot_h + 22), IM_COL32(210,210,220,230), xlabel);
+  draw->AddText(ImVec2(8, pad_t - 22), IM_COL32(120,220,150,235), "amplitude");
+  draw->AddText(ImVec2(pad_l + plot_w - 28, pad_t - 22), IM_COL32(245,180,90,235), "period");
+
+  char hud[260];
+  std::snprintf(hud, sizeof(hud),
+                "Limit-cycle continuation — %zu slices, %d with a cycle  |  green = amplitude (left), orange = period (right)",
+                app.lcc_pp.size(), n_cycle);
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+}
+
 void draw_series_plot(AppState &app, const char *title, const char *value_name, ImVec2 size) {
   ImGui::TextUnformatted(title);
   ImDrawList *draw = ImGui::GetWindowDrawList();
@@ -6321,6 +6849,115 @@ void run_bifurcation(AppState &app) {
   app.analysis_message = "bifurcation scan completed";
 }
 
+/* PHASE D step 2 (foundation): measure the limit-cycle period & amplitude
+ * of the current trajectory. Pulls the y-axis state component from the
+ * (settled) history and runs the validated detector. */
+void run_limit_cycle(AppState &app) {
+  app.lc_ready = false;
+  if (app.mode != SystemMode::ODE) { app.lc_msg = "limit cycles are an ODE feature"; return; }
+  const size_t n = app.state_names.size();
+  if (n < 1) { app.lc_msg = "no system"; return; }
+  const size_t yi = (size_t)std::max(0, std::min(app.phase_y_index, (int)n - 1));
+
+  /* gather the observable signal; use the second half (more settled) */
+  std::vector<double> sig;
+  sig.reserve(app.history.size());
+  for (const State &st : app.history) {
+    const double v = state_at(st, yi);
+    if (std::isfinite(v)) sig.push_back(v);
+  }
+  if (sig.size() < 200) { app.lc_msg = "let the trajectory run longer, then retry"; return; }
+  /* drop the first third as transient */
+  const size_t drop = sig.size() / 3;
+  std::vector<double> tail(sig.begin() + (long)drop, sig.end());
+
+  const double dt = app.dt > 0 ? app.dt : 0.01;
+  dynsys::analysis::LimitCycleResult R = dynsys::analysis::limit_cycle_period_amplitude(tail, dt);
+  if (!R.ok) { app.lc_msg = R.message; return; }
+  app.lc_ready = true;
+  app.lc_period = R.period;
+  app.lc_amplitude = R.amplitude;
+  app.lc_msg = "ok";
+}
+
+/* PHASE D step 2: sweep a parameter and measure the limit cycle's period &
+ * amplitude at each value, producing the continuation curves. Mirrors the
+ * bifurcation sweep's safety (force fixed-step RK4, save/restore integrator
+ * and parameter, sync param_values each slice). */
+void run_lc_continuation(AppState &app) {
+  app.lcc_pp.clear(); app.lcc_period.clear(); app.lcc_amp.clear();
+  app.lcc_has_data = false; app.lcc_amp_max = 1.0; app.lcc_period_max = 1.0;
+
+  if (app.mode != SystemMode::ODE) { app.lcc_msg = "limit-cycle continuation is for ODE systems"; return; }
+  const size_t n = app.state_names.size();
+  if (n < 1) { app.lcc_msg = "no system"; return; }
+  if (app.params.empty()) { app.lcc_msg = "system has no parameter to sweep"; return; }
+
+  AppState::Param *param = find_param(app, app.lcc_param);
+  if (!param) { param = &app.params[0]; std::snprintf(app.lcc_param, sizeof(app.lcc_param), "%s", param->name.c_str()); }
+
+  const size_t yi = (size_t)std::max(0, std::min(app.phase_y_index, (int)n - 1));
+  const double pmin = std::min(app.lcc_p_min, app.lcc_p_max);
+  const double pmax = std::max(app.lcc_p_min, app.lcc_p_max);
+  const int slices = std::max(8, app.lcc_slices);
+
+  /* force fixed-step RK4 for the sweep; restore after */
+  const Integrator saved_integrator = app.integrator;
+  if (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45)
+    app.integrator = Integrator::RK4;
+  const double old_value = param->value;
+  const double dt = app.dt > 0 ? app.dt : 0.01;
+
+  char err[128] = {0};
+  const int settle_steps = 30000;   /* integrate to settle onto the attractor */
+  const int sample_steps = 40000;   /* then sample the orbit */
+
+  double amax = 0.0, tmax = 0.0;
+  for (int i = 0; i < slices; ++i) {
+    const double u = (double)i / (double)(slices - 1);
+    param->value = pmin + u * (pmax - pmin);
+    sync_param_values(app); /* CRITICAL: evaluator reads param_values */
+
+    State s = app.start; resize_state(s, n);
+    bool ok = true;
+    for (int j = 0; j < settle_steps; ++j) {
+      State nx{};
+      if (!step_ode_state(app, s, &nx, err, sizeof(err))) { ok = false; break; }
+      s = nx;
+    }
+    double period = std::nan(""), amp = 0.0;
+    if (ok) {
+      std::vector<double> sig; sig.reserve(sample_steps);
+      for (int j = 0; j < sample_steps; ++j) {
+        State nx{};
+        if (!step_ode_state(app, s, &nx, err, sizeof(err))) { ok = false; break; }
+        s = nx;
+        const double v = state_at(s, yi);
+        if (std::isfinite(v)) sig.push_back(v);
+      }
+      if (ok && sig.size() > 100) {
+        dynsys::analysis::LimitCycleResult R = dynsys::analysis::limit_cycle_period_amplitude(sig, dt);
+        if (R.ok) { period = R.period; amp = R.amplitude; }
+        else { amp = 0.0; period = std::nan(""); } /* settled to a fixed point */
+      }
+    }
+    app.lcc_pp.push_back(param->value);
+    app.lcc_period.push_back(period);
+    app.lcc_amp.push_back(amp);
+    if (std::isfinite(amp) && amp > amax) amax = amp;
+    if (std::isfinite(period) && period > tmax) tmax = period;
+  }
+
+  param->value = old_value;
+  sync_param_values(app);
+  app.integrator = saved_integrator;
+
+  app.lcc_amp_max = amax > 0 ? amax : 1.0;
+  app.lcc_period_max = tmax > 0 ? tmax : 1.0;
+  app.lcc_has_data = !app.lcc_pp.empty();
+  app.lcc_msg = app.lcc_has_data ? "ok" : "no data";
+}
+
 /* PHASE B/C: estimate the box-counting fractal dimension of the on-screen
  * set in the current 2D plane. For a MAP we iterate from the start state
  * (after a transient) to sample the attractor densely; for an ODE we use
@@ -6569,7 +7206,19 @@ void draw_top_toolbar(AppState &app) {
     if (!ok) ImGui::BeginDisabled();
     if (ImGui::RadioButton(label, app.active_view == v) && ok) app.active_view = v;
     if (!ok) ImGui::EndDisabled();
-    ImGui::SameLine();
+    /* Explain *why* a view is unavailable (or what it shows) on hover, so
+     * the applicability rules are visible instead of a mystery grey-out.
+     * IsItemHovered with AllowWhenDisabled still fires for disabled items. */
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      if (ok) ImGui::SetTooltip("%s", view_requirement(v));
+      else ImGui::SetTooltip("unavailable — needs %s", view_requirement(v));
+    }
+    /* Wrap to the next line instead of overflowing off the right edge of
+     * the (non-scrolling) toolbar — otherwise later views (continuation,
+     * IFS, ...) become invisible on narrower windows. */
+    const float avail = ImGui::GetWindowContentRegionMax().x;
+    const float next_w = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 4.0f + 40.0f;
+    if (ImGui::GetItemRectMax().x + next_w < avail) ImGui::SameLine();
   };
   view_radio("1D", AppState::ActiveView::Line1D);
   view_radio("2D phase", AppState::ActiveView::Phase2D);
@@ -6580,7 +7229,8 @@ void draw_top_toolbar(AppState &app) {
   view_radio("basins", AppState::ActiveView::Basins);
   view_radio("param scan", AppState::ActiveView::ParamScan2D);
   view_radio("continuation", AppState::ActiveView::Continuation);
-  ImGui::TextUnformatted("|"); ImGui::SameLine();
+  view_radio("limit cycle", AppState::ActiveView::LimitCycle);
+  ImGui::Separator();
 
   if (ImGui::Button(app.paused ? "Play" : "Pause")) app.paused = !app.paused;
   ImGui::SameLine();
@@ -6632,6 +7282,33 @@ void draw_top_toolbar(AppState &app) {
     if (ImGui::Button("Continue")) run_continuation(app);
     ImGui::SameLine();
   }
+  if (app.active_view == AppState::ActiveView::Phase2D && app.mode == SystemMode::IFS) {
+    ImGui::Text("IFS model: %zu maps", app.ifs_maps.size());
+    ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+    int it = (int)app.ifs_iterations;
+    if (ImGui::SliderInt("iters##ifs", &it, 50000, 2000000)) { app.ifs_iterations = it; app.ifs_dirty = true; }
+    ImGui::SameLine();
+  }
+  if (app.active_view == AppState::ActiveView::LimitCycle && !app.params.empty()) {
+    if (app.lcc_param[0] == '\0') std::snprintf(app.lcc_param, sizeof(app.lcc_param), "%s", app.params[0].name.c_str());
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::BeginCombo("##lccp", app.lcc_param)) {
+      for (const auto &pr : app.params)
+        if (ImGui::Selectable(pr.name.c_str(), pr.name == app.lcc_param)) {
+          std::snprintf(app.lcc_param, sizeof(app.lcc_param), "%s", pr.name.c_str());
+          if (pr.has_range) { app.lcc_p_min = pr.min_value; app.lcc_p_max = pr.max_value; }
+        }
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine(); ImGui::SetNextItemWidth(54);
+    ImGui::InputDouble("##lccmin", &app.lcc_p_min, 0, 0, "%.3g"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(54);
+    ImGui::InputDouble("##lccmax", &app.lcc_p_max, 0, 0, "%.3g"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::SliderInt("slices##lcc", &app.lcc_slices, 16, 240); ImGui::SameLine();
+    if (ImGui::Button("Sweep")) run_lc_continuation(app);
+    ImGui::SameLine();
+  }
   ImGui::TextDisabled("  %d FPS | %s | %dD%s", app.fps, mode_name(app.mode),
                       effective_dimension(app),
                       app.active_view == AppState::ActiveView::Phase2D
@@ -6646,13 +7323,20 @@ void draw_gui(AppState &app) {
    * already drawn straight to the backbuffer in the main loop.) */
   switch (app.active_view) {
     case AppState::ActiveView::Line1D:      render_line1d_background(app); break;
-    case AppState::ActiveView::Phase2D:     render_phase_background(app); break;
+    case AppState::ActiveView::Phase2D:
+      /* An IFS system is a planar object; it displays in the phase view via
+       * the chaos game (just as an ODE shows its trajectory here). */
+      if (app.mode == SystemMode::IFS) render_ifs_background(app);
+      else render_phase_background(app);
+      break;
     case AppState::ActiveView::Bifurcation: render_bifurcation_background(app); break;
     case AppState::ActiveView::Fractal:     render_fractal_background(app); break;
     case AppState::ActiveView::Scene3DBridge: /* drawn to backbuffer in main loop */ break;
     case AppState::ActiveView::Basins:      render_basin_background(app); break;
     case AppState::ActiveView::ParamScan2D: render_scan_background(app); break;
     case AppState::ActiveView::Continuation: render_continuation_background(app); break;
+    case AppState::ActiveView::IFS: render_ifs_background(app); break;
+    case AppState::ActiveView::LimitCycle: render_lc_continuation_background(app); break;
     case AppState::ActiveView::Scene3D:     /* drawn in main loop */ break;
   }
 
@@ -6867,7 +7551,7 @@ void draw_gui(AppState &app) {
     }
   }
 
-  if (ImGui::CollapsingHeader("System editor", ImGuiTreeNodeFlags_DefaultOpen)) {
+  if (ImGui::CollapsingHeader("System editor")) {
     const char *current_preset_name = kPresets[std::max(0, std::min(app.selected_preset, kPresetCount - 1))].name;
     if (ImGui::BeginCombo("Preset", current_preset_name)) {
       for (int i = 0; i < kPresetCount; ++i) {
@@ -6917,32 +7601,145 @@ void draw_gui(AppState &app) {
     if (!app.runtime_error.empty()) ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "Runtime: %s", app.runtime_error.c_str());
   }
 
+  if (app.mode == SystemMode::IFS &&
+      ImGui::CollapsingHeader("IFS maps", ImGuiTreeNodeFlags_DefaultOpen)) {
+    /* Surface the IFS's own contents: each affine map and its coefficients
+     * x' = a x + b y + e,  y' = c x + d y + f,  with selection weight p.
+     * Directly editable when all coefficients are constants; read-only
+     * (parameter-driven) otherwise — tweak those via the Parameters panel. */
+    if (app.ifs_maps.empty()) evaluate_ifs_maps(app);
+    ImGui::TextDisabled("x' = a x + b y + e    y' = c x + d y + f    (p = selection weight)");
+    if (!app.ifs_maps_editable)
+      ImGui::TextColored(ImVec4(0.95f,0.8f,0.4f,1.0f),
+                         "parameter-driven maps (read-only here) — adjust the parameters above");
+
+    const char *labels[7] = {"a","b","c","d","e","f","p"};
+    for (size_t mi = 0; mi < app.ifs_maps.size(); ++mi) {
+      ImGui::PushID((int)mi);
+      auto &m = app.ifs_maps[mi];
+      double *coef[7] = {&m.a,&m.b,&m.c,&m.d,&m.e,&m.f,&m.p};
+      ImGui::Text("map %zu", mi + 1);
+      bool changed = false;
+      for (int k = 0; k < 7; ++k) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(72);
+        if (app.ifs_maps_editable) {
+          float v = (float)*coef[k];
+          /* drag for a tactile feel; double-click to type */
+          if (ImGui::DragFloat(labels[k], &v, 0.005f, -3.0f, 10.0f, "%.3f")) {
+            *coef[k] = (double)v; changed = true;
+          }
+        } else {
+          ImGui::Text("%s %.3f", labels[k], *coef[k]);
+        }
+      }
+      if (changed) { app.ifs_dirty = true; }
+      ImGui::PopID();
+    }
+
+    if (app.ifs_maps_editable) {
+      if (ImGui::SmallButton("+ add map")) {
+        app.ifs_maps.push_back(dynsys::analysis::AffineMap{0.5,0,0,0.5,0,0,0.0});
+        app.ifs_dirty = true;
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("- remove last") && app.ifs_maps.size() > 1) {
+        app.ifs_maps.pop_back();
+        app.ifs_dirty = true;
+      }
+      ImGui::SameLine();
+      ImGui::TextDisabled("(edits drive the attractor live)");
+    }
+  }
+
   if (ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen)) {
     if (app.params.empty()) ImGui::TextDisabled("No param declarations in this system.");
     for (auto &param : app.params) {
       double old = param.value;
-      if (param.has_range) {
-        float v = static_cast<float>(param.value);
-        if (ImGui::SliderFloat(param.name.c_str(), &v, static_cast<float>(param.min_value), static_cast<float>(param.max_value), "%.6g")) {
-          param.value = static_cast<double>(v);
+      /* Every parameter gets a slider. If the model declared [min,max] we
+       * use it; otherwise we synthesize an editable range from the value's
+       * magnitude so there's always a draggable control (the user asked for
+       * sliders on everything, not bare input boxes). */
+      double lo, hi;
+      if (param.has_range) { lo = param.min_value; hi = param.max_value; }
+      else {
+        if (!param.ui_range_init) { auto_slider_range(param.value, &param.ui_lo, &param.ui_hi); param.ui_range_init = true; }
+        lo = param.ui_lo; hi = param.ui_hi;
+      }
+      float v = static_cast<float>(param.value);
+      ImGui::SetNextItemWidth(-90);
+      if (ImGui::SliderFloat(param.name.c_str(), &v, static_cast<float>(lo), static_cast<float>(hi), "%.6g"))
+        param.value = static_cast<double>(v);
+      ImGui::SameLine();
+      if (ImGui::SmallButton((std::string(param.ui_show_exact ? "edit-" : "edit+") + "##e" + param.name).c_str()))
+        param.ui_show_exact = !param.ui_show_exact;
+      ImGui::SameLine();
+      if (ImGui::SmallButton((std::string("reset##") + param.name).c_str())) {
+        param.value = param.default_value;
+        param.ui_range_init = false; /* re-fit the auto-range to the default */
+        sync_param_values(app);
+      }
+      /* expander: type an exact value and/or adjust the (auto) range */
+      if (param.ui_show_exact) {
+        ImGui::Indent();
+        ImGui::SetNextItemWidth(140);
+        ImGui::InputDouble((std::string("value##v") + param.name).c_str(), &param.value, 0.01, 0.1, "%.8g");
+        if (!param.has_range) {
+          ImGui::SetNextItemWidth(90);
+          ImGui::InputDouble((std::string("min##lo") + param.name).c_str(), &param.ui_lo, 0, 0, "%.4g");
+          ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+          ImGui::InputDouble((std::string("max##hi") + param.name).c_str(), &param.ui_hi, 0, 0, "%.4g");
+          ImGui::SameLine();
+          if (ImGui::SmallButton((std::string("auto##ar") + param.name).c_str())) { auto_slider_range(param.value, &param.ui_lo, &param.ui_hi); }
         }
-      } else {
-        ImGui::InputDouble(param.name.c_str(), &param.value, 0.01, 0.1, "%.8g");
+        ImGui::Unindent();
       }
       if (old != param.value) {
         app.poincare_points.clear();
         reset_lyapunov(app);
         sync_param_values(app);
-      }
-      ImGui::SameLine();
-      if (ImGui::SmallButton((std::string("reset##") + param.name).c_str())) {
-        param.value = param.default_value;
-        sync_param_values(app);
+        /* nudge cached views so the slider feels live there too */
+        app.fractal_dirty = true;
+        app.basin_dirty = true;
+        app.ifs_dirty = true;
       }
     }
   }
 
-  if (ImGui::CollapsingHeader("Simulation", ImGuiTreeNodeFlags_DefaultOpen)) {
+  /* PHASE: initial-condition sliders. The starting point of the orbit is a
+   * "variable value" the user can tweak; previously it had no control.
+   * Each state variable gets a slider (auto-ranged); changing it re-seeds
+   * the simulation so the orbit moves live. (Not for IFS, which has no
+   * single trajectory.) */
+  if (app.mode != SystemMode::IFS &&
+      ImGui::CollapsingHeader("Initial conditions", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (app.state_names.empty()) ImGui::TextDisabled("No state variables.");
+    static std::vector<double> ic_lo, ic_hi;
+    static std::vector<unsigned char> ic_init;
+    const size_t n = app.state_names.size();
+    if (ic_lo.size() != n) { ic_lo.assign(n, -1.0); ic_hi.assign(n, 1.0); ic_init.assign(n, 0); }
+    bool changed = false;
+    for (size_t i = 0; i < n; ++i) {
+      double cur = state_at(app.start, i);
+      if (!ic_init[i]) { auto_slider_range(cur, &ic_lo[i], &ic_hi[i]); ic_init[i] = 1; }
+      /* keep the range covering the current value */
+      if (cur < ic_lo[i]) ic_lo[i] = cur;
+      if (cur > ic_hi[i]) ic_hi[i] = cur;
+      float v = static_cast<float>(cur);
+      ImGui::SetNextItemWidth(-90);
+      if (ImGui::SliderFloat((app.state_names[i] + "(0)").c_str(), &v,
+                             static_cast<float>(ic_lo[i]), static_cast<float>(ic_hi[i]), "%.5g")) {
+        set_state_at(app.start, i, static_cast<double>(v));
+        changed = true;
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton((std::string("auto##ic") + std::to_string(i)).c_str()))
+        ic_init[i] = 0;
+    }
+    if (changed) reset_simulation(app);
+  }
+
+  if (ImGui::CollapsingHeader("Simulation")) {
     int integrator_idx = static_cast<int>(app.integrator);
     const char *integrators[] = {"Euler", "RK2 midpoint", "Heun (RK2)", "RK4",
                                  "RK 3/8", "RKF45 (adaptive)", "Dormand-Prince (adaptive)"};
@@ -7017,6 +7814,19 @@ void draw_gui(AppState &app) {
                                     : "measured from the current trajectory");
     } else if (!app.boxdim_msg.empty() && app.boxdim_msg != "ok") {
       ImGui::TextDisabled("%s", app.boxdim_msg.c_str());
+    }
+
+    /* PHASE D step 2 (foundation): limit-cycle period & amplitude */
+    ImGui::SeparatorText("Limit cycle (period & amplitude)");
+    if (ImGui::Button("Measure limit cycle")) run_limit_cycle(app);
+    if (app.lc_ready) {
+      ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                         "period T = %.5g   amplitude (peak-to-peak) = %.5g",
+                         app.lc_period, app.lc_amplitude);
+      ImGui::TextDisabled("measured on the '%s' component of the current orbit",
+                          app.state_names[(size_t)std::max(0, std::min(app.phase_y_index, (int)app.state_names.size()-1))].c_str());
+    } else if (!app.lc_msg.empty() && app.lc_msg != "ok") {
+      ImGui::TextDisabled("%s", app.lc_msg.c_str());
     }
 
     ImGui::Text("Poincare points: %zu", app.poincare_points.size());
@@ -7395,7 +8205,7 @@ int run_headless(int argc, char **argv) {
 
   std::printf("dim=%zu mode=%s integrator=%s dt=%.6f steps=%lld defs=%zu params=%zu path=%s\n",
               app.state_names.size(),
-              app.mode == SystemMode::Map ? "map" : "ode",
+              mode_name(app.mode),
               integrator_name(app.integrator),
               app.dt, steps, app.definitions.size(), app.params.size(),
               use_ast ? "ast" : "ir");
@@ -7466,7 +8276,7 @@ int main(int argc, char **argv) {
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
     process_keyboard(app, window);
-    if (!app.paused) {
+    if (!app.paused && app.mode != SystemMode::IFS) {
       for (int i = 0; i < app.steps_per_frame; ++i) {
         if (!calculate_next_point(app)) break;
       }
@@ -7509,6 +8319,8 @@ int main(int argc, char **argv) {
   if (app.fractal_tex) glDeleteTextures(1, &app.fractal_tex);
   if (app.basin_tex) glDeleteTextures(1, &app.basin_tex);
   if (app.scan_tex) glDeleteTextures(1, &app.scan_tex);
+  if (app.ifs_tex) glDeleteTextures(1, &app.ifs_tex);
+  if (app.ifs_arena_init) { arena_destroy(&app.ifs_arena); app.ifs_arena_init = false; }
   if (app.bridge_vbo) glDeleteBuffers(1, &app.bridge_vbo);
   if (app.bridge_cbo) glDeleteBuffers(1, &app.bridge_cbo);
   if (app.bridge_vao) glDeleteVertexArrays(1, &app.bridge_vao);

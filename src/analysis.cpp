@@ -1197,4 +1197,119 @@ BoxCountResult box_counting_dimension(const std::vector<double> &xs,
   return R;
 }
 
+/* ---- Iterated Function System (chaos game) -------------------- */
+IFSResult chaos_game(const std::vector<AffineMap> &maps, long iterations,
+                     unsigned int seed) {
+  IFSResult R;
+  if (maps.empty()) { R.message = "no maps"; return R; }
+  if (iterations < 100) iterations = 100;
+
+  /* build a cumulative probability table; if probabilities are all zero or
+   * don't sum to ~1, fall back to uniform selection. */
+  std::vector<double> cum(maps.size());
+  double sum = 0.0;
+  for (size_t i = 0; i < maps.size(); ++i) { sum += std::max(0.0, maps[i].p); cum[i] = sum; }
+  const bool uniform = !(sum > 1e-12);
+
+  /* simple deterministic LCG so results are reproducible and dependency-free */
+  unsigned int state = seed ? seed : 1u;
+  auto rnd = [&]() -> double {
+    state = state * 1664525u + 1013904223u;
+    return (double)(state >> 8) / (double)(1u << 24);
+  };
+
+  double x = 0.0, y = 0.0;
+  const long burn = 50;
+  R.xs.reserve((size_t)iterations);
+  R.ys.reserve((size_t)iterations);
+  double xmin = 1e300, xmax = -1e300, ymin = 1e300, ymax = -1e300;
+  for (long it = 0; it < iterations; ++it) {
+    size_t k = 0;
+    if (uniform) {
+      k = (size_t)(rnd() * maps.size());
+      if (k >= maps.size()) k = maps.size() - 1;
+    } else {
+      const double r = rnd() * sum;
+      k = 0;
+      while (k + 1 < maps.size() && r > cum[k]) ++k;
+    }
+    const AffineMap &m = maps[k];
+    const double nx = m.a * x + m.b * y + m.e;
+    const double ny = m.c * x + m.d * y + m.f;
+    x = nx; y = ny;
+    if (!std::isfinite(x) || !std::isfinite(y)) { x = 0; y = 0; continue; }
+    if (it >= burn) {
+      R.xs.push_back((float)x); R.ys.push_back((float)y);
+      xmin = std::min(xmin, x); xmax = std::max(xmax, x);
+      ymin = std::min(ymin, y); ymax = std::max(ymax, y);
+    }
+  }
+  if (R.xs.empty()) { R.message = "no points"; return R; }
+  R.xmin = xmin; R.xmax = xmax; R.ymin = ymin; R.ymax = ymax;
+  R.ok = true; R.message = "ok";
+  return R;
+}
+
+/* ---- Limit-cycle period & amplitude --------------------------- */
+LimitCycleResult limit_cycle_period_amplitude(const std::vector<double> &y, double dt) {
+  LimitCycleResult R;
+  const size_t n = y.size();
+  if (n < 16 || !(dt > 0)) { R.message = "signal too short"; return R; }
+
+  /* mean and peak-to-peak amplitude over the (assumed settled) signal */
+  double ymin = y[0], ymax = y[0], mean = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(y[i])) { R.message = "non-finite signal"; return R; }
+    ymin = std::min(ymin, y[i]); ymax = std::max(ymax, y[i]); mean += y[i];
+  }
+  mean /= (double)n;
+  const double ptp = ymax - ymin;
+  R.amplitude = ptp;
+
+  /* If the signal barely varies it's a fixed point, not a cycle. Scale the
+   * threshold to the signal magnitude. */
+  const double scale = std::max(1.0, std::fabs(ymax) + std::fabs(ymin));
+  if (ptp < 1e-6 * scale) { R.message = "no oscillation (fixed point)"; return R; }
+
+  /* Autocorrelation of the mean-removed signal; the first strong peak after
+   * the zero-lag descent gives the period. */
+  std::vector<double> c(y.begin(), y.end());
+  for (double &v : c) v -= mean;
+  const size_t maxlag = n / 2;
+  double c0 = 0.0;
+  for (size_t i = 0; i < n; ++i) c0 += c[i] * c[i];
+  if (c0 <= 0) { R.message = "degenerate signal"; return R; }
+
+  auto acf = [&](size_t lag) {
+    double s = 0.0;
+    for (size_t i = 0; i + lag < n; ++i) s += c[i] * c[i + lag];
+    return s / c0;
+  };
+
+  /* find first lag where ACF rises back to a local max above a threshold,
+   * after it has first dropped below zero (one full oscillation). */
+  bool dropped = false;
+  size_t best_lag = 0; double best_val = 0.0;
+  for (size_t lag = 1; lag < maxlag; ++lag) {
+    const double a = acf(lag);
+    if (!dropped && a < 0.0) dropped = true;
+    if (dropped) {
+      const double am = acf(lag - 1), ap = (lag + 1 < maxlag) ? acf(lag + 1) : a;
+      if (a > am && a >= ap && a > 0.2) { best_lag = lag; best_val = a; break; }
+    }
+    (void)best_val;
+  }
+  if (best_lag == 0) { R.message = "no clear period (aperiodic or too few cycles)"; return R; }
+
+  /* refine the peak with a parabolic fit around best_lag */
+  const double am = acf(best_lag - 1), a0 = acf(best_lag), ap = acf(best_lag + 1);
+  double offset = 0.0;
+  const double denom = (am - 2 * a0 + ap);
+  if (std::fabs(denom) > 1e-12) offset = 0.5 * (am - ap) / denom;
+  R.period = ((double)best_lag + offset) * dt;
+  R.ok = true;
+  R.message = "ok";
+  return R;
+}
+
 }  // namespace dynsys::analysis

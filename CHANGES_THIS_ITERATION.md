@@ -1,47 +1,43 @@
-# dynsys — box-counting fractal dimension + vector-field color fix
+# dynsys — IFS maps are now inspectable & editable (the IFS "variables")
 
 Unzip at repo root, then `make clean && make && make run`. Green
 "dynsys NEW-UI <date>" label = you're on this build.
 
-Now that the parameter-sync fix made every sweep trustworthy, this round
-adds a genuinely new analysis capability and fixes a rendering bug I found
-while looking around.
+## What I'd missed, now fixed
 
-## New: box-counting (fractal) dimension
+You meant the IFS's own contents — its maps and their coefficients — should
+be visible and editable, the way an ODE shows its equations and state
+variables. An IFS was a black box: load it, see the attractor, but nothing
+showed the maps. Now there's an **"IFS maps"** panel (Setup tab, shown when
+an IFS is loaded) listing every affine map and its coefficients:
 
-In the Analysis tab, under the Lyapunov spectrum, there's a new
-**"Measure box-counting dimension"** button. It estimates the
-Minkowski-Bouligand (box-counting) dimension of the set currently in the
-2D plane:
-- For a MAP it samples the attractor by iterating (200k points after a
-  transient).
-- For an ODE it measures the live trajectory (let it run a bit first).
-It reports D_box and the log-log fit quality R^2.
+    x' = a x + b y + e      y' = c x + d y + f      (p = selection weight)
 
-This is a real piece of nonlinear-dynamics kit that none of pplane / XPPAUT
-/ MatCont / AUTO surface, and it complements the Kaplan-Yorke dimension
-already there (Kaplan-Yorke comes from the Lyapunov spectrum; box-counting
-is measured directly from the geometry — nice to compare the two).
+- For a plain (constant-coefficient) IFS — fern, Sierpinski, dragon — every
+  coefficient is **editable**: drag a value (double-click to type) and the
+  attractor updates live. You can also **+ add map / - remove last** to grow
+  or prune the system.
+- For a parametrized IFS (coefficients are expressions like `s*cos(theta)`),
+  the panel shows the **evaluated values read-only** and tells you to adjust
+  the parameters above — so a number-edit can't silently fight an
+  expression. (Detected automatically at compile.)
 
-Validated headlessly (`make test-boxdim`) against shapes of known
-dimension: filled square -> 1.99, line -> 1.04, circle -> 1.09, Sierpinski
-triangle -> 1.60 (theory 1.585), Henon attractor -> 1.31 (literature ~1.26),
-all with R^2 >= 0.995.
+Try it: load **"Barnsley fern (IFS)"**, open **IFS maps**, and drag map 2's
+`d` from 0.85 downward — the fern collapses into a stunted plant in real
+time. Load **"Spiral IFS (parametrized)"** and the panel is read-only with
+the theta/s sliders driving it instead.
 
-## Fixed: vector-field arrow coloring
+## Verified
+- The editable path feeds edits straight to the chaos game: changing the
+  fern's `d` (0.85 -> 0.5) shrinks its height from 10.0 to 3.2, and adding a
+  map still yields a valid bounded attractor (checked headlessly + rendered).
+- Editability is detected correctly: all-constant IFS = editable; any
+  parameter expression = read-only.
+- All 4 C++ TUs compile with ZERO warnings (-O2 -Wall -Wextra).
+- make test: 24 checks/suites pass.
 
-While wiring the above I noticed the phase-plane vector field's speed->color
-mapping had a collapsed term (a stray * 0.0) that tinted almost every arrow
-the same. It now scales color to the actual max speed in the current view
-(two-pass): slow = blue, fast = warm. The flow structure reads much more
-clearly. (I also caught myself starting to build a duplicate direction-field
-renderer and removed it — the existing one just needed the fix.)
-
-## Roadmap
-docs/COMPARISON_AND_ROADMAP.md updated: box-counting dimension marked done
-(Phase C). Remaining: IFS/chaos game; the big one is still Phase D step 2
-(limit-cycle continuation) for full MatCont parity; Phase E waits on Lizard.
-
-## Verification
-- All 4 C++ TUs compile with ZERO warnings (-O2).
-- make test: 19 checks/suites pass (added **test-boxdim**).
+## Note on the two IFS knobs
+- **IFS maps panel** = the maps themselves (this iteration).
+- **Parameters panel** = parameters that *drive* expression coefficients
+  (previous iteration). Both can apply to the same system; they're
+  complementary.

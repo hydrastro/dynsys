@@ -287,4 +287,44 @@ BoxCountResult box_counting_dimension(const std::vector<double> &xs,
                                       const std::vector<double> &ys,
                                       int n_levels = 10);
 
+/* ---- Iterated Function System (chaos game) -------------------- *
+ * An IFS is a set of affine contraction maps with probabilities; its
+ * attractor (Barnsley fern, Sierpinski, dragon, ...) is drawn by the
+ * "chaos game": start anywhere, repeatedly pick a map at random (weighted
+ * by probability) and apply it, plotting each point. AppState-free and
+ * testable (the attractor has a known box-counting dimension). */
+struct AffineMap {
+  double a = 1, b = 0, c = 0, d = 1, e = 0, f = 0; /* x' = a x + b y + e, y' = c x + d y + f */
+  double p = 0.0;                                  /* selection probability */
+};
+
+struct IFSResult {
+  bool ok = false;
+  std::vector<float> xs, ys;   /* the plotted points (after burn-in) */
+  double xmin = 0, xmax = 0, ymin = 0, ymax = 0;
+  std::string message;
+};
+
+/* Run the chaos game for `iterations` steps (minus a small burn-in),
+ * returning the visited points. `seed` makes it deterministic. */
+IFSResult chaos_game(const std::vector<AffineMap> &maps, long iterations,
+                     unsigned int seed = 12345u);
+
+/* ---- Limit-cycle period & amplitude (foundation for LC continuation) -- *
+ * Given a settled, sampled scalar signal y(t) from an oscillating system,
+ * estimate the oscillation PERIOD and AMPLITUDE. The period is found from
+ * the dominant peak of the autocorrelation (robust to noise and to the
+ * exact section), the amplitude from the settled signal's peak-to-peak
+ * range. Returns ok=false for non-oscillatory signals (fixed points). This
+ * is the per-parameter measurement that a limit-cycle continuation diagram
+ * (period vs parameter, amplitude vs parameter) is built from. */
+struct LimitCycleResult {
+  bool ok = false;
+  double period = 0.0;     /* in units of the sample spacing dt */
+  double amplitude = 0.0;  /* peak-to-peak of the settled signal */
+  std::string message;
+};
+
+LimitCycleResult limit_cycle_period_amplitude(const std::vector<double> &y, double dt);
+
 }  // namespace dynsys::analysis

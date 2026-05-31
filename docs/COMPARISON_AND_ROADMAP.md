@@ -31,7 +31,10 @@ Escape-time Mandelbrot/Julia (progressive render); Mandelbrot<->bifurcation
 3D bridge; density-rendered bifurcation diagrams (now with a contrast lift
 so the period-doubling tree is clearly visible); PNG export of any view.
 DONE: box-counting fractal dimension (validated: square~2, Sierpinski~1.585,
-Henon~1.26). Left: IFS / chaos game (Barnsley fern, Sierpinski); optional cellular-automata / life-like module (independent of
+Henon~1.26). DONE: IFS / chaos game view (Barnsley fern, Sierpinski,
+dragon, tree, maple leaf; dimension cross-checked via box-counting).
+DONE: IFS as a first-class model (mode = ifs, gallery -> presets) so view
+applicability is uniform. Left: optional cellular-automata / life-like module (independent of
 Lizard).
 
 ### Phase D — STEP 1 DONE
@@ -39,7 +42,11 @@ Equilibrium continuation view: traces the equilibrium branch both ways
 vs. a parameter, stable (solid green) vs. unstable (dashed red), with Fold
 (LP) and Hopf (H) markers. Engine validated (test-continuation) on the
 fold normal form x'=p-x^2 and the Hopf normal form.
-Left: branch switching at bifurcations; limit-cycle continuation
+DONE (step 2): limit-cycle continuation diagram — sweep a parameter and
+plot the cycle's period & amplitude (validated: supercritical Hopf amplitude
+follows 2*sqrt(mu) from the bifurcation; van der Pol period rises with mu).
+Left: branch
+switching at bifurcations; limit-cycle continuation
 (needs a BVP collocation solver - the big one); codim-2 (cusp, BT, GH).
 
 ### Phase E — BLOCKED ON LIZARD
@@ -80,10 +87,11 @@ Legend:
 | Basins of attraction | no | partial | no | no | full |
 | 2-parameter scan (shrimps) | no | no | partial | partial | full |
 | Escape-time fractals | no | no | no | no | full |
+| IFS / chaos game (fractal gallery) | no | no | no | no | full |
 | CONTINUATION | | | | | |
 | Equilibrium continuation | no | partial | full | full | partial (view shipped) |
 | Fold / Hopf detection | no | partial | full | full | full |
-| Limit-cycle continuation | no | partial | full | full | no |
+| Limit-cycle continuation | no | partial | full | full | partial (period/amplitude diagram) |
 | Codim-2 points | no | no | full | full | no |
 | Normal-form coefficients | no | no | full | partial | no (planned Phase E) |
 | SYMBOLIC / EXACTNESS | | | | | |
