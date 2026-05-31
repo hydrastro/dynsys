@@ -65,6 +65,12 @@ BASIN_TEST_TARGET := $(BUILD_DIR)/basin_smoke$(EXEEXT)
 SOLVER_TEST_TARGET := $(BUILD_DIR)/solver_smoke$(EXEEXT)
 SCAN_TEST_TARGET := $(BUILD_DIR)/scan_smoke$(EXEEXT)
 ODEBIF_TEST_TARGET := $(BUILD_DIR)/odebif_smoke$(EXEEXT)
+PROG_TEST_TARGET := $(BUILD_DIR)/progressive_smoke$(EXEEXT)
+BASINCHAOS_TEST_TARGET := $(BUILD_DIR)/basinchaos_smoke$(EXEEXT)
+CONT_TEST_TARGET := $(BUILD_DIR)/continuation_smoke$(EXEEXT)
+PNG_TEST_TARGET := $(BUILD_DIR)/png_smoke$(EXEEXT)
+PARAMSYNC_TEST_TARGET := $(BUILD_DIR)/paramsync_smoke$(EXEEXT)
+PERIOD_TEST_TARGET := $(BUILD_DIR)/period_smoke$(EXEEXT)
 TEST_OBJ_DIR := $(BUILD_DIR)/obj-test
 
 PREFIX ?= /usr/local
@@ -194,6 +200,8 @@ else
 endif
 IR_TEST_C_OBJS := $(patsubst %.c,$(TEST_OBJ_DIR)/%.o,$(C_SRCS))
 IR_TEST_OBJS := $(IR_TEST_CPP_OBJS) $(IR_TEST_C_OBJS)
+PARAMSYNC_OBJS := $(TEST_OBJ_DIR)/test/paramsync_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
+BOXDIM_TEST_TARGET := $(BUILD_DIR)/boxdim_smoke$(EXEEXT)
 
 IMGUI_CORE_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp
 IMGUI_BACKEND_SRCS := imgui_impl_glfw.cpp imgui_impl_opengl3.cpp
@@ -298,7 +306,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -376,6 +384,41 @@ test-odebif: $(ODEBIF_TEST_TARGET)
 $(ODEBIF_TEST_TARGET): test/odebif_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/odebif_smoke.cpp -o $@ -lm
+
+test-progressive: $(PROG_TEST_TARGET)
+	./$(PROG_TEST_TARGET)
+
+$(PROG_TEST_TARGET): test/progressive_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/progressive_smoke.cpp -o $@ -lm
+
+test-basinchaos: $(BASINCHAOS_TEST_TARGET)
+	./$(BASINCHAOS_TEST_TARGET)
+
+$(BASINCHAOS_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/basinchaos_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/basinchaos_smoke.cpp -o $@ -lm
+
+test-continuation: $(CONT_TEST_TARGET)
+	./$(CONT_TEST_TARGET)
+
+$(CONT_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/continuation_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/continuation_smoke.cpp -o $@ -lm
+
+test-png: $(PNG_TEST_TARGET)
+	./$(PNG_TEST_TARGET)
+
+$(PNG_TEST_TARGET): test/png_smoke.cpp $(SRC_DIR)/png_writer.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) test/png_smoke.cpp -o $@ -lm
+
+test-period: $(PERIOD_TEST_TARGET)
+	./$(PERIOD_TEST_TARGET)
+
+$(PERIOD_TEST_TARGET): test/period_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/period_smoke.cpp -o $@ -lm
 
 test-ad: $(AD_TEST_TARGET)
 	./$(AD_TEST_TARGET)
@@ -481,3 +524,22 @@ help:
 	@echo "  make release         optimized native build"
 
 -include $(DEPS)
+
+test-paramsync: $(PARAMSYNC_TEST_TARGET)
+	./$(PARAMSYNC_TEST_TARGET)
+
+$(TEST_OBJ_DIR)/test/paramsync_smoke.o: test/paramsync_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds -c test/paramsync_smoke.cpp -o $@
+
+$(PARAMSYNC_TEST_TARGET): $(PARAMSYNC_OBJS)
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) -o $@ $(PARAMSYNC_OBJS) -lm
+
+test-boxdim: $(BOXDIM_TEST_TARGET)
+	./$(BOXDIM_TEST_TARGET)
+
+$(BOXDIM_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp -o $@ -lm
+

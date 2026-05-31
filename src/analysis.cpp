@@ -17,6 +17,7 @@
 
 #include "analysis.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <cmath>
 
@@ -395,7 +396,14 @@ namespace {
 
 bool jacobian_x(const Model &m, const double *x, double p,
                 std::vector<double> *jac, std::string *err) {
-  if (m.jacobian_x) return m.jacobian_x(x, p, jac->data(), err);
+  if (m.jacobian_x) {
+    /* The caller may pass an empty vector; the exact callback writes into
+     * jac->data(), so it MUST be sized n*n first (otherwise data() is null
+     * or undersized -> out-of-bounds write / crash). The finite-difference
+     * fallback resizes internally, which masked this on the FD path. */
+    jac->assign(m.n * m.n, 0.0);
+    return m.jacobian_x(x, p, jac->data(), err);
+  }
   return finite_diff_jacobian(m, x, p, jac, err);
 }
 
@@ -1068,7 +1076,15 @@ BasinResult compute_basins(const std::function<bool(double, double, double *, do
       }
 
       const size_t idx = (size_t)j * W + i;
-      if (diverged) { R.cell_attractor[idx] = -1; R.cell_speed[idx] = 0.0f; continue; }
+      if (diverged) { R.cell_attractor[idx] = -1; R.cell_speed[idx] = 0.0f; ++R.n_diverged; continue; }
+      if (!settled) {
+        /* Orbit never stopped drifting within max_steps. For a chaotic
+         * attractor (e.g. Lorenz) the endpoint is a different point of the
+         * attractor each time, so clustering it would manufacture spurious
+         * basins. Mark it as non-convergent (-2) instead — an honest,
+         * coherent region rather than noise. */
+        R.cell_attractor[idx] = -2; R.cell_speed[idx] = 0.0f; ++R.n_nonconvergent; continue;
+      }
 
       /* match endpoint to an existing attractor cluster, else add one */
       int label = -1;
@@ -1092,10 +1108,90 @@ BasinResult compute_basins(const std::function<bool(double, double, double *, do
         }
       }
       R.cell_attractor[idx] = label;
+      ++R.n_converged;
       /* convergence speed: faster settle => brighter (1 at 0 steps, ->0 at max) */
       R.cell_speed[idx] = (float)(1.0 - (double)steps / (double)opt.max_steps);
     }
   }
+  R.ok = true;
+  R.message = "ok";
+  return R;
+}
+
+/* ---- Box-counting fractal dimension --------------------------- */
+BoxCountResult box_counting_dimension(const std::vector<double> &xs,
+                                      const std::vector<double> &ys,
+                                      int n_levels) {
+  BoxCountResult R;
+  const size_t N = std::min(xs.size(), ys.size());
+  if (N < 8) { R.message = "too few points"; return R; }
+  if (n_levels < 3) n_levels = 3;
+  if (n_levels > 24) n_levels = 24;
+
+  double xmin = xs[0], xmax = xs[0], ymin = ys[0], ymax = ys[0];
+  for (size_t i = 1; i < N; ++i) {
+    if (std::isfinite(xs[i])) { xmin = std::min(xmin, xs[i]); xmax = std::max(xmax, xs[i]); }
+    if (std::isfinite(ys[i])) { ymin = std::min(ymin, ys[i]); ymax = std::max(ymax, ys[i]); }
+  }
+  double span = std::max(xmax - xmin, ymax - ymin);
+  if (!(span > 0.0)) { R.message = "degenerate point set (zero extent)"; return R; }
+  /* pad slightly so boundary points fall inside the coarse box */
+  span *= 1.0000001;
+
+  for (int level = 0; level < n_levels; ++level) {
+    const int grid = 1 << level;          /* 1, 2, 4, ... boxes per side */
+    const double eps = span / grid;
+    /* count occupied cells via a hash set of packed (ix,iy) */
+    std::unordered_set<long long> occupied;
+    occupied.reserve(N * 2);
+    for (size_t i = 0; i < N; ++i) {
+      if (!std::isfinite(xs[i]) || !std::isfinite(ys[i])) continue;
+      int ix = (int)((xs[i] - xmin) / eps);
+      int iy = (int)((ys[i] - ymin) / eps);
+      if (ix < 0) ix = 0;
+      if (ix >= grid) ix = grid - 1;
+      if (iy < 0) iy = 0;
+      if (iy >= grid) iy = grid - 1;
+      occupied.insert(((long long)ix << 32) | (unsigned int)iy);
+    }
+    const double count = (double)occupied.size();
+    if (count > 0) {
+      R.log_inv_eps.push_back(std::log(1.0 / eps));
+      R.log_count.push_back(std::log(count));
+    }
+  }
+
+  /* Least-squares slope of log N vs log(1/eps). Use the middle of the
+   * range: the coarsest levels (few boxes) and the finest (each point in
+   * its own box -> N saturates at #points) bias the slope, so trim a
+   * couple from each end when we have enough levels. */
+  size_t lo = 0, hi = R.log_count.size();
+  if (hi >= 7) { lo = 1; hi = R.log_count.size() - 2; }
+  else if (hi >= 5) { lo = 1; hi = R.log_count.size() - 1; }
+  const size_t m = (hi > lo) ? (hi - lo) : 0;
+  if (m < 2) { R.message = "insufficient scales for a fit"; return R; }
+
+  double sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (size_t i = lo; i < hi; ++i) {
+    const double X = R.log_inv_eps[i], Y = R.log_count[i];
+    sx += X; sy += Y; sxx += X * X; sxy += X * Y;
+  }
+  const double denom = m * sxx - sx * sx;
+  if (std::fabs(denom) < 1e-300) { R.message = "degenerate fit"; return R; }
+  const double slope = (m * sxy - sx * sy) / denom;
+  const double intercept = (sy - slope * sx) / m;
+
+  /* R^2 */
+  const double ymean = sy / m;
+  double ss_tot = 0, ss_res = 0;
+  for (size_t i = lo; i < hi; ++i) {
+    const double X = R.log_inv_eps[i], Y = R.log_count[i];
+    const double pred = slope * X + intercept;
+    ss_res += (Y - pred) * (Y - pred);
+    ss_tot += (Y - ymean) * (Y - ymean);
+  }
+  R.dimension = slope;
+  R.r_squared = (ss_tot > 0) ? (1.0 - ss_res / ss_tot) : 1.0;
   R.ok = true;
   R.message = "ok";
   return R;

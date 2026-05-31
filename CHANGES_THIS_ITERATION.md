@@ -1,67 +1,47 @@
-# dynsys — root-cause fixes + 19 new presets
+# dynsys — box-counting fractal dimension + vector-field color fix
 
 Unzip at repo root, then `make clean && make && make run`. Green
-"dynsys NEW-UI" label = you're on this build.
+"dynsys NEW-UI <date>" label = you're on this build.
 
-I found the real cause behind several recurring complaints this time.
+Now that the parameter-sync fix made every sweep trustworthy, this round
+adds a genuinely new analysis capability and fixes a rendering bug I found
+while looking around.
 
-## 1. Logistic bifurcation "horizontal lines" — ROOT CAUSE FOUND & FIXED
+## New: box-counting (fractal) dimension
 
-The Logistic and Tent presets were secretly "embedded in 3D"
-(x_next, y_next=x, z_next=z, i.e. 3 state variables). That single bad
-choice caused THREE of your bugs:
-- the bifurcation observed a muddled variable -> not the clean tree;
-- the 3D bridge (which needs a 1D map) was permanently disabled;
-- the 1D cobweb view wasn't offered.
+In the Analysis tab, under the Lyapunov spectrum, there's a new
+**"Measure box-counting dimension"** button. It estimates the
+Minkowski-Bouligand (box-counting) dimension of the set currently in the
+2D plane:
+- For a MAP it samples the attractor by iterating (200k points after a
+  transient).
+- For an ODE it measures the live trajectory (let it run a bit first).
+It reports D_box and the log-log fit quality R^2.
 
-Both are now GENUINE 1D maps (state x only). Result:
-- Logistic bifurcation now shows the real period-doubling tree (verified:
-  the map gives 1,2,4,8,... attractor values as r increases).
-- The 3D bridge works again for the Logistic/Tent (it needs a 1D map).
-- The 1D cobweb view is offered for them.
+This is a real piece of nonlinear-dynamics kit that none of pplane / XPPAUT
+/ MatCont / AUTO surface, and it complements the Kaplan-Yorke dimension
+already there (Kaplan-Yorke comes from the Lyapunov spectrum; box-counting
+is measured directly from the geometry — nice to compare the two).
 
-## 2. The 3D bridge being "always deactivated" — fixed by the above
+Validated headlessly (`make test-boxdim`) against shapes of known
+dimension: filled square -> 1.99, line -> 1.04, circle -> 1.09, Sierpinski
+triangle -> 1.60 (theory 1.585), Henon attractor -> 1.31 (literature ~1.26),
+all with R^2 >= 0.995.
 
-It is valid for 1D maps; with the Logistic/Tent now genuinely 1D, select
-one of them and the "3D bridge" toolbar button is enabled.
+## Fixed: vector-field arrow coloring
 
-## 3. Bifurcation "Run" button overflowing — replaced
+While wiring the above I noticed the phase-plane vector field's speed->color
+mapping had a collapsed term (a stray * 0.0) that tinted almost every arrow
+the same. It now scales color to the actual max speed in the current view
+(two-pass): slow = blue, fast = warm. The flow structure reads much more
+clearly. (I also caught myself starting to build a duplicate direction-field
+renderer and removed it — the existing one just needed the fix.)
 
-The floating in-view panel that overflowed is gone. The bifurcation
-controls (parameter picker, from/to range, Run) now live in the TOP
-TOOLBAR when the bifurcation view is active — compact and clip-free. The
-empty-view text now points you to the toolbar button and to loading the
-Logistic map.
-
-## 4. Basin / fractal display bugs — hardening
-
-- Fixed an asymmetric bounds guard in the fractal parameter-space compute
-  (one of the two parameter writes wasn't size-checked).
-- (From last round, still in place) grid computes force fixed-step RK4 and
-  are debounced so panning/zooming doesn't freeze.
-Note: the fractal view requires a 2D MAP — use "Complex quadratic"
-(Mandelbrot/Julia) or "Gingerbreadman". The now-1D Logistic correctly does
-not offer the fractal view.
-
-## 5. NEW PRESETS (19 added; 39 total)
-
-Phase-plane: Duffing, FitzHugh-Nagumo, Brusselator, Sel'kov glycolysis,
-SIR epidemic, Rosenzweig-MacArthur predator-prey (limit cycle), undamped
-pendulum.
-1D maps (great for bifurcation/cobweb): Sine, Gauss/mouse, Cubic.
-2D maps: Gingerbreadman, Chirikov standard map.
-3D: Chua's circuit (double-scroll), Sprott B, Nose-Hoover.
-All 19 were checked through the real expression engine (parse + lower +
-iterate); every one parses and runs.
+## Roadmap
+docs/COMPARISON_AND_ROADMAP.md updated: box-counting dimension marked done
+(Phase C). Remaining: IFS/chaos game; the big one is still Phase D step 2
+(limit-cycle continuation) for full MatCont parity; Phase E waits on Lizard.
 
 ## Verification
-- All 4 C++ TUs compile with ZERO warnings (-O2) against the real
-  ImGui/GLFW/cglm/tpcas headers (integer ImTextureID, matching nix).
-- make test: 12 suites all pass.
-- New presets validated by parsing+running each through the IR.
-
-## What I still can't verify (need your eyes)
-I can't see the GUI, so for any remaining "bug out" in basins/fractals: a
-screenshot (with the green NEW-UI label) plus which preset + view triggers
-it would let me fix the exact pixels. If it hard-crashes, running
-`gdb ./build/dynsys` and pasting the backtrace pinpoints it instantly.
+- All 4 C++ TUs compile with ZERO warnings (-O2).
+- make test: 19 checks/suites pass (added **test-boxdim**).

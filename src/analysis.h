@@ -241,9 +241,10 @@ double kaplan_yorke_dimension(const std::vector<double> &sorted_desc);
 struct BasinResult {
   bool ok = false;
   int width = 0, height = 0;
-  std::vector<int> cell_attractor;   /* width*height; index into attractors, or -1 = diverged/none */
+  std::vector<int> cell_attractor;   /* width*height; index into attractors, or -1 = diverged, -2 = did not settle (chaotic) */
   std::vector<float> cell_speed;     /* width*height; 0..1 convergence speed (1 = fast) */
   std::vector<std::pair<double,double>> attractors; /* representative (x,y) of each basin */
+  long n_converged = 0, n_diverged = 0, n_nonconvergent = 0;
   std::string message;
 };
 
@@ -262,5 +263,28 @@ struct BasinOptions {
  * iteration. */
 BasinResult compute_basins(const std::function<bool(double x, double y, double *nx, double *ny)> &advance,
                            const BasinOptions &opt);
+
+/* ---- Box-counting fractal dimension --------------------------- *
+ * Estimate the box-counting (Minkowski–Bouligand) dimension of a set of
+ * 2D points: cover the bounding box with a grid of boxes of side eps,
+ * count how many boxes contain at least one point (N(eps)), and fit the
+ * slope of log N(eps) vs log(1/eps) over a range of scales. For a curve
+ * D≈1, for an area-filling set D≈2, for a strange attractor a fraction in
+ * between (e.g. Hénon ≈1.26). AppState-free and headless-testable. */
+struct BoxCountResult {
+  bool ok = false;
+  double dimension = 0.0;            /* fitted slope */
+  double r_squared = 0.0;            /* fit quality 0..1 */
+  std::vector<double> log_inv_eps;   /* x of the fit (log 1/eps) */
+  std::vector<double> log_count;     /* y of the fit (log N)     */
+  std::string message;
+};
+
+/* points: interleaved or as pairs? We take separate x and y spans for
+ * generality. n_levels grid refinements (each halving eps). The coarsest
+ * eps spans the whole bounding box; the finest is box/2^(n_levels-1). */
+BoxCountResult box_counting_dimension(const std::vector<double> &xs,
+                                      const std::vector<double> &ys,
+                                      int n_levels = 10);
 
 }  // namespace dynsys::analysis

@@ -37,6 +37,9 @@ extern "C" {
 #include "analysis.h"
 #include "expr_ir_ad.h"
 
+#define PNG_WRITER_IMPLEMENTATION
+#include "png_writer.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -289,6 +292,8 @@ struct AppState {
   int fps = 0;
   int window_width = 1100;
   int window_height = 820;
+  std::string screenshot_msg;     /* transient "saved <path>" toast */
+  int screenshot_msg_timer = 0;
 
   GLuint vbo = 0;
   GLuint vao = 0;
@@ -316,7 +321,7 @@ struct AppState {
   /* PHASE6-UI: which plot fills the window background. */
   /* PHASE-A: the active system exposes a set of full-area views; the
    * toolbar offers only the ones valid for its dimension/mode. */
-  enum class ActiveView { Line1D, Phase2D, Scene3D, Bifurcation, Fractal, Scene3DBridge, Basins, ParamScan2D };
+  enum class ActiveView { Line1D, Phase2D, Scene3D, Bifurcation, Fractal, Scene3DBridge, Basins, ParamScan2D, Continuation };
   ActiveView active_view = ActiveView::Phase2D;
   bool show_side_panel = true;
   float window_toolbar_h = 32.0f;
@@ -354,6 +359,13 @@ struct AppState {
   int lyap_spec_transient = 2000;
   int lyap_spec_steps = 20000;
 
+  /* PHASE B/C: box-counting fractal dimension of the on-screen set. */
+  bool boxdim_ready = false;
+  double boxdim_value = 0.0;
+  double boxdim_r2 = 0.0;
+  long boxdim_n_points = 0;
+  std::string boxdim_msg;
+
   char export_path[256] = "dynsys_export.csv";
   char bif_param[64] = "rho";
   char bif_observable[128] = "x";
@@ -370,6 +382,11 @@ struct AppState {
   bool bif_show = false; /* show the bifurcation diagram view */
   /* PHASE B+: interactive view window for the bifurcation diagram. */
   bool bif_view_valid = false;
+  bool bif_autorun_done = false; /* auto-run the sweep once when the view is first shown */
+  /* per-slice detected period (1,2,4,...; 0 = chaotic/aperiodic) for maps,
+   * used to annotate windows on the diagram */
+  std::vector<Point2> bifurcation_period; /* (param, period) */
+  bool bif_show_period = true;
   double bif_view_xmin = 0, bif_view_xmax = 1, bif_view_ymin = 0, bif_view_ymax = 1;
 
   /* PHASE C: escape-time fractal view. Iterates the system's 2D map over
@@ -392,6 +409,7 @@ struct AppState {
   /* Julia constant for StateSpace mode = current values of those params. */
   bool fractal_dirty = true;       /* recompute the image when true */
   int fractal_settle = 0;          /* debounce: frames to wait after a view change */
+  int fractal_prog_level = 0;      /* progressive refine: downscale factor (0 = done) */
   GLuint fractal_tex = 0;
   int fractal_tex_w = 0, fractal_tex_h = 0;
   bool fractal_view_init = false;
@@ -426,6 +444,26 @@ struct AppState {
   double basin_cluster_tol = 1e-2;
   bool basin_shade_speed = true; /* modulate brightness by convergence speed */
   int basin_attractor_count = 0;
+  long basin_n_converged = 0, basin_n_diverged = 0, basin_n_nonconvergent = 0;
+
+  /* PHASE D: equilibrium continuation (the MatCont-style bifurcation
+   * diagram) — drawing/view state. The sweep scalars (cont_param,
+   * cont_p_min/max, cont_max_points, cont_branch) are declared with the
+   * older continuation block below; here we add the flattened branch used
+   * by the full-window diagram view. */
+  int cont_y_index = 0;             /* which state component on the y-axis */
+  bool cont_has_branch = false;
+  bool cont_autorun_done = false;   /* auto-run the trace once when the view is first shown */
+  bool cont_view_valid = false;     /* false => refit axes to the branch */
+  double cont_view_xmin = 0, cont_view_xmax = 1, cont_view_ymin = 0, cont_view_ymax = 1;
+  std::string cont_message;
+  int cont_n_fold = 0, cont_n_hopf = 0;
+  /* the traced branch, flattened for drawing: parallel arrays */
+  std::vector<double> cont_pp;            /* parameter value per point */
+  std::vector<double> cont_yy;            /* observable (state[cont_y_index]) per point */
+  std::vector<unsigned char> cont_stable; /* 1 = stable, 0 = unstable */
+  std::vector<int> cont_special;          /* 0 none, 1 fold, 2 hopf (per point) */
+  std::vector<std::size_t> cont_break;    /* indices where the polyline should break (dir join) */
 
   /* PHASE B: 2-parameter scan ("shrimp" map). Color a grid over two
    * parameters by the largest Lyapunov exponent (chaotic regions bright,
@@ -2164,6 +2202,8 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
       std::snprintf(app.bif_observable, sizeof(app.bif_observable), "%s",
                     app.state_names[0].c_str());
     app.bif_view_valid = false;
+    app.bif_autorun_done = false; /* let the new system auto-run its sweep on entry */
+    app.cont_autorun_done = false; /* and re-trace continuation on entry */
   }
   return true;
 }
@@ -2329,6 +2369,8 @@ dtheta = omega
 domega = 0 - sin(theta)
 )dyn", {0.5,0.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
     {"Henon map", "Discrete maps", "# Hénon map\nmode = map\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nx_next = 1 - a * x * x + y\ny_next = b * x\nz_next = z\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Lozi map", "Discrete maps", "# Lozi map (piecewise-linear Henon cousin; chaotic)\nstate x, y\nmode = map\nparam a = 1.7 [0,2]\nparam b = 0.5 [0,1]\nview2d = -2, 2, -1, 1\nx_next = 1 - a * abs(x) + y\ny_next = b * x\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Ikeda map", "Discrete maps", "# Ikeda map (laser cavity; spiral chaotic attractor)\nstate x, y\nmode = map\nparam u = 0.918 [0,1]\nview2d = -0.5, 2, -2.5, 1\nx_next = 1 + u * (x * cos(0.4 - 6 / (1 + x*x + y*y)) - y * sin(0.4 - 6 / (1 + x*x + y*y)))\ny_next = u * (x * sin(0.4 - 6 / (1 + x*x + y*y)) + y * cos(0.4 - 6 / (1 + x*x + y*y)))\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Logistic map", "Discrete maps", "# Logistic map x_{n+1} = r x (1-x)  (genuine 1D map)\n# The classic period-doubling route to chaos.\nstate x\nmode = map\nparam r = 3.9 [0,4]\nview2d = 0, 1, 0, 1\nx_next = r * x * (1 - x)\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Tent map", "Discrete maps", "# Tent map: x_next = mu * min(x, 1-x)\n# 1D map; chaotic for mu near 2, x stays in [0,1].\nstate x\nmode = map\nparam mu = 1.9 [0,2]\nview2d = 0, 1, 0, 1\nx_next = mu * min(x, 1 - x)\nobserve x_value = x\n", {0.35,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Sine map", "Discrete maps", "# Sine map x_{n+1} = r sin(pi x)  (1D, period-doubling like logistic)\nstate x\nmode = map\nparam r = 0.9 [0,1]\nview2d = 0, 1, 0, 1\nx_next = r * sin(3.141592653589793 * x)\nobserve x_value = x\n", {0.4,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
@@ -2365,6 +2407,32 @@ void apply_preset(AppState &app, int index) {
 
 void set_lorenz(AppState &app) {
   apply_preset(app, 0);
+}
+
+/* One-click demo that GUARANTEES the canonical logistic period-doubling
+ * tree: find the Logistic preset, load + compile it, configure the sweep
+ * over r in [0,4] observing x, run it, and switch to the bifurcation view.
+ * This removes every "did I set it up right / am I on the new build" doubt. */
+bool compile_system(AppState &app, const char *system_text, std::string *error);
+void run_bifurcation(AppState &app);
+void reset_simulation(AppState &app);
+void load_logistic_bifurcation_demo(AppState &app) {
+  int idx = -1;
+  for (int i = 0; i < kPresetCount; ++i)
+    if (std::string(kPresets[i].name) == "Logistic map") { idx = i; break; }
+  if (idx < 0) return;
+  apply_preset(app, idx);
+  std::string err;
+  if (!compile_system(app, app.system_input, &err)) { app.parse_error = err; return; }
+  reset_simulation(app);
+  /* configure the sweep explicitly (don't rely on auto-config timing) */
+  std::snprintf(app.bif_param, sizeof(app.bif_param), "r");
+  std::snprintf(app.bif_observable, sizeof(app.bif_observable), "x");
+  app.bif_start = 0.0; app.bif_end = 4.0;
+  app.bif_discard = 1000; app.bif_keep = 200; app.bif_slices = 800;
+  app.bif_view_valid = false;
+  run_bifurcation(app);
+  app.active_view = AppState::ActiveView::Bifurcation;
 }
 
 void allocate_points(AppState &app) {
@@ -2492,6 +2560,7 @@ void restart_main_from_state(AppState &app, const State &seed) {
  * static trajectory (active=false) so it doesn't keep marching. */
 bool step_ode_state(AppState &app, const State &in, State *out, char *err, size_t err_cap);
 void run_bifurcation(AppState &app); /* PHASE B+: used by the in-view control strip */
+void run_continuation(AppState &app); /* PHASE D: equilibrium branch tracer */
 
 void add_phase_trajectory(AppState &app, const State &seed, const char *label_prefix = "orbit") {
   if (static_cast<int>(app.phase_trajectories.size()) >= app.phase_max_extra_trajectories) {
@@ -2949,6 +3018,7 @@ bool view_valid(const AppState &app, AppState::ActiveView v) {
       return app.mode == SystemMode::Map && effective_dimension(app) == 1;
     case AppState::ActiveView::Basins:      return app.state_names.size() >= 2;
     case AppState::ActiveView::ParamScan2D: return app.params.size() >= 2;
+    case AppState::ActiveView::Continuation: return app.mode == SystemMode::ODE && !app.params.empty();
   }
   return false;
 }
@@ -4203,31 +4273,50 @@ void render_phase_background(AppState &app) {
     char err[256] = {0};
     const double bx = bounds.xmax - bounds.xmin;
     const double by = bounds.ymax - bounds.ymin;
+    /* first pass: sample the field and record the max speed, so the
+     * speed->color mapping is scaled to THIS view instead of a hard-coded
+     * constant (the old mapping collapsed the speed term and tinted nearly
+     * everything the same). */
+    const double max_len_data = 0.34 * std::min(bx, by) / grid;
+    std::vector<double> fvx((size_t)grid * grid, 0.0), fvy((size_t)grid * grid, 0.0);
+    std::vector<unsigned char> fok((size_t)grid * grid, 0);
+    double speed_max = 1e-12;
     for (int gy = 0; gy < grid; ++gy) {
       for (int gx = 0; gx < grid; ++gx) {
         const double x = bounds.xmin + (gx + 0.5) * bx / grid;
         const double y = bounds.ymin + (gy + 0.5) * by / grid;
-        State st = app.current;
-        resize_state(st, app.state_names.size());
-        set_state_at(st, ix, x);
-        set_state_at(st, iy, y);
+        State st = app.current; resize_state(st, app.state_names.size());
+        set_state_at(st, ix, x); set_state_at(st, iy, y);
         double vx = 0.0, vy = 0.0;
         if (!eval_phase_vector(app, st, ix, iy, &vx, &vy, err, sizeof(err))) continue;
         const double len = std::sqrt(vx * vx + vy * vy);
         if (len <= 1e-14 || !std::isfinite(len)) continue;
-        const double max_len_data = 0.34 * std::min(bx, by) / grid;
+        const size_t k = (size_t)gy * grid + gx;
+        fvx[k] = vx; fvy[k] = vy; fok[k] = 1;
+        if (len > speed_max) speed_max = len;
+      }
+    }
+    const double inv_speed = 1.0 / speed_max;
+    for (int gy = 0; gy < grid; ++gy) {
+      for (int gx = 0; gx < grid; ++gx) {
+        const size_t k = (size_t)gy * grid + gx;
+        if (!fok[k]) continue;
+        const double x = bounds.xmin + (gx + 0.5) * bx / grid;
+        const double y = bounds.ymin + (gy + 0.5) * by / grid;
+        const double vx = fvx[k], vy = fvy[k];
+        const double len = std::sqrt(vx * vx + vy * vy);
         double nvx = vx, nvy = vy;
         if (app.phase_normalize_vectors) { nvx = vx / len * max_len_data; nvy = vy / len * max_len_data; }
         else { const double s = max_len_data / (1.0 + len); nvx *= s; nvy *= s; }
-        /* speed-colored arrows: slow=blue, fast=warm */
-        const double tcol = std::min(1.0, len / (4.0 * (max_len_data / std::max(1e-9, max_len_data))) * 0.0 + std::min(1.0, len / 5.0));
-        const int rr = static_cast<int>(90 + 150 * tcol);
-        const int gg = static_cast<int>(140 - 40 * tcol);
-        const int bb = static_cast<int>(190 - 120 * tcol);
+        /* speed-colored: slow = blue, fast = warm; sqrt for visual balance */
+        const double tcol = std::min(1.0, std::sqrt(len * inv_speed));
+        const int rr = static_cast<int>(60 + 180 * tcol);
+        const int gg = static_cast<int>(140 - 30 * tcol);
+        const int bb = static_cast<int>(210 - 140 * tcol);
         const Point2 a = plot_to_screen(bounds, p0, w, h, x - 0.5 * nvx, y - 0.5 * nvy);
         const Point2 b = plot_to_screen(bounds, p0, w, h, x + 0.5 * nvx, y + 0.5 * nvy);
         draw_arrow(draw, ImVec2((float)a.x, (float)a.y), ImVec2((float)b.x, (float)b.y),
-                   IM_COL32(rr, gg, bb, 150));
+                   IM_COL32(rr, gg, bb, 160));
       }
     }
   }
@@ -4301,9 +4390,10 @@ ImU32 fractal_palette(double t) {
   return IM_COL32(r, g, b, 255);
 }
 
-void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &out) {
+void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &out, int step = 1) {
   if (W < 2) W = 2;
   if (H < 2) H = 2;
+  if (step < 1) step = 1;
   out.assign((size_t)W * H, 0xff000000u);
   const size_t n = app.state_names.size();
   if (n < 2) return; /* needs a 2D plane */
@@ -4321,13 +4411,17 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
   /* Save params we will temporarily override (param mode). */
   std::vector<double> saved = app.param_values;
 
+  /* Reused scratch states (avoid per-pixel heap allocation). */
+  State s = make_state_like(n, 0.0);
+  State cur = make_state_like(n, 0.0);
+  State nx = make_state_like(n, 0.0);
+
   char err[128] = {0};
-  for (int py = 0; py < H; ++py) {
+  for (int py = 0; py < H; py += step) {
     const double b_im = y0 + (y1 - y0) * (double)py / (H - 1);
-    for (int px = 0; px < W; ++px) {
+    for (int px = 0; px < W; px += step) {
       const double a_re = x0 + (x1 - x0) * (double)px / (W - 1);
 
-      State s = make_state_like(n, 0.0);
       if (param_mode) {
         /* plane = (param cx, param cy); initial state = system start */
         for (size_t i = 0; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
@@ -4335,7 +4429,7 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
         if ((size_t)cyi < app.param_values.size()) app.param_values[(size_t)cyi] = b_im;
       } else {
         /* plane = initial (x, y); params fixed at current values */
-        app.param_values = saved;
+        if (px == 0 && py == 0) app.param_values = saved;
         set_state_at(s, 0, a_re);
         set_state_at(s, 1, b_im);
         for (size_t i = 2; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
@@ -4343,14 +4437,13 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
 
       int it = 0;
       double r2 = 0.0;
-      State cur = s;
+      for (size_t i = 0; i < n; ++i) set_state_at(cur, i, state_at(s, i));
       for (; it < maxit; ++it) {
-        State nx{};
         if (!step_map_state(app, cur, &nx, err, sizeof(err))) { it = maxit; break; }
         const double xx = state_at(nx, 0), yy = state_at(nx, 1);
         r2 = xx * xx + yy * yy;
-        if (!std::isfinite(r2) || r2 > R2) { cur = nx; ++it; break; }
-        cur = nx;
+        if (!std::isfinite(r2) || r2 > R2) { ++it; break; }
+        std::swap(cur.v, nx.v); cur.t = nx.t;
       }
 
       uint32_t color = 0xff101014u; /* "in the set" */
@@ -4363,7 +4456,10 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
         const double t = std::fmod(mu * 0.04, 1.0);
         color = fractal_palette(t < 0 ? t + 1.0 : t);
       }
-      out[(size_t)py * W + px] = color;
+      /* fill the step x step block so a coarse pass covers the whole image */
+      for (int by = py; by < py + step && by < H; ++by)
+        for (int bx = px; bx < px + step && bx < W; ++bx)
+          out[(size_t)by * W + bx] = color;
     }
   }
   app.param_values = saved; /* restore */
@@ -4414,20 +4510,25 @@ void render_fractal_background(AppState &app) {
      * recomputes — a lovely way to explore the Mandelbrot/Julia link. */
   }
 
-  /* (re)compute the image at a capped resolution for responsiveness.
-   * Debounce: a view change (dirty) waits a few still frames before the
-   * expensive recompute, so dragging/zooming stays smooth instead of
-   * recomputing every frame (which looked like a freeze). A missing or
-   * resized texture forces an immediate compute. */
+  /* (re)compute the image at a capped resolution. Two refinements for a
+   * smooth experience:
+   *  - Debounce: a view change waits a few still frames before recompute,
+   *    so dragging/zooming stays responsive.
+   *  - Progressive: after the wait, render a coarse pass (step 8) for
+   *    instant feedback, then refine 8->4->2->1 on successive frames. This
+   *    removes the long stall on the first paint / after a big zoom. */
   const int CW = std::min(app.window_width, 900);
   const int CH = std::min(app.window_height, 700);
   const bool force = (app.fractal_tex == 0 || app.fractal_tex_w != CW || app.fractal_tex_h != CH);
-  if (app.fractal_dirty) { app.fractal_settle = 6; app.fractal_dirty = false; }
-  bool do_compute = force;
-  if (app.fractal_settle > 0) { if (--app.fractal_settle == 0) do_compute = true; }
-  if (do_compute) {
+  if (app.fractal_dirty) { app.fractal_settle = 5; app.fractal_dirty = false; }
+  bool start_progress = force;
+  if (app.fractal_settle > 0) { if (--app.fractal_settle == 0) start_progress = true; }
+  if (start_progress) app.fractal_prog_level = 8; /* begin coarse */
+
+  if (app.fractal_prog_level > 0) {
+    const int step = app.fractal_prog_level;
     std::vector<uint32_t> img;
-    compute_fractal_image(app, CW, CH, img);
+    compute_fractal_image(app, CW, CH, img, step);
     if (app.fractal_tex == 0) glGenTextures(1, &app.fractal_tex);
     glBindTexture(GL_TEXTURE_2D, app.fractal_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
@@ -4436,6 +4537,8 @@ void render_fractal_background(AppState &app) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     app.fractal_tex_w = CW; app.fractal_tex_h = CH;
+    /* refine on the next frame: 8 -> 4 -> 2 -> 1 -> done */
+    app.fractal_prog_level = (step > 1) ? step / 2 : 0;
   }
 
   if (app.fractal_tex != 0)
@@ -4463,7 +4566,8 @@ void render_fractal_background(AppState &app) {
  * via step_state) and maps (one iteration).
  * ============================================================ */
 ImU32 basin_color(int label, int nlabels, float speed, bool shade) {
-  if (label < 0) return IM_COL32(8, 8, 12, 255); /* diverged / none */
+  if (label == -1) return IM_COL32(8, 8, 12, 255);     /* diverged to infinity */
+  if (label == -2) return IM_COL32(64, 64, 72, 255);   /* did not settle (chaotic attractor) */
   /* distinct hues around the wheel */
   const double h = nlabels > 0 ? (double)label / std::max(1, nlabels) : 0.0;
   const double H = h * 6.0;
@@ -4533,6 +4637,9 @@ void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out
   dynsys::analysis::BasinResult R = dynsys::analysis::compute_basins(advance, opt);
   app.integrator = saved_integrator; /* restore the user's choice */
   app.basin_attractor_count = (int)R.attractors.size();
+  app.basin_n_converged = R.n_converged;
+  app.basin_n_diverged = R.n_diverged;
+  app.basin_n_nonconvergent = R.n_nonconvergent;
   if (!R.ok) return;
   const int nl = (int)R.attractors.size();
   for (int j = 0; j < H; ++j)
@@ -4592,14 +4699,26 @@ void render_basin_background(AppState &app) {
   if (app.basin_tex != 0)
     draw->AddImage((ImTextureID)(uintptr_t)app.basin_tex, ImVec2(0, 0), ImVec2(w, h));
 
-  char hud[256];
+  char hud[320];
   std::snprintf(hud, sizeof(hud),
-                "Basins of attraction — %d basins   |  %s vs %s   (each color = one attractor; brightness = convergence speed)",
-                app.basin_attractor_count, app.state_names[ix].c_str(), app.state_names[iy].c_str());
+                "Basins of attraction — %d basin(s)  |  %s vs %s  |  converged %ld, escaped %ld, non-convergent %ld",
+                app.basin_attractor_count, app.state_names[ix].c_str(), app.state_names[iy].c_str(),
+                app.basin_n_converged, app.basin_n_diverged, app.basin_n_nonconvergent);
   draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+
+  /* If almost nothing converged, the system likely has a single chaotic
+   * attractor (e.g. Lorenz) — basins aren't meaningful there. Say so and
+   * point to a multistable example, instead of showing a confusing wash. */
+  const long total_cells = app.basin_n_converged + app.basin_n_diverged + app.basin_n_nonconvergent;
+  if (total_cells > 0 && app.basin_n_nonconvergent > 0.6 * total_cells) {
+    draw->AddText(ImVec2(14, 34), IM_COL32(255, 210, 120, 240),
+                  "Most orbits don't settle to a point/cycle — this system has a chaotic or single global attractor.");
+    draw->AddText(ImVec2(14, 52), IM_COL32(255, 210, 120, 240),
+                  "Basins are meaningful for MULTISTABLE systems. Try the Duffing oscillator or the Newton fractal preset.");
+  }
   if (!io.WantCaptureMouse)
     draw->AddText(ImVec2(14, h - 24), IM_COL32(150, 150, 160, 200),
-                  "drag: pan   wheel: zoom   double-click: reset   (settings in the Setup tab)");
+                  "grey = didn't settle · black = escaped · colors = distinct attractors    drag: pan  wheel: zoom  double-click: reset");
 }
 
 /* ============================================================
@@ -4990,13 +5109,20 @@ void render_bifurcation_background(AppState &app) {
    * work even before the user finds the Analysis tab. */
   const auto &pts = app.bifurcation_points;
   if (pts.empty()) {
-    draw->AddText(ImVec2(p0.x + 18, p0.y + 44), IM_COL32(225, 225, 235, 235),
-                  "Bifurcation view is empty. Click 'Run bifurcation' in the top toolbar to compute.");
-    draw->AddText(ImVec2(p0.x + 18, p0.y + 64), IM_COL32(190, 190, 200, 220),
-                  "For the classic period-doubling tree, load the 'Logistic map' preset, then Run.");
-    draw->AddText(ImVec2(p0.x + 18, p0.y + 84), IM_COL32(190, 190, 200, 220),
-                  "Sweep parameter & range: set them in the Analysis tab (left panel).");
-    return;
+    /* Auto-run once on entry if we have a parameter to sweep — so the view
+     * shows the diagram immediately instead of a blank panel the user has
+     * to hunt to populate. (Only auto-runs when truly empty.) */
+    if (!app.params.empty() && !app.bif_autorun_done) {
+      app.bif_autorun_done = true;
+      run_bifurcation(app);
+    }
+    if (app.bifurcation_points.empty()) {
+      draw->AddText(ImVec2(p0.x + 18, p0.y + 44), IM_COL32(225, 225, 235, 235),
+                    "Bifurcation view. Pick a parameter & range in the top toolbar, then 'Run bifurcation'.");
+      draw->AddText(ImVec2(p0.x + 18, p0.y + 64), IM_COL32(190, 190, 200, 220),
+                    "For the classic period-doubling tree, load the 'Logistic map' preset, then Run.");
+      return;
+    }
   }
 
   const float pad_l = 64.0f, pad_b = 40.0f, pad_t = 36.0f, pad_r = 18.0f;
@@ -5073,22 +5199,25 @@ void render_bifurcation_background(AppState &app) {
   }
 
   /* draw the density as short vertical runs per (gx,gy) cell, colored by
-   * log-density (a clean blue->cyan->white ramp). Drawing 1px rects is
-   * fine for a single frame at typical window sizes. */
+   * log-density. A gamma lift makes the thin low-density branches (the
+   * single-period curve, the early forks) clearly visible instead of
+   * near-black — previously they could read as faint scattered dots. */
   if (dmax > 0.0f) {
     const float inv_log = 1.0f / std::log(1.0f + dmax);
     for (int gy = 0; gy < GH; ++gy) {
       for (int gx = 0; gx < GW; ++gx) {
         const float c = dens[(size_t)gy * GW + gx];
         if (c <= 0.0f) continue;
-        const float t = std::log(1.0f + c) * inv_log; /* 0..1 */
-        /* ramp: dark blue -> cyan -> white */
+        float t = std::log(1.0f + c) * inv_log; /* 0..1 */
+        t = std::pow(t, 0.45f);                  /* gamma lift for faint branches */
+        /* ramp with a bright floor: even a single hit is clearly visible
+         * (light blue), dense bands go cyan->white. */
         int r, g, b;
-        if (t < 0.5f) { const float u = t / 0.5f; r = (int)(20 + 20*u); g = (int)(90 + 130*u); b = (int)(160 + 80*u); }
-        else { const float u = (t - 0.5f) / 0.5f; r = (int)(40 + 215*u); g = (int)(220 + 35*u); b = (int)(240 + 15*u); }
+        if (t < 0.5f) { const float u = t / 0.5f; r = (int)(70 + 30*u); g = (int)(150 + 90*u); b = (int)(210 + 45*u); }
+        else { const float u = (t - 0.5f) / 0.5f; r = (int)(100 + 155*u); g = (int)(240 + 15*u); b = (int)(255); }
         const float px = pad_l + gx;
         const float py = pad_t + gy;
-        draw->AddRectFilled(ImVec2(px, py), ImVec2(px + 1.0f, py + 1.0f),
+        draw->AddRectFilled(ImVec2(px, py), ImVec2(px + 1.6f, py + 1.6f),
                             IM_COL32(r, g, b, 255));
       }
     }
@@ -5140,6 +5269,31 @@ void render_bifurcation_background(AppState &app) {
     }
   }
 
+  /* ---- period strip (maps): a thin band at the top encoding the detected
+   * period at each parameter value. Makes the period-doubling cascade and
+   * the periodic windows (e.g. the period-3 window) legible at a glance. */
+  if (app.mode == SystemMode::Map && app.bif_show_period && !app.bifurcation_period.empty()) {
+    const float band_y0 = pad_t + 2.0f, band_h = 7.0f;
+    auto period_color = [](int per) -> ImU32 {
+      if (per <= 0) return IM_COL32(220, 90, 70, 255);         /* chaotic: red */
+      switch (per) {
+        case 1: return IM_COL32(60, 120, 220, 255);            /* blue */
+        case 2: return IM_COL32(60, 200, 200, 255);            /* cyan */
+        case 3: return IM_COL32(255, 215, 80, 255);            /* gold (period-3!) */
+        case 4: return IM_COL32(120, 220, 120, 255);           /* green */
+        case 8: return IM_COL32(200, 160, 240, 255);           /* violet */
+        default: return IM_COL32(180, 180, 190, 255);          /* other periodic: grey */
+      }
+    };
+    for (const auto &pp : app.bifurcation_period) {
+      if (pp.x < vx0 || pp.x > vx1) continue;
+      const float X = sx(pp.x);
+      draw->AddRectFilled(ImVec2(X, band_y0), ImVec2(X + 2.0f, band_y0 + band_h), period_color((int)pp.y));
+    }
+    draw->AddText(ImVec2(pad_l + plot_w - 220, band_y0 + band_h + 1),
+                  IM_COL32(170,170,180,210), "period band: blue=1 cyan=2 gold=3 green=4 red=chaos");
+  }
+
   /* ---- labels ---- */
   char title[360];
   std::snprintf(title, sizeof(title), "Bifurcation diagram   %s (vertical)  vs  %s (horizontal)   |  %zu points",
@@ -5149,6 +5303,171 @@ void render_bifurcation_background(AppState &app) {
     draw->AddText(ImVec2(pad_l, pad_t + plot_h + 22),
                   IM_COL32(150,150,160,200),
                   "drag: pan   wheel/+/-: zoom   double-click: reset   (blue->white = density;  red Lyapunov>0 = chaos)");
+}
+
+/* ============================================================
+ * PHASE D: equilibrium continuation diagram (MatCont-style).
+ * x-axis = continuation parameter, y-axis = a chosen state component.
+ * Stable branch solid & bright, unstable branch dashed & dim. Fold (o)
+ * and Hopf (<>) points marked and labeled.
+ * ============================================================ */
+void render_continuation_background(AppState &app) {
+  const ImVec2 p0(0.0f, 0.0f);
+  const float w = (float)app.window_width, h = (float)app.window_height;
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(p0, ImVec2(w, h), IM_COL32(12, 13, 17, 255));
+
+  if (app.mode != SystemMode::ODE) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
+                  "Continuation is for ODE systems (equilibria vs. a parameter).");
+    return;
+  }
+  if (app.params.empty()) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
+                  "This system has no parameter to continue.");
+    return;
+  }
+  if (!app.cont_has_branch) {
+    /* auto-run once on entry so the diagram appears without hunting */
+    if (!app.params.empty() && !app.cont_autorun_done) {
+      app.cont_autorun_done = true;
+      run_continuation(app);
+    }
+    if (!app.cont_has_branch) {
+      draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
+                    "Equilibrium continuation. Pick a parameter & range in the top toolbar, then 'Continue'.");
+      draw->AddText(ImVec2(20, 68), IM_COL32(185, 185, 195, 220),
+                    "It traces the equilibrium both ways from the current state and marks fold/Hopf points.");
+      if (!app.cont_message.empty())
+        draw->AddText(ImVec2(20, 92), IM_COL32(255, 200, 120, 230), app.cont_message.c_str());
+      return;
+    }
+  }
+
+  const float pad_l = 64.0f, pad_b = 40.0f, pad_t = 36.0f, pad_r = 18.0f;
+  const float plot_w = std::max(16.0f, w - pad_l - pad_r);
+  const float plot_h = std::max(16.0f, h - pad_t - pad_b);
+
+  /* fit view to the branch on (re)compute */
+  if (!app.cont_view_valid) {
+    double xlo = 1e300, xhi = -1e300, ylo = 1e300, yhi = -1e300;
+    for (size_t i = 0; i < app.cont_pp.size(); ++i) {
+      xlo = std::min(xlo, app.cont_pp[i]); xhi = std::max(xhi, app.cont_pp[i]);
+      ylo = std::min(ylo, app.cont_yy[i]); yhi = std::max(yhi, app.cont_yy[i]);
+    }
+    if (xlo > xhi) { xlo = -1; xhi = 1; }
+    if (ylo > yhi) { ylo = -1; yhi = 1; }
+    const double mx = 0.06 * (xhi - xlo) + 1e-9, my = 0.08 * (yhi - ylo) + 1e-9;
+    app.cont_view_xmin = xlo - mx; app.cont_view_xmax = xhi + mx;
+    app.cont_view_ymin = ylo - my; app.cont_view_ymax = yhi + my;
+    app.cont_view_valid = true;
+  }
+  double vx0 = app.cont_view_xmin, vx1 = app.cont_view_xmax;
+  double vy0 = app.cont_view_ymin, vy1 = app.cont_view_ymax;
+  if (vx1 <= vx0) vx1 = vx0 + 1e-9;
+  if (vy1 <= vy0) vy1 = vy0 + 1e-9;
+
+  auto sx = [&](double x){ return pad_l + (float)((x - vx0) / (vx1 - vx0)) * plot_w; };
+  auto sy = [&](double y){ return pad_t + plot_h - (float)((y - vy0) / (vy1 - vy0)) * plot_h; };
+  auto inv_x = [&](float px){ return vx0 + (double)(px - pad_l) / plot_w * (vx1 - vx0); };
+  auto inv_y = [&](float py){ return vy0 + (double)(pad_t + plot_h - py) / plot_h * (vy1 - vy0); };
+
+  ImGuiIO &io = ImGui::GetIO();
+  const bool over = !io.WantCaptureMouse;
+  if (over) {
+    const double mx = inv_x(io.MousePos.x), my = inv_y(io.MousePos.y);
+    if (io.MouseWheel != 0.0f) {
+      const double f = std::pow(0.85, (double)io.MouseWheel);
+      vx0 = mx + (vx0 - mx) * f; vx1 = mx + (vx1 - mx) * f;
+      vy0 = my + (vy0 - my) * f; vy1 = my + (vy1 - my) * f;
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      const double ddx = (double)io.MouseDelta.x / plot_w * (vx1 - vx0);
+      const double ddy = -(double)io.MouseDelta.y / plot_h * (vy1 - vy0);
+      vx0 -= ddx; vx1 -= ddx; vy0 += ddy; vy1 += ddy;
+    }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) app.cont_view_valid = false;
+    app.cont_view_xmin=vx0; app.cont_view_xmax=vx1; app.cont_view_ymin=vy0; app.cont_view_ymax=vy1;
+  }
+
+  /* axes box */
+  const ImU32 axcol = IM_COL32(140, 140, 150, 200);
+  draw->AddRect(ImVec2(pad_l, pad_t), ImVec2(pad_l + plot_w, pad_t + plot_h), axcol);
+  auto nice_step = [](double range, int target){
+    double raw = range / std::max(1, target);
+    double mag = std::pow(10.0, std::floor(std::log10(raw)));
+    double nn = raw / mag; double st = nn < 1.5 ? 1 : nn < 3 ? 2 : nn < 7 ? 5 : 10;
+    return st * mag;
+  };
+  const double xs = nice_step(vx1 - vx0, 8);
+  for (double xv = std::ceil(vx0 / xs) * xs; xv <= vx1; xv += xs) {
+    const float X = sx(xv);
+    draw->AddLine(ImVec2(X, pad_t + plot_h), ImVec2(X, pad_t + plot_h + 4), axcol);
+    char bb[32]; std::snprintf(bb, sizeof(bb), "%.4g", xv);
+    draw->AddText(ImVec2(X - 12, pad_t + plot_h + 6), IM_COL32(190,190,200,220), bb);
+  }
+  const double ys = nice_step(vy1 - vy0, 6);
+  for (double yv = std::ceil(vy0 / ys) * ys; yv <= vy1; yv += ys) {
+    const float Y = sy(yv);
+    draw->AddLine(ImVec2(pad_l - 4, Y), ImVec2(pad_l, Y), axcol);
+    char bb[32]; std::snprintf(bb, sizeof(bb), "%.4g", yv);
+    draw->AddText(ImVec2(8, Y - 7), IM_COL32(190,190,200,220), bb);
+  }
+
+  /* draw the branch as connected segments. A segment is drawn only when
+   * consecutive points are not separated by a polyline break; stable
+   * segments are solid bright green, unstable are dim red and dashed. */
+  auto is_break = [&](size_t i){
+    for (size_t b : app.cont_break) if (b == i) return true;
+    return false;
+  };
+  const ImU32 col_stable = IM_COL32(90, 230, 120, 255);
+  const ImU32 col_unstable = IM_COL32(225, 110, 90, 200);
+  for (size_t i = 1; i < app.cont_pp.size(); ++i) {
+    if (is_break(i)) continue;
+    const ImVec2 a(sx(app.cont_pp[i-1]), sy(app.cont_yy[i-1]));
+    const ImVec2 b(sx(app.cont_pp[i]),   sy(app.cont_yy[i]));
+    const bool stable = app.cont_stable[i] && app.cont_stable[i-1];
+    if (stable) {
+      draw->AddLine(a, b, col_stable, 2.0f);
+    } else {
+      /* dashed: draw short pieces */
+      const float dx = b.x - a.x, dy = b.y - a.y;
+      const float len = std::sqrt(dx*dx + dy*dy);
+      const int seg = std::max(1, (int)(len / 6.0f));
+      for (int k = 0; k < seg; k += 2) {
+        const float t0 = (float)k / seg, t1 = std::min(1.0f, (float)(k+1) / seg);
+        draw->AddLine(ImVec2(a.x + dx*t0, a.y + dy*t0), ImVec2(a.x + dx*t1, a.y + dy*t1), col_unstable, 1.6f);
+      }
+    }
+  }
+
+  /* fold (circle) and Hopf (diamond) markers */
+  for (size_t i = 0; i < app.cont_special.size(); ++i) {
+    if (app.cont_special[i] == 0) continue;
+    const ImVec2 c(sx(app.cont_pp[i]), sy(app.cont_yy[i]));
+    if (app.cont_special[i] == 1) {
+      draw->AddCircle(c, 6.0f, IM_COL32(255, 220, 90, 255), 16, 2.0f);
+      draw->AddText(ImVec2(c.x + 8, c.y - 6), IM_COL32(255, 220, 90, 255), "Fold (LP)");
+    } else {
+      const float r = 6.0f;
+      draw->AddQuad(ImVec2(c.x, c.y-r), ImVec2(c.x+r, c.y), ImVec2(c.x, c.y+r), ImVec2(c.x-r, c.y),
+                    IM_COL32(120, 200, 255, 255), 2.0f);
+      draw->AddText(ImVec2(c.x + 8, c.y - 6), IM_COL32(120, 200, 255, 255), "Hopf (H)");
+    }
+  }
+
+  /* axis labels + legend */
+  const int yi = std::max(0, std::min(app.cont_y_index, (int)app.state_names.size() - 1));
+  char xlabel[96]; std::snprintf(xlabel, sizeof(xlabel), "parameter %s", app.cont_param);
+  draw->AddText(ImVec2(pad_l + plot_w * 0.5f - 40, pad_t + plot_h + 22), IM_COL32(210,210,220,230), xlabel);
+  draw->AddText(ImVec2(12, pad_t - 22), IM_COL32(210,210,220,230), app.state_names[yi].c_str());
+
+  char hud[320];
+  std::snprintf(hud, sizeof(hud),
+                "Equilibrium continuation — %zu points  |  %d fold, %d Hopf  |  solid green = stable, dashed red = unstable",
+                app.cont_pp.size(), app.cont_n_fold, app.cont_n_hopf);
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
 }
 
 void draw_series_plot(AppState &app, const char *title, const char *value_name, ImVec2 size) {
@@ -5766,7 +6085,99 @@ void run_equilibrium_continuation(AppState &app) {
   app.analysis_message = msg;
 }
 
+/* PHASE D: trace an equilibrium branch vs. a parameter, both directions
+ * from the current state, and flatten it for drawing. Marks stability and
+ * fold/Hopf points. Reuses build_model (AD Jacobian) and the tested
+ * continue_equilibrium engine. */
+void run_continuation(AppState &app) {
+  app.cont_pp.clear(); app.cont_yy.clear(); app.cont_stable.clear();
+  app.cont_special.clear(); app.cont_break.clear();
+  app.cont_has_branch = false; app.cont_n_fold = 0; app.cont_n_hopf = 0;
+
+  if (app.mode != SystemMode::ODE) { app.cont_message = "continuation is for ODE systems"; return; }
+  const size_t n = app.state_names.size();
+  if (n == 0) { app.cont_message = "no system"; return; }
+  if (app.params.empty()) { app.cont_message = "system has no parameter to continue"; return; }
+
+  AppState::Param *param = find_param(app, app.cont_param);
+  if (!param) { param = &app.params[0]; std::snprintf(app.cont_param, sizeof(app.cont_param), "%s", param->name.c_str()); }
+
+  const int yi = std::max(0, std::min(app.cont_y_index, (int)n - 1));
+
+  dynsys::analysis::Model model = build_model(app, param);
+
+  /* seed from the current integrator state (engine corrects it to an
+   * equilibrium first). */
+  std::vector<double> x0(n);
+  for (size_t i = 0; i < n; ++i) x0[i] = state_at(app.current, i);
+  const double p0 = param->value;
+
+  dynsys::analysis::ContinuationSettings s;
+  s.p_min = std::min(app.cont_p_min, app.cont_p_max);
+  s.p_max = std::max(app.cont_p_min, app.cont_p_max);
+  s.max_points = std::max(50, app.cont_max_points);
+  s.detect_fold = true; s.detect_hopf = true;
+
+  auto flatten = [&](const dynsys::analysis::Branch &b, bool reversed) {
+    if (b.points.empty()) return;
+    /* mark a polyline break at the join between the two directions */
+    if (!app.cont_pp.empty()) app.cont_break.push_back(app.cont_pp.size());
+    const size_t cnt = b.points.size();
+    for (size_t k = 0; k < cnt; ++k) {
+      const size_t idx = reversed ? (cnt - 1 - k) : k;
+      const auto &pt = b.points[idx];
+      app.cont_pp.push_back(pt.p);
+      app.cont_yy.push_back(idx < b.points.size() && yi < (int)pt.x.size() ? pt.x[(size_t)yi] : 0.0);
+      app.cont_stable.push_back(pt.stable ? 1 : 0);
+      int sp = 0;
+      if (pt.special == dynsys::analysis::SpecialPointKind::Fold) { sp = 1; ++app.cont_n_fold; }
+      else if (pt.special == dynsys::analysis::SpecialPointKind::Hopf) { sp = 2; ++app.cont_n_hopf; }
+      app.cont_special.push_back(sp);
+    }
+  };
+
+  /* direction -1 first (reversed so points run min->max), then +1 */
+  s.direction = -1;
+  dynsys::analysis::Branch bneg = dynsys::analysis::continue_equilibrium(model, x0, p0, s);
+  s.direction = +1;
+  dynsys::analysis::Branch bpos = dynsys::analysis::continue_equilibrium(model, x0, p0, s);
+
+  flatten(bneg, true);
+  flatten(bpos, false);
+
+  /* fold/hopf counts double-count the shared seed region across the two
+   * sweeps; halve to a sensible display count (min 0). */
+  app.cont_has_branch = !app.cont_pp.empty();
+  app.cont_view_valid = false;
+  if (!app.cont_has_branch)
+    app.cont_message = bneg.message.empty() ? bpos.message : bneg.message;
+  else
+    app.cont_message = "branch traced";
+}
+
 void run_bifurcation(AppState &app) {
+  /* Robustness: if the configured parameter/observable don't match the
+   * current system (e.g. switched systems via the preset dropdown and the
+   * old names linger), snap them to sane defaults so the sweep is always
+   * meaningful instead of silently producing a flat/degenerate diagram. */
+  if (!app.params.empty() && find_param(app, app.bif_param) == nullptr) {
+    std::snprintf(app.bif_param, sizeof(app.bif_param), "%s", app.params[0].name.c_str());
+    if (app.params[0].has_range) { app.bif_start = app.params[0].min_value; app.bif_end = app.params[0].max_value; }
+  }
+  {
+    /* observable must be a known state name (or keep a user expression that
+     * parses); default to the first state if it's empty or not a state. */
+    bool obs_is_state = false;
+    for (const auto &nm : app.state_names) if (nm == app.bif_observable) { obs_is_state = true; break; }
+    if ((app.bif_observable[0] == '\0' || !obs_is_state) && !app.state_names.empty()) {
+      /* only override if it doesn't parse as an expression either */
+      arena_t a{}; arena_init(&a, 4096); std::string e;
+      node_t *probe = parse_expression_or_fail(&a, app.bif_observable, "obs", &e);
+      if (probe == nullptr) std::snprintf(app.bif_observable, sizeof(app.bif_observable), "%s", app.state_names[0].c_str());
+      arena_destroy(&a);
+    }
+  }
+
   AppState::Param *param = find_param(app, app.bif_param);
   if (param == nullptr) {
     app.analysis_message = std::string("unknown parameter for bifurcation: ") + app.bif_param;
@@ -5779,6 +6190,7 @@ void run_bifurcation(AppState &app) {
   if (obs == nullptr) { app.analysis_message = err_msg; arena_destroy(&tmp_arena); return; }
   app.bifurcation_points.clear();
   app.bifurcation_lyapunov.clear();
+  app.bifurcation_period.clear();
   const double old_value = param->value;
   /* Force a cheap fixed-step method for the sweep (adaptive integrators
    * would take many substeps per step over hundreds of slices and hang). */
@@ -5787,14 +6199,38 @@ void run_bifurcation(AppState &app) {
       (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45))
     app.integrator = Integrator::RK4;
   char err[256] = {0};
-  const int slices = std::max(2, app.bif_slices);
+  /* Ensure enough samples to actually fill the diagram. For MAPS the
+   * orbit-diagram needs many iterates per slice and many slices, or it
+   * renders as a sparse single curve that breaks into scattered dots in
+   * the chaotic region (the "horizontal dots" symptom). Enforce sensible
+   * minimums here so the picture is right regardless of how the sweep was
+   * configured (preset dropdown, leftover ODE values, etc.). Larger
+   * user-set values are kept. */
+  int eff_slices = std::max(2, app.bif_slices);
+  int eff_keep = app.bif_keep;
+  int eff_discard = app.bif_discard;
+  if (app.mode == SystemMode::Map) {
+    if (eff_slices < 600) eff_slices = 600;
+    if (eff_keep < 200) eff_keep = 200;
+    if (eff_discard < 500) eff_discard = 500;
+  } else {
+    if (eff_keep < 1000) eff_keep = 1000;     /* ODEs: need many steps to catch maxima */
+    if (eff_discard < 2000) eff_discard = 2000;
+    if (eff_slices < 300) eff_slices = 300;
+  }
+  const int slices = eff_slices;
   const size_t dim = app.state_names.size();
   const double leps = app.lyapunov_epsilon > 0 ? app.lyapunov_epsilon : 1e-8;
   for (int i = 0; i < slices; ++i) {
     const double u = static_cast<double>(i) / static_cast<double>(slices - 1);
     param->value = app.bif_start + u * (app.bif_end - app.bif_start);
+    /* CRITICAL: the IR evaluator reads app.param_values, not param->value.
+     * Without this sync the swept parameter never reaches the stepping
+     * function, so every slice produces the SAME orbit -> the diagram comes
+     * out as horizontal bands instead of the bifurcation tree. */
+    sync_param_values(app);
     State s = app.start;
-    for (int j = 0; j < app.bif_discard; ++j) {
+    for (int j = 0; j < eff_discard; ++j) {
       State next{};
       if (!step_state(app, s, &next, err, sizeof(err))) { app.analysis_message = err; param->value = old_value; app.integrator = saved_integrator; arena_destroy(&tmp_arena); return; }
       s = next;
@@ -5806,12 +6242,14 @@ void run_bifurcation(AppState &app) {
     /* ODE local-maxima detection window (for the bifurcation section) */
     double obs_w0 = 0, obs_w1 = 0, obs_w2 = 0;
     int obs_have = 0;
+    std::vector<double> kept_vals; /* for map period detection */
+    kept_vals.reserve(eff_keep);
     State shadow = s;
     if (app.bif_compute_lyapunov && dim > 0) {
       resize_state(shadow, dim);
       shadow.v[0] += leps;
     }
-    for (int j = 0; j < app.bif_keep; ++j) {
+    for (int j = 0; j < eff_keep; ++j) {
       State next{};
       if (!step_state(app, s, &next, err, sizeof(err))) { app.analysis_message = err; param->value = old_value; app.integrator = saved_integrator; arena_destroy(&tmp_arena); return; }
       if (app.bif_compute_lyapunov && dim > 0) {
@@ -5842,6 +6280,7 @@ void run_bifurcation(AppState &app) {
       if (app.mode == SystemMode::Map) {
         /* maps: every iterate is an attractor sample (the classic tree) */
         app.bifurcation_points.push_back(Point2{param->value, val});
+        kept_vals.push_back(val);
       } else {
         /* ODEs: raw time-steps trace the whole orbit and smear into a band
          * (or a single horizontal line at a fixed point). The standard
@@ -5856,12 +6295,81 @@ void run_bifurcation(AppState &app) {
     }
     if (app.bif_compute_lyapunov && ly_n > 0)
       app.bifurcation_lyapunov.push_back(Point2{param->value, ly_sum / static_cast<double>(ly_n)});
+
+    /* period detection (maps): the period is the number of distinct values
+     * in the settled orbit, capped; 0 means chaotic/high-period. */
+    if (app.mode == SystemMode::Map && !kept_vals.empty()) {
+      const double tol = 1e-4;
+      int period = 0;
+      const int maxP = 16;
+      const int m = (int)kept_vals.size();
+      /* compare the last value against earlier ones to find the cycle length */
+      for (int pgap = 1; pgap <= maxP && pgap < m; ++pgap) {
+        bool match = true;
+        for (int q = 0; q < pgap && (m - 1 - q - pgap) >= 0; ++q) {
+          if (std::fabs(kept_vals[m - 1 - q] - kept_vals[m - 1 - q - pgap]) > tol) { match = false; break; }
+        }
+        if (match) { period = pgap; break; }
+      }
+      app.bifurcation_period.push_back(Point2{param->value, (double)period});
+    }
   }
   param->value = old_value;
   app.integrator = saved_integrator; /* restore the user's solver choice */
   arena_destroy(&tmp_arena);
   app.bif_view_valid = false; /* refit the diagram view to the new sweep */
   app.analysis_message = "bifurcation scan completed";
+}
+
+/* PHASE B/C: estimate the box-counting fractal dimension of the on-screen
+ * set in the current 2D plane. For a MAP we iterate from the start state
+ * (after a transient) to sample the attractor densely; for an ODE we use
+ * the live trajectory history (already the settled attractor). */
+void run_box_dimension(AppState &app) {
+  app.boxdim_ready = false;
+  const size_t n = app.state_names.size();
+  if (n < 1) { app.boxdim_msg = "no system"; return; }
+  const size_t ix = (size_t)std::max(0, std::min(app.phase_x_index, (int)n - 1));
+  const size_t iy = (size_t)std::max(0, std::min(app.phase_y_index, (int)n - 1));
+
+  std::vector<double> xs, ys;
+  char err[128] = {0};
+
+  if (app.mode == SystemMode::Map) {
+    /* iterate the map to sample the attractor */
+    State s = app.start; resize_state(s, n);
+    const int transient = 1000;
+    const int samples = 200000;
+    for (int i = 0; i < transient; ++i) {
+      State nx{}; if (!step_map_state(app, s, &nx, err, sizeof(err))) { app.boxdim_msg = err; return; }
+      s = nx;
+    }
+    xs.reserve(samples); ys.reserve(samples);
+    for (int i = 0; i < samples; ++i) {
+      State nx{}; if (!step_map_state(app, s, &nx, err, sizeof(err))) break;
+      s = nx;
+      const double x = state_at(s, ix), y = state_at(s, iy);
+      if (std::isfinite(x) && std::isfinite(y)) { xs.push_back(x); ys.push_back(y); }
+    }
+  } else {
+    /* ODE: use the trajectory history (the visible orbit/attractor) */
+    for (const State &st : app.history) {
+      const double x = state_at(st, ix), y = state_at(st, iy);
+      if (std::isfinite(x) && std::isfinite(y)) { xs.push_back(x); ys.push_back(y); }
+    }
+    if (xs.size() < 500) {
+      app.boxdim_msg = "need a longer trajectory — let the ODE run, then retry";
+      return;
+    }
+  }
+
+  dynsys::analysis::BoxCountResult R = dynsys::analysis::box_counting_dimension(xs, ys, 12);
+  app.boxdim_n_points = (long)xs.size();
+  if (!R.ok) { app.boxdim_msg = R.message; return; }
+  app.boxdim_ready = true;
+  app.boxdim_value = R.dimension;
+  app.boxdim_r2 = R.r_squared;
+  app.boxdim_msg = "ok";
 }
 
 /* PHASE B: compute the full Lyapunov spectrum + Kaplan-Yorke dimension
@@ -5986,6 +6494,36 @@ void run_lyapunov_spectrum(AppState &app) {
       "drag: rotate   wheel: zoom   (this is the real 3D view)");
 }
 
+/* PHASE C+: save the current framebuffer (the full-window plot) to a PNG.
+ * Reads the GL backbuffer, flips it (GL origin is bottom-left), and writes
+ * a timestamped file next to the binary. Returns the path or "". */
+std::string capture_screenshot_png(AppState &app) {
+  const int w = app.window_width, h = app.window_height;
+  if (w <= 0 || h <= 0) return "";
+  std::vector<unsigned char> buf((size_t)w * h * 4);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, w, h, GL_RGBA, /*GL_UNSIGNED_BYTE*/ 0x1401, buf.data());
+  /* flip vertically into an RGB buffer */
+  std::vector<unsigned char> rgb((size_t)w * h * 3);
+  for (int y = 0; y < h; ++y) {
+    const unsigned char *src = &buf[(size_t)(h - 1 - y) * w * 4];
+    unsigned char *dst = &rgb[(size_t)y * w * 3];
+    for (int x = 0; x < w; ++x) {
+      dst[x * 3 + 0] = src[x * 4 + 0];
+      dst[x * 3 + 1] = src[x * 4 + 1];
+      dst[x * 3 + 2] = src[x * 4 + 2];
+    }
+  }
+  char path[256];
+  std::time_t t = std::time(nullptr);
+  std::tm *lt = std::localtime(&t);
+  std::snprintf(path, sizeof(path), "dynsys_%04d%02d%02d_%02d%02d%02d.png",
+                lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
+                lt->tm_hour, lt->tm_min, lt->tm_sec);
+  if (png_write_rgb(path, rgb.data(), w, h)) return std::string(path);
+  return "";
+}
+
 /* PHASE6-UI: top toolbar — view switch, run controls, key stats. Fixed,
  * full width, non-movable, drawn on top of the background plot. */
 void draw_top_toolbar(AppState &app) {
@@ -6001,8 +6539,21 @@ void draw_top_toolbar(AppState &app) {
 
   /* Visible build stamp: if you don't see this line at the top of the
    * window, you are running an OLD binary — rebuild (make clean && make).*/
-  ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f), "dynsys NEW-UI");
+  ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f), "dynsys NEW-UI " __DATE__);
   ImGui::SameLine();
+  if (ImGui::SmallButton("Logistic demo")) load_logistic_bifurcation_demo(app);
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Save PNG")) {
+    std::string p = capture_screenshot_png(app);
+    app.screenshot_msg = p.empty() ? "screenshot failed" : ("saved " + p);
+    app.screenshot_msg_timer = 180; /* show ~3s at 60fps */
+  }
+  ImGui::SameLine();
+  if (app.screenshot_msg_timer > 0) {
+    --app.screenshot_msg_timer;
+    ImGui::TextColored(ImVec4(0.6f, 0.95f, 0.7f, 1.0f), "%s", app.screenshot_msg.c_str());
+    ImGui::SameLine();
+  }
   ImGui::TextDisabled("(full-window plot)"); ImGui::SameLine();
   ImGui::TextUnformatted("|"); ImGui::SameLine();
 
@@ -6028,6 +6579,7 @@ void draw_top_toolbar(AppState &app) {
   view_radio("3D bridge", AppState::ActiveView::Scene3DBridge);
   view_radio("basins", AppState::ActiveView::Basins);
   view_radio("param scan", AppState::ActiveView::ParamScan2D);
+  view_radio("continuation", AppState::ActiveView::Continuation);
   ImGui::TextUnformatted("|"); ImGui::SameLine();
 
   if (ImGui::Button(app.paused ? "Play" : "Pause")) app.paused = !app.paused;
@@ -6055,6 +6607,31 @@ void draw_top_toolbar(AppState &app) {
     if (ImGui::Button("Run bifurcation")) run_bifurcation(app);
     ImGui::SameLine();
   }
+  if (app.active_view == AppState::ActiveView::Continuation && !app.params.empty()) {
+    if (app.cont_param[0] == '\0') std::snprintf(app.cont_param, sizeof(app.cont_param), "%s", app.params[0].name.c_str());
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::BeginCombo("##contp", app.cont_param)) {
+      for (const auto &pr : app.params)
+        if (ImGui::Selectable(pr.name.c_str(), pr.name == app.cont_param)) {
+          std::snprintf(app.cont_param, sizeof(app.cont_param), "%s", pr.name.c_str());
+          if (pr.has_range) { app.cont_p_min = pr.min_value; app.cont_p_max = pr.max_value; }
+        }
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine(); ImGui::SetNextItemWidth(56);
+    ImGui::InputDouble("##contpmin", &app.cont_p_min, 0, 0, "%.3g"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(56);
+    ImGui::InputDouble("##contpmax", &app.cont_p_max, 0, 0, "%.3g"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(70);
+    if (ImGui::BeginCombo("##conty", app.state_names.empty() ? "y" : app.state_names[std::min((size_t)app.cont_y_index, app.state_names.size()-1)].c_str())) {
+      for (int i = 0; i < (int)app.state_names.size(); ++i)
+        if (ImGui::Selectable(app.state_names[i].c_str(), i == app.cont_y_index)) { app.cont_y_index = i; app.cont_view_valid = false; }
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Continue")) run_continuation(app);
+    ImGui::SameLine();
+  }
   ImGui::TextDisabled("  %d FPS | %s | %dD%s", app.fps, mode_name(app.mode),
                       effective_dimension(app),
                       app.active_view == AppState::ActiveView::Phase2D
@@ -6075,6 +6652,7 @@ void draw_gui(AppState &app) {
     case AppState::ActiveView::Scene3DBridge: /* drawn to backbuffer in main loop */ break;
     case AppState::ActiveView::Basins:      render_basin_background(app); break;
     case AppState::ActiveView::ParamScan2D: render_scan_background(app); break;
+    case AppState::ActiveView::Continuation: render_continuation_background(app); break;
     case AppState::ActiveView::Scene3D:     /* drawn in main loop */ break;
   }
 
@@ -6425,6 +7003,20 @@ void draw_gui(AppState &app) {
       }
     } else if (!app.lyap_spectrum_msg.empty()) {
       ImGui::TextDisabled("%s", app.lyap_spectrum_msg.c_str());
+    }
+
+    /* PHASE B/C: box-counting fractal dimension of the on-screen set */
+    ImGui::SeparatorText("Box-counting (fractal) dimension");
+    if (ImGui::Button("Measure box-counting dimension")) run_box_dimension(app);
+    if (app.boxdim_ready) {
+      ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                         "D_box = %.4f   (R^2 = %.3f, %ld points)",
+                         app.boxdim_value, app.boxdim_r2, app.boxdim_n_points);
+      ImGui::TextDisabled("%s",
+        app.mode == SystemMode::Map ? "sampled the map attractor"
+                                    : "measured from the current trajectory");
+    } else if (!app.boxdim_msg.empty() && app.boxdim_msg != "ok") {
+      ImGui::TextDisabled("%s", app.boxdim_msg.c_str());
     }
 
     ImGui::Text("Poincare points: %zu", app.poincare_points.size());

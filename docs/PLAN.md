@@ -110,6 +110,13 @@ any system with a parameter (not just the 1D maps).
 
 ## Phase D — matcont-grade continuation UI (engine exists)
 
+**DONE (step 1): equilibrium branch diagram** — a full-window continuation
+view traces the equilibrium both directions vs. a parameter, draws stable
+(solid green) vs. unstable (dashed red) segments, and marks Fold (LP) and
+Hopf (H) points. Also fixed a null-buffer crash in the exact-Jacobian path
+of continue_equilibrium. test-continuation locks fold (x'=p-x^2) + Hopf.
+Remaining: branch switching, limit-cycle continuation, codim-2.
+
 - **Equilibrium continuation diagram** view (branches, fold/Hopf/branch
   points, click to start).
 - **Limit-cycle continuation**, period-doubling cascades.
