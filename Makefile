@@ -201,12 +201,14 @@ endif
 IR_TEST_C_OBJS := $(patsubst %.c,$(TEST_OBJ_DIR)/%.o,$(C_SRCS))
 IR_TEST_OBJS := $(IR_TEST_CPP_OBJS) $(IR_TEST_C_OBJS)
 PARAMSYNC_OBJS := $(TEST_OBJ_DIR)/test/paramsync_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
+IFSLIT_OBJS := $(TEST_OBJ_DIR)/test/ifslit_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
 BOXDIM_TEST_TARGET := $(BUILD_DIR)/boxdim_smoke$(EXEEXT)
 IFS_TEST_TARGET := $(BUILD_DIR)/ifs_smoke$(EXEEXT)
 LC_TEST_TARGET := $(BUILD_DIR)/limitcycle_smoke$(EXEEXT)
 LCSWEEP_TEST_TARGET := $(BUILD_DIR)/lcsweep_smoke$(EXEEXT)
 IFSMODEL_TEST_TARGET := $(BUILD_DIR)/ifsmodel_smoke$(EXEEXT)
 IFSPARAM_TEST_TARGET := $(BUILD_DIR)/ifsparam_smoke$(EXEEXT)
+IFSLIT_TEST_TARGET := $(BUILD_DIR)/ifslit_smoke$(EXEEXT)
 
 IMGUI_CORE_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp
 IMGUI_BACKEND_SRCS := imgui_impl_glfw.cpp imgui_impl_opengl3.cpp
@@ -311,7 +313,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -582,4 +584,15 @@ test-ifsparam: $(IFSPARAM_TEST_TARGET)
 $(IFSPARAM_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp -o $@ -lm
+
+test-ifslit: $(IFSLIT_TEST_TARGET)
+	./$(IFSLIT_TEST_TARGET)
+
+$(TEST_OBJ_DIR)/test/ifslit_smoke.o: test/ifslit_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds -c test/ifslit_smoke.cpp -o $@
+
+$(IFSLIT_TEST_TARGET): $(IFSLIT_OBJS)
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) -o $@ $(IFSLIT_OBJS) -lm
 

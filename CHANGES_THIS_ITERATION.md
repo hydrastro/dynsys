@@ -1,38 +1,37 @@
-# dynsys — IFS map coefficients are now real SLIDERS
+# dynsys — IFS coefficient sliders are now editable (per-coefficient)
 
 Unzip at repo root, then `make clean && make && make run`. Green
 "dynsys NEW-UI <date>" label = you're on this build.
 
-## Fix
+## The fix
 
-Last iteration I gave the IFS maps panel drag-to-scrub number fields, not
-sliders — that's not what you wanted. Now every coefficient is a proper
-**slider** (visible track + handle, click anywhere on the track), with a
-sensible range per coefficient:
-- a, b, c, d (linear / rotation part): slider over [-1, 1]
-- e, f (translation): slider over [-5, 5]
-- p (selection weight): slider over [0, 1]
-(If a value sits outside its default window, that slider's range widens to
-include it, so nothing is unreachable.)
+I had disabled ALL the coefficient sliders for any IFS that had a parameter
+or a non-constant coefficient — too blunt. Now editability is decided
+**per coefficient**:
 
-Layout: two sliders per row at 150px each, grouped under "map 1", "map 2",
-... so they're wide enough to actually use.
+- A coefficient that's a plain constant (e.g. the fern's 0.85, -0.04, 1.6)
+  gets a **live, editable slider** — drag it and the attractor updates.
+- A coefficient that's a parameter expression (e.g. the spiral's
+  `s*cos(theta)`) is shown as a **disabled slider in orange** that tracks
+  its live value — you change those via the parameter sliders.
 
-- **Constant-coefficient IFS** (fern, Sierpinski, dragon): the sliders edit
-  the maps directly and the attractor updates live. + add map / - remove
-  last still there.
-- **Parametrized IFS** (coefficients are expressions): the coefficient
-  sliders are shown disabled and track the live values as you drag the
-  PARAMETER sliders above — so you can watch how, say, theta drives each
-  a/b/c/d. (The editable knobs in that case are the parameters.)
+So a constant coefficient is editable **even when the system also has
+parameters elsewhere**. A fully-constant IFS (fern, Sierpinski, dragon) is
+now entirely editable, including the negative coefficients.
 
-## Try it
-Load **"Barnsley fern (IFS)"**, open **IFS maps**, and slide map 2's `d`
-down from 0.85 — the fern shrinks live. Load **"Spiral IFS
-(parametrized)"** and slide `theta` in Parameters; the coefficient sliders
-move to show the rotation feeding through.
+## A bug I caught before shipping
+
+Negative literals like `-0.04` parse as `0 - 0.04` (a subtraction node), not
+a bare number — so my first "is it a literal?" check wrongly flagged them
+non-editable, which would have made the fern read-only. Fixed by testing the
+real criterion: a coefficient is editable iff it references **no parameter**
+(checked by walking the expression for any variable). Locked with a test
+(`make test-ifslit`): fern coefficients incl. negatives = editable; the
+spiral's `s*cos(theta)` = parameter-driven, its `e,f,p` = editable.
+
+Editing one constant coefficient of a parametrized IFS keeps that edit while
+the parameter-driven coefficients keep tracking their parameters.
 
 ## Verification
 - All 4 C++ TUs compile with ZERO warnings (-O2 -Wall -Wextra).
-- make test: 24 checks/suites pass (UI swap; the map/eval logic is the same
-  validated code from last iteration).
+- make test: 25 checks/suites pass (added **test-ifslit**).

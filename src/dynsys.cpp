@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <chrono>
 #include <cerrno>
 #include <cctype>
@@ -264,12 +265,16 @@ struct AppState {
   std::vector<dynsys::analysis::AffineMap> ifs_maps;
   struct IFSMapExpr { node_t *a=nullptr,*b=nullptr,*c=nullptr,*d=nullptr,*e=nullptr,*f=nullptr,*p=nullptr; };
   std::vector<IFSMapExpr> ifs_map_exprs;   /* parsed coefficient expressions */
+  /* per-coefficient editability: a coefficient is directly editable iff its
+   * expression is a plain literal number. Index order: a,b,c,d,e,f,p. A
+   * parameter-driven coefficient (e.g. s*cos(theta)) is not directly
+   * editable — its slider is shown disabled and tracks the live value. */
+  std::vector<std::array<bool,7>> ifs_coef_literal;
   arena_t ifs_arena{};                     /* owns the ifs_map_exprs ASTs */
   bool ifs_arena_init = false;
-  /* true when every coefficient is a plain constant (no parameter
-   * expressions): then the maps can be edited directly as numbers in the
-   * IFS maps panel. When false (parametrized), the panel shows evaluated
-   * values read-only and you tweak via the parameter sliders. */
+  /* true when EVERY coefficient is a plain constant: then add/remove-map is
+   * offered (a fully hand-built IFS). Per-coefficient editing works
+   * regardless, via ifs_coef_literal. */
   bool ifs_maps_editable = false;
   Integrator integrator = Integrator::RK4;
   /* PHASE B: adaptive-step controls (RKF45 / DOPRI45). The visible dt is
@@ -1668,20 +1673,35 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
       app.parse_error.clear();
       app.detected_dim = 2;
       sync_param_values(app);             /* make param values available to eval */
-      /* the maps are directly editable iff there are no parameters AND every
-       * coefficient is a literal number (so editing a value can't fight an
-       * expression). */
-      app.ifs_maps_editable = app.params.empty();
-      auto is_literal = [](node_t *n) -> bool {
-        if (!n) return true; /* absent p is fine */
-        if (n->kind != NODE_CONST) return false;
-        if (!n->cnst.name) return false;
-        char *end = nullptr; std::strtod(n->cnst.name, &end);
-        return end && *end == '\0';
+      /* A coefficient is directly editable iff it's a compile-time constant
+       * — it references no parameter/variable. (A literal like -0.04 parses
+       * as SUB(0,0.04), and "1-r" references r, so we can't just check for a
+       * bare number node; we recurse looking for any NODE_VAR.) When a
+       * coefficient is constant we also fold it to its numeric value so the
+       * slider has a clean starting point. System-wide ifs_maps_editable is
+       * true only when ALL coefficients are constant (enables add/remove). */
+      std::function<bool(node_t *)> is_const_expr = [&](node_t *n) -> bool {
+        if (!n) return true;
+        switch (n->kind) {
+          case NODE_VAR: return false;            /* a parameter/variable ref */
+          case NODE_CONST: return true;           /* number or named const */
+          case NODE_APP: {
+            if (!is_const_expr(n->app.head)) return false;
+            for (size_t i = 0; i < n->app.argc; ++i)
+              if (!is_const_expr(n->app.args[i])) return false;
+            return true;
+          }
+          default: return false;                  /* binders etc. — treat as non-const */
+        }
       };
-      for (const auto &me : app.ifs_map_exprs)
-        if (!(is_literal(me.a) && is_literal(me.b) && is_literal(me.c) && is_literal(me.d) &&
-              is_literal(me.e) && is_literal(me.f) && is_literal(me.p))) { app.ifs_maps_editable = false; break; }
+      app.ifs_coef_literal.clear();
+      app.ifs_maps_editable = true;
+      for (const auto &me : app.ifs_map_exprs) {
+        node_t *src[7] = {me.a,me.b,me.c,me.d,me.e,me.f,me.p};
+        std::array<bool,7> lit{};
+        for (int k = 0; k < 7; ++k) { lit[(size_t)k] = is_const_expr(src[k]); if (!lit[(size_t)k]) app.ifs_maps_editable = false; }
+        app.ifs_coef_literal.push_back(lit);
+      }
       app.ifs_dirty = true;
       app.ifs_selected = -1;
       app.ifs_maps.clear();               /* evaluated lazily at render time */
@@ -2161,6 +2181,7 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   /* leaving IFS (or recompiling as ODE/map): drop any IFS maps/expressions
    * so nothing stale lingers (their arena is freed too). */
   app.ifs_map_exprs.clear();
+  app.ifs_coef_literal.clear();
   app.ifs_maps.clear();
   if (app.ifs_arena_init) { arena_destroy(&app.ifs_arena); app.ifs_arena_init = false; }
   app.poincare_enabled = next_poincare_enabled;
@@ -4830,11 +4851,13 @@ const std::vector<IFSPreset> &ifs_gallery() {
 }
 
 /* Evaluate the IFS coefficient expressions against the current parameter
- * values into numeric affine maps. Called when the maps are dirty (system
- * compiled or a parameter changed). Returns false on an eval error. */
-bool evaluate_ifs_maps(AppState &app) {
-  app.ifs_maps.clear();
-  if (app.ifs_map_exprs.empty()) return false;
+ * values into numeric affine maps. On the initial build (ifs_maps empty)
+ * every coefficient is evaluated. On a refresh (e.g. a parameter changed),
+ * pass preserve_literals=true to update ONLY the parameter-driven
+ * coefficients and keep any literal coefficients the user edited via their
+ * sliders. Returns false on an eval error. */
+bool evaluate_ifs_maps(AppState &app, bool preserve_literals = false) {
+  if (app.ifs_map_exprs.empty()) { app.ifs_maps.clear(); return false; }
   State dummy = app.start; resize_state(dummy, app.state_names.size());
   char err[128] = {0};
   auto ev = [&](node_t *n, double fallback) -> double {
@@ -4843,13 +4866,27 @@ bool evaluate_ifs_maps(AppState &app) {
     if (!eval_expr_at(app, n, dummy, &v, err, sizeof(err))) return fallback;
     return std::isfinite(v) ? v : fallback;
   };
-  for (const auto &me : app.ifs_map_exprs) {
+  const bool have_old = preserve_literals && app.ifs_maps.size() == app.ifs_map_exprs.size()
+                        && app.ifs_coef_literal.size() == app.ifs_map_exprs.size();
+  std::vector<dynsys::analysis::AffineMap> out;
+  for (size_t i = 0; i < app.ifs_map_exprs.size(); ++i) {
+    const auto &me = app.ifs_map_exprs[i];
     dynsys::analysis::AffineMap m;
-    m.a = ev(me.a, 0); m.b = ev(me.b, 0); m.c = ev(me.c, 0);
-    m.d = ev(me.d, 0); m.e = ev(me.e, 0); m.f = ev(me.f, 0);
-    m.p = ev(me.p, 0);
-    app.ifs_maps.push_back(m);
+    double *dst[7] = {&m.a,&m.b,&m.c,&m.d,&m.e,&m.f,&m.p};
+    node_t *src[7] = {me.a,me.b,me.c,me.d,me.e,me.f,me.p};
+    double oldv[7];
+    if (have_old) {
+      const auto &o = app.ifs_maps[i];
+      oldv[0]=o.a; oldv[1]=o.b; oldv[2]=o.c; oldv[3]=o.d; oldv[4]=o.e; oldv[5]=o.f; oldv[6]=o.p;
+    }
+    for (int k = 0; k < 7; ++k) {
+      const bool lit = (i < app.ifs_coef_literal.size()) ? app.ifs_coef_literal[i][(size_t)k] : true;
+      if (have_old && lit) *dst[k] = oldv[k];  /* keep the user's edited literal */
+      else *dst[k] = ev(src[k], 0);            /* (re)evaluate param-driven coef */
+    }
+    out.push_back(m);
   }
+  app.ifs_maps = std::move(out);
   return true;
 }
 
@@ -4863,13 +4900,12 @@ void render_ifs_background(AppState &app) {
    * the current parameter values whenever the maps are dirty — this is what
    * lets an IFS respond to its parameters. */
   const bool is_ifs_model = (app.mode == SystemMode::IFS && !app.ifs_map_exprs.empty());
-  /* Re-evaluate from expressions only when the maps are parameter-driven.
-   * When they're directly editable (all-constant), the user's edits live in
-   * app.ifs_maps and we must NOT overwrite them — just evaluate once to
-   * populate, then leave them alone. */
+  /* Initial build evaluates everything. On a dirty refresh, preserve any
+   * literal coefficients the user edited via sliders and only re-evaluate
+   * the parameter-driven ones. (A fully-literal IFS never needs refresh.) */
   if (is_ifs_model) {
-    if (app.ifs_maps_editable) { if (app.ifs_maps.empty()) evaluate_ifs_maps(app); }
-    else if (app.ifs_dirty || app.ifs_maps.empty()) evaluate_ifs_maps(app);
+    if (app.ifs_maps.empty()) evaluate_ifs_maps(app, false);
+    else if (app.ifs_dirty && !app.ifs_maps_editable) evaluate_ifs_maps(app, true);
   }
 
   const bool use_model = (app.mode == SystemMode::IFS && !app.ifs_maps.empty());
@@ -7608,15 +7644,13 @@ void draw_gui(AppState &app) {
      * Every coefficient gets a real SLIDER. When all coefficients are
      * constants the sliders edit them directly; when they're parameter
      * expressions the sliders are shown disabled (drive them via Parameters). */
-    if (app.ifs_maps.empty()) evaluate_ifs_maps(app);
+    if (app.ifs_maps.empty()) evaluate_ifs_maps(app, false);
     ImGui::TextDisabled("x' = a x + b y + e      y' = c x + d y + f      (p = selection weight)");
-    const bool editable = app.ifs_maps_editable;
-    if (!editable)
+    const bool has_param_coef = !app.ifs_maps_editable;
+    if (has_param_coef)
       ImGui::TextColored(ImVec4(0.95f,0.8f,0.4f,1.0f),
-                         "parameter-driven maps — the sliders below are disabled; adjust the parameters above");
+                         "coefficients shown in orange are parameter-driven (adjust them in Parameters); the rest are editable here");
 
-    /* sensible per-coefficient ranges: linear/rotation part in [-1,1],
-     * translation in [-5,5], probability in [0,1]. */
     struct CoefSpec { const char *label; float lo, hi; };
     const CoefSpec specs[7] = {
       {"a", -1.0f, 1.0f}, {"b", -1.0f, 1.0f}, {"c", -1.0f, 1.0f}, {"d", -1.0f, 1.0f},
@@ -7628,32 +7662,43 @@ void draw_gui(AppState &app) {
       double *coef[7] = {&m.a,&m.b,&m.c,&m.d,&m.e,&m.f,&m.p};
       ImGui::SeparatorText((std::string("map ") + std::to_string(mi + 1)).c_str());
       bool changed = false;
-      if (!editable) ImGui::BeginDisabled();
-      /* two sliders per row so each is wide enough to actually use */
       for (int k = 0; k < 7; ++k) {
+        /* a coefficient is editable iff its expression is a literal number */
+        const bool coef_editable = (mi < app.ifs_coef_literal.size())
+                                   ? app.ifs_coef_literal[mi][(size_t)k] : true;
         float lo = specs[k].lo, hi = specs[k].hi;
-        /* widen the range if the value sits outside the default window */
         if ((float)*coef[k] < lo) lo = (float)*coef[k];
         if ((float)*coef[k] > hi) hi = (float)*coef[k];
         float v = (float)*coef[k];
         ImGui::SetNextItemWidth(150);
-        if (ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f")) { *coef[k] = (double)v; changed = true; }
+        if (!coef_editable) {
+          /* parameter-driven: disabled slider that tracks the live value,
+           * labelled in orange so it's clear why it can't be dragged here */
+          ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240,180,90,255));
+          ImGui::BeginDisabled();
+          ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f");
+          ImGui::EndDisabled();
+          ImGui::PopStyleColor();
+        } else {
+          if (ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f")) { *coef[k] = (double)v; changed = true; }
+        }
         if (k % 2 == 0 && k < 6) ImGui::SameLine();
       }
-      if (!editable) ImGui::EndDisabled();
       if (changed) app.ifs_dirty = true;
       ImGui::PopID();
     }
 
-    if (editable) {
+    if (app.ifs_maps_editable) {
       ImGui::Separator();
       if (ImGui::SmallButton("+ add map")) {
         app.ifs_maps.push_back(dynsys::analysis::AffineMap{0.5,0,0,0.5,0,0,0.0});
+        app.ifs_coef_literal.push_back({true,true,true,true,true,true,true});
         app.ifs_dirty = true;
       }
       ImGui::SameLine();
       if (ImGui::SmallButton("- remove last") && app.ifs_maps.size() > 1) {
         app.ifs_maps.pop_back();
+        if (!app.ifs_coef_literal.empty()) app.ifs_coef_literal.pop_back();
         app.ifs_dirty = true;
       }
       ImGui::SameLine();
