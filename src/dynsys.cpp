@@ -7605,39 +7605,48 @@ void draw_gui(AppState &app) {
       ImGui::CollapsingHeader("IFS maps", ImGuiTreeNodeFlags_DefaultOpen)) {
     /* Surface the IFS's own contents: each affine map and its coefficients
      * x' = a x + b y + e,  y' = c x + d y + f,  with selection weight p.
-     * Directly editable when all coefficients are constants; read-only
-     * (parameter-driven) otherwise — tweak those via the Parameters panel. */
+     * Every coefficient gets a real SLIDER. When all coefficients are
+     * constants the sliders edit them directly; when they're parameter
+     * expressions the sliders are shown disabled (drive them via Parameters). */
     if (app.ifs_maps.empty()) evaluate_ifs_maps(app);
-    ImGui::TextDisabled("x' = a x + b y + e    y' = c x + d y + f    (p = selection weight)");
-    if (!app.ifs_maps_editable)
+    ImGui::TextDisabled("x' = a x + b y + e      y' = c x + d y + f      (p = selection weight)");
+    const bool editable = app.ifs_maps_editable;
+    if (!editable)
       ImGui::TextColored(ImVec4(0.95f,0.8f,0.4f,1.0f),
-                         "parameter-driven maps (read-only here) — adjust the parameters above");
+                         "parameter-driven maps — the sliders below are disabled; adjust the parameters above");
 
-    const char *labels[7] = {"a","b","c","d","e","f","p"};
+    /* sensible per-coefficient ranges: linear/rotation part in [-1,1],
+     * translation in [-5,5], probability in [0,1]. */
+    struct CoefSpec { const char *label; float lo, hi; };
+    const CoefSpec specs[7] = {
+      {"a", -1.0f, 1.0f}, {"b", -1.0f, 1.0f}, {"c", -1.0f, 1.0f}, {"d", -1.0f, 1.0f},
+      {"e", -5.0f, 5.0f}, {"f", -5.0f, 5.0f}, {"p", 0.0f, 1.0f},
+    };
     for (size_t mi = 0; mi < app.ifs_maps.size(); ++mi) {
       ImGui::PushID((int)mi);
       auto &m = app.ifs_maps[mi];
       double *coef[7] = {&m.a,&m.b,&m.c,&m.d,&m.e,&m.f,&m.p};
-      ImGui::Text("map %zu", mi + 1);
+      ImGui::SeparatorText((std::string("map ") + std::to_string(mi + 1)).c_str());
       bool changed = false;
+      if (!editable) ImGui::BeginDisabled();
+      /* two sliders per row so each is wide enough to actually use */
       for (int k = 0; k < 7; ++k) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(72);
-        if (app.ifs_maps_editable) {
-          float v = (float)*coef[k];
-          /* drag for a tactile feel; double-click to type */
-          if (ImGui::DragFloat(labels[k], &v, 0.005f, -3.0f, 10.0f, "%.3f")) {
-            *coef[k] = (double)v; changed = true;
-          }
-        } else {
-          ImGui::Text("%s %.3f", labels[k], *coef[k]);
-        }
+        float lo = specs[k].lo, hi = specs[k].hi;
+        /* widen the range if the value sits outside the default window */
+        if ((float)*coef[k] < lo) lo = (float)*coef[k];
+        if ((float)*coef[k] > hi) hi = (float)*coef[k];
+        float v = (float)*coef[k];
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f")) { *coef[k] = (double)v; changed = true; }
+        if (k % 2 == 0 && k < 6) ImGui::SameLine();
       }
-      if (changed) { app.ifs_dirty = true; }
+      if (!editable) ImGui::EndDisabled();
+      if (changed) app.ifs_dirty = true;
       ImGui::PopID();
     }
 
-    if (app.ifs_maps_editable) {
+    if (editable) {
+      ImGui::Separator();
       if (ImGui::SmallButton("+ add map")) {
         app.ifs_maps.push_back(dynsys::analysis::AffineMap{0.5,0,0,0.5,0,0,0.0});
         app.ifs_dirty = true;
@@ -7648,7 +7657,7 @@ void draw_gui(AppState &app) {
         app.ifs_dirty = true;
       }
       ImGui::SameLine();
-      ImGui::TextDisabled("(edits drive the attractor live)");
+      ImGui::TextDisabled("(slider edits drive the attractor live)");
     }
   }
 
