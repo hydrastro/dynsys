@@ -107,8 +107,12 @@ enum class SystemMode {
 
 enum class Integrator {
   Euler,
-  RK2,
-  RK4,
+  RK2,      /* midpoint */
+  Heun,     /* explicit trapezoid (RK2, alternative) */
+  RK4,      /* classic 4th order */
+  RK38,     /* 3/8 rule, 4th order */
+  RKF45,    /* Runge-Kutta-Fehlberg, adaptive step (embedded 4/5) */
+  DOPRI45,  /* Dormand-Prince, adaptive step (embedded 5/4) */
 };
 
 enum class SectionDirection {
@@ -125,7 +129,11 @@ const char *integrator_name(Integrator integrator) {
   switch (integrator) {
   case Integrator::Euler: return "Euler";
   case Integrator::RK2: return "RK2 midpoint";
+  case Integrator::Heun: return "Heun (RK2)";
   case Integrator::RK4: return "RK4";
+  case Integrator::RK38: return "RK 3/8";
+  case Integrator::RKF45: return "RKF45 (adaptive)";
+  case Integrator::DOPRI45: return "Dormand-Prince (adaptive)";
   }
   return "unknown";
 }
@@ -215,6 +223,13 @@ struct AppState {
 
   SystemMode mode = SystemMode::ODE;
   Integrator integrator = Integrator::RK4;
+  /* PHASE B: adaptive-step controls (RKF45 / DOPRI45). The visible dt is
+   * the target output step; adaptive methods subdivide internally to meet
+   * this error tolerance, clamping each substep to [dt_min, dt_max]. */
+  double adaptive_tol = 1e-6;
+  double adaptive_dt_min = 1e-7;
+  double adaptive_dt_max = 0.1;
+  double last_adaptive_dt = 0.0; /* reported: last accepted substep size */
 
   char system_input[16384] = {0};
   std::string parse_error;
@@ -299,7 +314,9 @@ struct AppState {
   int detected_dim = 3; /* recomputed at compile time */
 
   /* PHASE6-UI: which plot fills the window background. */
-  enum class ActiveView { Phase2D, Scene3D };
+  /* PHASE-A: the active system exposes a set of full-area views; the
+   * toolbar offers only the ones valid for its dimension/mode. */
+  enum class ActiveView { Line1D, Phase2D, Scene3D, Bifurcation, Fractal, Scene3DBridge, Basins, ParamScan2D };
   ActiveView active_view = ActiveView::Phase2D;
   bool show_side_panel = true;
   float window_toolbar_h = 32.0f;
@@ -328,6 +345,15 @@ struct AppState {
   long long lyapunov_samples = 0;
   double lyapunov_estimate = 0.0;
 
+  /* PHASE B: full Lyapunov spectrum + Kaplan-Yorke dimension. */
+  std::vector<double> lyap_spectrum;     /* sorted descending */
+  double lyap_kaplan_yorke = 0.0;
+  double lyap_spectrum_sum = 0.0;
+  bool lyap_spectrum_ready = false;
+  std::string lyap_spectrum_msg;
+  int lyap_spec_transient = 2000;
+  int lyap_spec_steps = 20000;
+
   char export_path[256] = "dynsys_export.csv";
   char bif_param[64] = "rho";
   char bif_observable[128] = "x";
@@ -337,6 +363,86 @@ struct AppState {
   int bif_discard = 1000;
   int bif_keep = 80;
   std::vector<Point2> bifurcation_points;
+  /* PHASE7: Lyapunov exponent vs parameter, computed on the same sweep as
+   * the orbit diagram so the two line up. */
+  std::vector<Point2> bifurcation_lyapunov;
+  bool bif_compute_lyapunov = true;
+  bool bif_show = false; /* show the bifurcation diagram view */
+  /* PHASE B+: interactive view window for the bifurcation diagram. */
+  bool bif_view_valid = false;
+  double bif_view_xmin = 0, bif_view_xmax = 1, bif_view_ymin = 0, bif_view_ymax = 1;
+
+  /* PHASE C: escape-time fractal view. Iterates the system's 2D map over
+   * the plane; each pixel is either an initial condition (Julia-type) or
+   * a parameter value (Mandelbrot-type), colored by escape time. This is
+   * the explicit bridge between dynamical systems and fractals:
+   *   - Mandelbrot = parameter map of z->z^2+c (orbit of 0 stays bounded)
+   *   - Julia      = same map, fixed c, sweeping the initial point
+   *   - logistic bifurcation = the real-axis analog of the Mandelbrot set
+   */
+  enum class FractalMode { ParameterSpace /*Mandelbrot-like*/, StateSpace /*Julia-like*/ };
+  FractalMode fractal_mode = FractalMode::ParameterSpace;
+  double fractal_xmin = -2.5, fractal_xmax = 1.0;   /* view window (re) */
+  double fractal_ymin = -1.5, fractal_ymax = 1.5;   /* view window (im) */
+  int fractal_max_iter = 200;
+  double fractal_escape_r = 4.0;
+  bool fractal_smooth = true;
+  int fractal_param_cx_index = 0;  /* which params are the two plane axes */
+  int fractal_param_cy_index = 1;  /* (ParameterSpace mode) */
+  /* Julia constant for StateSpace mode = current values of those params. */
+  bool fractal_dirty = true;       /* recompute the image when true */
+  int fractal_settle = 0;          /* debounce: frames to wait after a view change */
+  GLuint fractal_tex = 0;
+  int fractal_tex_w = 0, fractal_tex_h = 0;
+  bool fractal_view_init = false;
+
+  /* PHASE C+: the "3D bridge" scene — the Mandelbrot set lying in its
+   * plane with the period-doubling bifurcation diagram rising out of it
+   * along the real axis, making the conjugacy between z^2+c and the
+   * logistic map visible in one picture. Its own GL buffers (drawn as
+   * GL_POINTS), independent of the live-orbit line strip. */
+  GLuint bridge_vbo = 0, bridge_cbo = 0, bridge_vao = 0;
+  int bridge_point_count = 0;
+  bool bridge_built = false;
+  int bridge_mandel_res = 360;   /* c-plane sampling resolution */
+  int bridge_bif_slices = 600;   /* bifurcation parameter slices */
+  int bridge_bif_keep = 120;     /* attractor points kept per slice */
+  float bridge_height = 18.0f;   /* vertical scale of the bifurcation */
+  bool bridge_show_mandelbrot = true;
+  bool bridge_show_bifurcation = true;
+
+  /* PHASE B/C: basins of attraction. Integrate a grid of initial
+   * conditions over the current 2D view and color each pixel by which
+   * attractor it converges to — the basin-of-attraction fractal. (A Julia
+   * set is the escape-to-infinity special case, already in the fractal
+   * view; this covers attractors at finite points / cycles, e.g. Newton
+   * fractals and forced-oscillator basins.) */
+  GLuint basin_tex = 0;
+  int basin_tex_w = 0, basin_tex_h = 0;
+  bool basin_dirty = true;
+  int basin_settle = 0;
+  int basin_steps = 1500;        /* integration steps per cell */
+  int basin_res = 1;             /* unused placeholder for future supersampling */
+  double basin_cluster_tol = 1e-2;
+  bool basin_shade_speed = true; /* modulate brightness by convergence speed */
+  int basin_attractor_count = 0;
+
+  /* PHASE B: 2-parameter scan ("shrimp" map). Color a grid over two
+   * parameters by the largest Lyapunov exponent (chaotic regions bright,
+   * periodic windows dark) — the shrimp-shaped periodic structures in
+   * parameter space. Reuses the renormalized-shadow-orbit estimate. */
+  GLuint scan_tex = 0;
+  int scan_tex_w = 0, scan_tex_h = 0;
+  bool scan_dirty = true;
+  int scan_settle = 0;
+  int scan_px_index = 0;     /* parameter on the horizontal axis */
+  int scan_py_index = 1;     /* parameter on the vertical axis */
+  double scan_xmin = 0, scan_xmax = 4;   /* param-x range */
+  double scan_ymin = 0, scan_ymax = 4;   /* param-y range */
+  int scan_transient = 500;
+  int scan_iterations = 500;
+  bool scan_view_init = false;
+  double scan_lyap_min = 0, scan_lyap_max = 0; /* observed range, for the legend */
 
   bool fixed_ready = false;
   State fixed_point{};
@@ -1052,12 +1158,117 @@ static void add_scaled_into(const State &base, const State &k, double h,
   return out;
 }
 
+/* PHASE B: adaptive embedded Runge-Kutta step from t to t+dt.
+ * Subdivides [t, t+dt] into internal substeps whose size is chosen to keep
+ * the local error estimate (difference of the embedded 4th/5th order
+ * solutions) under adaptive_tol, clamped to [dt_min, dt_max]. Supports
+ * RKF45 (Fehlberg) and DOPRI45 (Dormand-Prince) Butcher tableaux. */
+bool step_ode_adaptive(AppState &app, const State &in, State *out, char *err, size_t err_cap) {
+  const size_t dim = app.state_names.size();
+  const bool dopri = (app.integrator == Integrator::DOPRI45);
+  const double total = app.dt;               /* signed target output step */
+  const double dir = total >= 0 ? 1.0 : -1.0;
+  double remaining = std::fabs(total);
+  const double tol = std::max(1e-12, app.adaptive_tol);
+  const double hmin = std::max(1e-12, app.adaptive_dt_min);
+  const double hmax = std::max(hmin, app.adaptive_dt_max);
+
+  std::vector<double> y(dim), ytmp(dim), y4(dim), y5(dim);
+  for (size_t i = 0; i < dim; ++i) y[i] = state_at(in, i);
+  double t = in.t;
+
+  /* Butcher c-nodes and stage combinations. We evaluate via eval_rhs on a
+   * State wrapper. k has up to 7 stages (DOPRI). */
+  std::vector<std::vector<double>> k(7, std::vector<double>(dim));
+  State stage = in; resize_state(stage, dim);
+  auto rhs_at = [&](const std::vector<double> &yv, double tt, std::vector<double> &kout) -> bool {
+    for (size_t i = 0; i < dim; ++i) set_state_at(stage, i, yv[i]);
+    stage.t = tt;
+    State d{};
+    if (!eval_rhs(app, stage, &d, err, err_cap)) return false;
+    resize_state(d, dim);
+    for (size_t i = 0; i < dim; ++i) kout[i] = state_at(d, i);
+    return true;
+  };
+
+  double h = std::min(hmax, remaining > 0 ? remaining : hmax);
+  if (h < hmin) h = hmin;
+  int guard = 0;
+  const int max_substeps = 100000;
+
+  while (remaining > 1e-15 && guard++ < max_substeps) {
+    if (h > remaining) h = remaining;
+    const double hs = dir * h;
+    bool ok = true;
+
+    if (!dopri) {
+      /* Runge-Kutta-Fehlberg 4(5) */
+      ok = rhs_at(y, t, k[0]);
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(0.25*k[0][i]); ok=rhs_at(ytmp,t+0.25*hs,k[1]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(3.0/32*k[0][i]+9.0/32*k[1][i]); ok=rhs_at(ytmp,t+3.0/8*hs,k[2]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(1932.0/2197*k[0][i]-7200.0/2197*k[1][i]+7296.0/2197*k[2][i]); ok=rhs_at(ytmp,t+12.0/13*hs,k[3]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(439.0/216*k[0][i]-8.0*k[1][i]+3680.0/513*k[2][i]-845.0/4104*k[3][i]); ok=rhs_at(ytmp,t+hs,k[4]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(-8.0/27*k[0][i]+2.0*k[1][i]-3544.0/2565*k[2][i]+1859.0/4104*k[3][i]-11.0/40*k[4][i]); ok=rhs_at(ytmp,t+0.5*hs,k[5]); }
+      if (ok) for (size_t i=0;i<dim;++i) {
+        y4[i]=y[i]+hs*(25.0/216*k[0][i]+1408.0/2565*k[2][i]+2197.0/4104*k[3][i]-1.0/5*k[4][i]);
+        y5[i]=y[i]+hs*(16.0/135*k[0][i]+6656.0/12825*k[2][i]+28561.0/56430*k[3][i]-9.0/50*k[4][i]+2.0/55*k[5][i]);
+      }
+    } else {
+      /* Dormand-Prince 5(4) */
+      ok = rhs_at(y, t, k[0]);
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(0.2*k[0][i]); ok=rhs_at(ytmp,t+0.2*hs,k[1]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(3.0/40*k[0][i]+9.0/40*k[1][i]); ok=rhs_at(ytmp,t+0.3*hs,k[2]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(44.0/45*k[0][i]-56.0/15*k[1][i]+32.0/9*k[2][i]); ok=rhs_at(ytmp,t+0.8*hs,k[3]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(19372.0/6561*k[0][i]-25360.0/2187*k[1][i]+64448.0/6561*k[2][i]-212.0/729*k[3][i]); ok=rhs_at(ytmp,t+8.0/9*hs,k[4]); }
+      if (ok) { for (size_t i=0;i<dim;++i) ytmp[i]=y[i]+hs*(9017.0/3168*k[0][i]-355.0/33*k[1][i]+46732.0/5247*k[2][i]+49.0/176*k[3][i]-5103.0/18656*k[4][i]); ok=rhs_at(ytmp,t+hs,k[5]); }
+      if (ok) for (size_t i=0;i<dim;++i) y5[i]=y[i]+hs*(35.0/384*k[0][i]+500.0/1113*k[2][i]+125.0/192*k[3][i]-2187.0/6784*k[4][i]+11.0/84*k[5][i]);
+      if (ok) ok=rhs_at(y5,t+hs,k[6]);
+      if (ok) for (size_t i=0;i<dim;++i)
+        y4[i]=y[i]+hs*(5179.0/57600*k[0][i]+7571.0/16695*k[2][i]+393.0/640*k[3][i]-92097.0/339200*k[4][i]+187.0/2100*k[5][i]+1.0/40*k[6][i]);
+    }
+    if (!ok) return false;
+
+    /* error estimate (max norm of y5 - y4, relative) */
+    double erot = 0.0;
+    for (size_t i = 0; i < dim; ++i) {
+      const double sc = 1.0 + std::max(std::fabs(y[i]), std::fabs(y5[i]));
+      const double e = std::fabs(y5[i] - y4[i]) / sc;
+      if (e > erot) erot = e;
+    }
+    /* accept if within tol or already at the minimum step */
+    if (erot <= tol || h <= hmin * 1.0000001) {
+      const std::vector<double> &ynew = dopri ? y5 : y5; /* use higher order */
+      for (size_t i = 0; i < dim; ++i) y[i] = ynew[i];
+      t += hs;
+      remaining -= h;
+      app.last_adaptive_dt = h;
+      bool finite = true;
+      for (double v : y) finite = finite && std::isfinite(v);
+      if (!finite) { set_error(err, err_cap, "adaptive step diverged"); return false; }
+    }
+    /* PI-ish step update: h_new = h * clamp(0.9*(tol/err)^(1/5)) */
+    double factor;
+    if (erot <= 1e-300) factor = 5.0;
+    else factor = 0.9 * std::pow(tol / erot, 0.2);
+    factor = std::max(0.2, std::min(5.0, factor));
+    h *= factor;
+    if (h < hmin) h = hmin;
+    if (h > hmax) h = hmax;
+  }
+
+  resize_state(*out, dim);
+  out->t = t;
+  for (size_t i = 0; i < dim; ++i) set_state_at(*out, i, y[i]);
+  return true;
+}
+
 bool step_ode_state(AppState &app, const State &in, State *out, char *err,
                     size_t err_cap) {
   const size_t dim = app.state_names.size();
   if (app.integrator == Integrator::Euler) {
     if (!eval_rhs(app, in, &app.scratch_k1, err, err_cap)) return false;
     add_scaled_into(in, app.scratch_k1, app.dt, dim, out);
+    out->t = in.t + app.dt;
     return true;
   }
   if (app.integrator == Integrator::RK2) {
@@ -1065,7 +1276,45 @@ bool step_ode_state(AppState &app, const State &in, State *out, char *err,
     add_scaled_into(in, app.scratch_k1, app.dt * 0.5, dim, &app.scratch_mid);
     if (!eval_rhs(app, app.scratch_mid, &app.scratch_k2, err, err_cap)) return false;
     add_scaled_into(in, app.scratch_k2, app.dt, dim, out);
+    out->t = in.t + app.dt;
     return true;
+  }
+  if (app.integrator == Integrator::Heun) {
+    /* explicit trapezoid: predictor Euler, corrector average of slopes */
+    if (!eval_rhs(app, in, &app.scratch_k1, err, err_cap)) return false;
+    add_scaled_into(in, app.scratch_k1, app.dt, dim, &app.scratch_mid);
+    if (!eval_rhs(app, app.scratch_mid, &app.scratch_k2, err, err_cap)) return false;
+    resize_state(*out, dim);
+    out->t = in.t + app.dt;
+    for (size_t i = 0; i < dim; ++i)
+      set_state_at(*out, i, state_at(in, i) +
+        app.dt * 0.5 * (state_at(app.scratch_k1, i) + state_at(app.scratch_k2, i)));
+    return true;
+  }
+  if (app.integrator == Integrator::RK38) {
+    /* classic 3/8 rule (4th order) */
+    const double h = app.dt;
+    if (!eval_rhs(app, in, &app.scratch_k1, err, err_cap)) return false;
+    add_scaled_into(in, app.scratch_k1, h / 3.0, dim, &app.scratch_mid);
+    if (!eval_rhs(app, app.scratch_mid, &app.scratch_k2, err, err_cap)) return false;
+    /* mid = in + h*(-1/3 k1 + k2) */
+    resize_state(app.scratch_mid, dim);
+    for (size_t i = 0; i < dim; ++i)
+      set_state_at(app.scratch_mid, i, state_at(in, i) + h * (-1.0/3.0 * state_at(app.scratch_k1, i) + state_at(app.scratch_k2, i)));
+    if (!eval_rhs(app, app.scratch_mid, &app.scratch_k3, err, err_cap)) return false;
+    for (size_t i = 0; i < dim; ++i)
+      set_state_at(app.scratch_mid, i, state_at(in, i) + h * (state_at(app.scratch_k1, i) - state_at(app.scratch_k2, i) + state_at(app.scratch_k3, i)));
+    if (!eval_rhs(app, app.scratch_mid, &app.scratch_k4, err, err_cap)) return false;
+    resize_state(*out, dim);
+    out->t = in.t + h;
+    for (size_t i = 0; i < dim; ++i)
+      set_state_at(*out, i, state_at(in, i) + h / 8.0 *
+        (state_at(app.scratch_k1, i) + 3.0 * state_at(app.scratch_k2, i)
+         + 3.0 * state_at(app.scratch_k3, i) + state_at(app.scratch_k4, i)));
+    return true;
+  }
+  if (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45) {
+    return step_ode_adaptive(app, in, out, err, err_cap);
   }
 
   /* RK4 — entirely in pre-sized scratch buffers. */
@@ -1198,6 +1447,9 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
    * variables (count + names) are unchanged, since their coordinates
    * still mean the same thing. */
   const std::vector<std::string> prev_state_names = app.state_names;
+  std::vector<std::string> prev_param_names;
+  prev_param_names.reserve(app.params.size());
+  for (const auto &pp : app.params) prev_param_names.push_back(pp.name);
 
   const std::vector<std::string> lines = split_lines(system_text);
 
@@ -1373,9 +1625,13 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
     if (lhs == "integrator") {
       if (rhs == "euler") app.integrator = Integrator::Euler;
       else if (rhs == "rk2" || rhs == "midpoint") app.integrator = Integrator::RK2;
+      else if (rhs == "heun") app.integrator = Integrator::Heun;
       else if (rhs == "rk4") app.integrator = Integrator::RK4;
+      else if (rhs == "rk38" || rhs == "rk3/8") app.integrator = Integrator::RK38;
+      else if (rhs == "rkf45" || rhs == "fehlberg") app.integrator = Integrator::RKF45;
+      else if (rhs == "dopri45" || rhs == "dopri" || rhs == "dormand-prince") app.integrator = Integrator::DOPRI45;
       else {
-        *error = "line " + std::to_string(line_no + 1) + ": integrator must be euler, rk2, or rk4";
+        *error = "line " + std::to_string(line_no + 1) + ": integrator must be euler, rk2, heun, rk4, rk38, rkf45, or dopri45";
         arena_destroy(&next_arena);
         return false;
       }
@@ -1864,6 +2120,9 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
    * the located equilibrium, its Jacobian/spectrum, and the saddle
    * separatrices were computed for the previous vector field. Clear
    * them. */
+  app.fractal_dirty = true; /* PHASE C: recompute the fractal image too */
+  app.basin_dirty = true;   /* PHASE B/C: recompute basins for the new system */
+  app.scan_dirty = true; app.scan_view_init = false; /* PHASE B: recompute 2-param scan */
   app.fixed_ready = false;
   app.fixed_jacobian.clear();
   app.fixed_classification.clear();
@@ -1876,6 +2135,35 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
    * drop them; otherwise keep them on screen. */
   if (app.state_names != prev_state_names) {
     app.phase_trajectories.clear();
+  }
+
+  /* PHASE B+: auto-configure the bifurcation sweep for THIS system so the
+   * defaults aren't pointing at a previous system's parameter/range (the
+   * usual reason "the bifurcation diagram looks wrong"). Only do this when
+   * the system actually changed, so we don't stomp a user's tweaks while
+   * they iterate on one system. We pick the first parameter and its
+   * declared [min,max] range, and the first state variable as observable. */
+  if (app.state_names != prev_state_names || [&]{
+        std::vector<std::string> cur;
+        for (const auto &pp : app.params) cur.push_back(pp.name);
+        return cur != prev_param_names;
+      }()) {
+    if (!app.params.empty()) {
+      const auto &p0 = app.params[0];
+      std::snprintf(app.bif_param, sizeof(app.bif_param), "%s", p0.name.c_str());
+      if (p0.has_range) { app.bif_start = p0.min_value; app.bif_end = p0.max_value; }
+      else { app.bif_start = p0.value - 1.0; app.bif_end = p0.value + 1.0; }
+      /* sensible cascade defaults for maps vs ODEs */
+      if (app.mode == SystemMode::Map) {
+        app.bif_discard = 1000; app.bif_keep = 200; app.bif_slices = 800;
+      } else {
+        app.bif_discard = 4000; app.bif_keep = 2000; app.bif_slices = 400;
+      }
+    }
+    if (!app.state_names.empty())
+      std::snprintf(app.bif_observable, sizeof(app.bif_observable), "%s",
+                    app.state_names[0].c_str());
+    app.bif_view_valid = false;
   }
   return true;
 }
@@ -1911,6 +2199,21 @@ const SystemPreset kPresets[] = {
     {"Three-Scroll Unified", "Continuous 3D", "# Three-Scroll Unified Chaotic System\nmode = ode\nintegrator = rk4\nparam a = 32.48 [0,60]\nparam b = 45.84 [0,70]\nparam c = 1.18 [0,5]\nparam d = 0.13 [0,1]\nparam e = 0.57 [0,2]\nparam f = 14.7 [0,30]\ndx = a * (y - x) + d * x * z\ndy = b * x - x * z + f * y\ndz = c * z + x * y - e * pow(x, 2)\n", {0.1,0.1,0.1,0}, 0.0005, 16, Integrator::RK4,1.0f,0,0,0},
     {"Sprott", "Continuous 3D", "# Sprott system\nmode = ode\nintegrator = rk4\nparam a = 2.07 [0,4]\nparam b = 1.79 [0,4]\ndx = y + a * x * y + x * z\ndy = 1 - b * pow(x, 2) + y * z\ndz = x - pow(x, 2) - pow(y, 2)\n", {0.1,0.1,0.1,0}, 0.002, 8, Integrator::RK4,1.0f,0,0,0},
     {"Four-Wing", "Continuous 3D", "# Four-Wing attractor\nmode = ode\nintegrator = rk4\nparam a = 0.2 [0,2]\nparam b = 0.01 [0,1]\nparam c = 0 - 0.4 [-2,1]\ndx = a * x + y * z\ndy = b * x + c * y - x * z\ndz = 0 - z - x * y\n", {0.1,0.1,0.1,0}, 0.005, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Chua's circuit", "Continuous 3D", R"dyn(# Chua's circuit (double-scroll). f is the piecewise-linear diode,
+# written smoothly with abs(): f = m1 x + 0.5 (m0-m1)(|x+1|-|x-1|).
+state x, y, z
+mode = ode
+integrator = rk4
+param alpha = 15.6 [0,30]
+param beta = 28 [0,60]
+param m0 = 0 - 1.143 [-2,0]
+param m1 = 0 - 0.714 [-2,0]
+dx = alpha * (y - x - (m1 * x + 0.5 * (m0 - m1) * (abs(x + 1) - abs(x - 1))))
+dy = x - y + z
+dz = 0 - beta * y
+)dyn", {0.7,0.0,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Sprott B", "Continuous 3D", "# Sprott B attractor (algebraically simple chaos)\nmode = ode\nintegrator = rk4\ndx = y * z\ndy = x - y\ndz = 1 - x * y\n", {0.1,0.1,0.1,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Nose-Hoover", "Continuous 3D", "# Nose-Hoover oscillator (conservative chaos)\nmode = ode\nintegrator = rk4\nparam a = 1.5 [0,3]\ndx = y\ndy = 0 - x + y * z\ndz = a - y * y\n", {0.1,0.1,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
     {"Van der Pol", "Phase-plane examples", R"dyn(# Van der Pol oscillator
 state x, y
 mode = ode
@@ -1951,10 +2254,92 @@ initial omega = 0
 dtheta = omega
 domega = 0 - sin(theta) - damping * omega
 )dyn", {2.5,0.0,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Duffing oscillator", "Phase-plane examples", R"dyn(# Unforced Duffing oscillator (double-well)
+state x, v
+mode = ode
+integrator = rk4
+param delta = 0.2 [0,2]
+param beta = 1.0 [-2,2]
+view2d = -2, 2, -2, 2
+dx = v
+dv = 0 - delta * v + x - beta * x*x*x
+)dyn", {1.0,0.0,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
+    {"FitzHugh-Nagumo", "Phase-plane examples", R"dyn(# FitzHugh-Nagumo neuron model
+state v, w
+mode = ode
+integrator = rk4
+param I = 0.5 [0,2]
+param a = 0.7 [0,1]
+param b = 0.8 [0,1]
+param tau = 12.5 [1,50]
+view2d = -2.5, 2.5, -1, 2
+dv = v - v*v*v / 3 - w + I
+dw = (v + a - b * w) / tau
+)dyn", {-1.0,1.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Brusselator", "Phase-plane examples", R"dyn(# Brusselator chemical oscillator
+state x, y
+mode = ode
+integrator = rk4
+param a = 1.0 [0,5]
+param b = 3.0 [0,5]
+view2d = 0, 5, 0, 5
+dx = a + x*x*y - (b + 1) * x
+dy = b * x - x*x*y
+)dyn", {1.0,1.0,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Selkov glycolysis", "Phase-plane examples", R"dyn(# Sel'kov model of glycolytic oscillations
+state x, y
+mode = ode
+integrator = rk4
+param a = 0.08 [0,0.5]
+param b = 0.6 [0,2]
+view2d = 0, 3, 0, 3
+dx = 0 - x + a * y + x*x*y
+dy = b - a * y - x*x*y
+)dyn", {1.0,1.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
+    {"SIR epidemic", "Phase-plane examples", R"dyn(# SIR epidemic model (S-I plane, R = 1 - S - I)
+state S, I
+mode = ode
+integrator = rk4
+param beta = 0.6 [0,2]
+param gamma = 0.1 [0,1]
+view2d = 0, 1, 0, 1
+dS = 0 - beta * S * I
+dI = beta * S * I - gamma * I
+)dyn", {0.99,0.01,0.0,0}, 0.05, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Predator-prey (limit cycle)", "Phase-plane examples", R"dyn(# Rosenzweig-MacArthur predator-prey with a stable limit cycle
+state x, y
+mode = ode
+integrator = rk4
+param r = 1.0 [0,3]
+param K = 10 [1,30]
+param a = 1.0 [0,5]
+param h = 2.0 [0,5]
+param e = 0.5 [0,2]
+param m = 0.3 [0,2]
+view2d = 0, 12, 0, 4
+dx = r * x * (1 - x / K) - a * x * y / (1 + a * h * x)
+dy = e * a * x * y / (1 + a * h * x) - m * y
+)dyn", {5.0,1.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Simple pendulum (undamped)", "Phase-plane examples", R"dyn(# Undamped pendulum: nested closed orbits + separatrix
+state theta, omega
+mode = ode
+integrator = rk4
+view2d = -6.5, 6.5, -3, 3
+dtheta = omega
+domega = 0 - sin(theta)
+)dyn", {0.5,0.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
     {"Henon map", "Discrete maps", "# Hénon map\nmode = map\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nx_next = 1 - a * x * x + y\ny_next = b * x\nz_next = z\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
-    {"Logistic map", "Discrete maps", "# Logistic map embedded in 3D\nmode = map\nparam r = 3.9 [0,4]\nx_next = r * x * (1 - x)\ny_next = x\nz_next = z\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Logistic map", "Discrete maps", "# Logistic map x_{n+1} = r x (1-x)  (genuine 1D map)\n# The classic period-doubling route to chaos.\nstate x\nmode = map\nparam r = 3.9 [0,4]\nview2d = 0, 1, 0, 1\nx_next = r * x * (1 - x)\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Tent map", "Discrete maps", "# Tent map: x_next = mu * min(x, 1-x)\n# 1D map; chaotic for mu near 2, x stays in [0,1].\nstate x\nmode = map\nparam mu = 1.9 [0,2]\nview2d = 0, 1, 0, 1\nx_next = mu * min(x, 1 - x)\nobserve x_value = x\n", {0.35,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Sine map", "Discrete maps", "# Sine map x_{n+1} = r sin(pi x)  (1D, period-doubling like logistic)\nstate x\nmode = map\nparam r = 0.9 [0,1]\nview2d = 0, 1, 0, 1\nx_next = r * sin(3.141592653589793 * x)\nobserve x_value = x\n", {0.4,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Gauss / mouse map", "Discrete maps", "# Gauss (mouse) map x_{n+1} = exp(-alpha x^2) + beta  (1D)\nstate x\nmode = map\nparam alpha = 6.2 [1,10]\nparam beta = 0 - 0.5 [-1,1]\nview2d = -1, 1.5, -1, 1.5\nx_next = exp(0 - alpha * x * x) + beta\nobserve x_value = x\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Cubic map", "Discrete maps", "# Cubic map x_{n+1} = a x - x^3  (1D, symmetric period-doubling)\nstate x\nmode = map\nparam a = 2.8 [0,3]\nview2d = -2, 2, -2, 2\nx_next = a * x - x*x*x\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Gingerbreadman map", "Discrete maps", "# Gingerbreadman map (piecewise-linear, chaotic)\nstate x, y\nmode = map\nview2d = -8, 8, -8, 8\nx_next = 1 - y + abs(x)\ny_next = x\n", {0.5,3.7,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Standard (Chirikov) map", "Discrete maps", "# Chirikov standard map on the cylinder\nstate theta, p\nmode = map\nparam K = 0.97 [0,5]\nview2d = 0, 6.2832, -3.1416, 3.1416\np_next = p + K * sin(theta)\ntheta_next = theta + p + K * sin(theta)\n", {3.0,0.1,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Ikeda map", "Discrete maps", "# Ikeda map\nmode = map\nparam u = 0.918 [0,1]\ntheta = 0.4 - 6 / (1 + x*x + y*y)\nx_next = 1 + u * (x * cos(theta) - y * sin(theta))\ny_next = u * (x * sin(theta) + y * cos(theta))\nz_next = z\n", {0.1,0.1,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Tinkerbell map", "Discrete maps", "# Tinkerbell map\nmode = map\nparam a = 0.9 [0,2]\nparam b = 0 - 0.6013 [-2,2]\nparam c = 2.0 [0,4]\nparam d = 0.5 [0,2]\nx_next = x*x - y*y + a*x + b*y\ny_next = 2*x*y + c*x + d*y\nz_next = z\n", {0.1,0.1,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Newton fractal (z^3 - 1)", "Fractals", "# Newton's method for z^3 = 1, as a 2D map.\n# Three roots -> three basins with fractal boundaries.\n# Switch to the 'basins' view after loading.\nstate x, y\nmode = map\nview2d = -2, 2, -2, 2\n# z^2 = a + i b\nx_next = x - ( ( (x*(x*x-y*y) - y*(2*x*y)) - 1 )*(3*(x*x-y*y)) + ( x*(2*x*y) + y*(x*x-y*y) )*(3*(2*x*y)) ) / ( 9*((x*x-y*y)*(x*x-y*y) + (2*x*y)*(2*x*y)) )\ny_next = y - ( ( x*(2*x*y) + y*(x*x-y*y) )*(3*(x*x-y*y)) - ( (x*(x*x-y*y) - y*(2*x*y)) - 1 )*(3*(2*x*y)) ) / ( 9*((x*x-y*y)*(x*x-y*y) + (2*x*y)*(2*x*y)) )\n", {0.5,0.5,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Complex quadratic (Mandelbrot/Julia)", "Fractals", "# z -> z^2 + c  (x+iy)^2 + (cx+i cy)\n# Fractal view: parameter space = Mandelbrot, state space = Julia.\nstate x, y\nmode = map\nparam cx = 0 [-2,2]\nparam cy = 0 [-2,2]\nview2d = -2, 2, -2, 2\nx_next = x*x - y*y + cx\ny_next = 2*x*y + cy\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Henon map 2D", "N-dimensional examples", "# Hénon map as a true 2D state\nstate x, y\nmode = map\nview2d = -1.5, 1.5, -0.5, 0.5\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nplot3d = x, y, 0\nx_next = 1 - a * x * x + y\ny_next = b * x\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"4D coupled oscillator demo", "N-dimensional examples", "# Four-dimensional demo system\nstate x, y, z, w\nmode = ode\nintegrator = rk4\nparam a = 0.1 [0,1]\nplot3d = x, y, w\nobserve r4 = sqrt(x*x + y*y + z*z + w*w)\nsection = w\nsection_direction = positive\nsection_plot = x, z\ninitial x = 0.1\ninitial y = 0\ninitial z = 0\ninitial w = 0.2\ndx = y\ndy = 0 - x - a*y + z\ndz = w\ndw = 0 - z - a*w + x\n", {0.1,0.0,0.0,0}, 0.01, 3, Integrator::RK4,1.0f,0,0,0},
 };
@@ -2106,6 +2491,7 @@ void restart_main_from_state(AppState &app, const State &seed) {
  * grows one step per frame and looks half-finished. The result is a
  * static trajectory (active=false) so it doesn't keep marching. */
 bool step_ode_state(AppState &app, const State &in, State *out, char *err, size_t err_cap);
+void run_bifurcation(AppState &app); /* PHASE B+: used by the in-view control strip */
 
 void add_phase_trajectory(AppState &app, const State &seed, const char *label_prefix = "orbit") {
   if (static_cast<int>(app.phase_trajectories.size()) >= app.phase_max_extra_trajectories) {
@@ -2131,6 +2517,20 @@ void add_phase_trajectory(AppState &app, const State &seed, const char *label_pr
 
   if (app.mode == SystemMode::ODE) {
     const double dt0 = app.dt;
+    /* Stop tracing if the orbit runs far from the seed — this keeps a
+     * backward trace that diverges in reverse time from polluting the
+     * auto-fit (and from wasting work). Cap is relative to the seed's own
+     * magnitude with a generous floor, so it works at any scale without
+     * needing the view bounds (which aren't declared yet here). */
+    const double sx = state_at(start, (size_t)app.phase_x_index);
+    const double sy = state_at(start, (size_t)app.phase_y_index);
+    const double seed_mag = std::sqrt(sx * sx + sy * sy);
+    const double cap = 1.0e4 + 1.0e3 * seed_mag;
+    auto too_far = [&](const State &s) {
+      const double x = state_at(s, (size_t)app.phase_x_index) - sx;
+      const double y = state_at(s, (size_t)app.phase_y_index) - sy;
+      return std::sqrt(x * x + y * y) > cap;
+    };
     /* backward */
     app.dt = -std::fabs(dt0);
     State s = start;
@@ -2139,7 +2539,7 @@ void add_phase_trajectory(AppState &app, const State &seed, const char *label_pr
       if (!step_ode_state(app, s, &nx, err, sizeof(err))) break;
       bool finite = true;
       for (double v : nx.v) finite = finite && std::isfinite(v);
-      if (!finite) break;
+      if (!finite || too_far(nx)) break;
       backward.push_front(nx);
       s = nx;
     }
@@ -2151,7 +2551,7 @@ void add_phase_trajectory(AppState &app, const State &seed, const char *label_pr
       if (!step_ode_state(app, s, &nx, err, sizeof(err))) break;
       bool finite = true;
       for (double v : nx.v) finite = finite && std::isfinite(v);
-      if (!finite) break;
+      if (!finite || too_far(nx)) break;
       forward.push_back(nx);
       s = nx;
     }
@@ -2527,6 +2927,46 @@ bool system_is_3d(const AppState &app) {
   return effective_dimension(app) >= 3 && app.state_names.size() >= 3;
 }
 
+/* PHASE-A: which full-area views make sense for the current system.
+ *   1D line/cobweb : exactly 1 effective dimension
+ *   2D phase       : >= 2 effective dimensions
+ *   3D scene       : >= 3 effective dimensions
+ *   bifurcation    : any system that has at least one parameter
+ * (effective dimension respects the Force2D/Force3D override.) */
+bool view_valid(const AppState &app, AppState::ActiveView v) {
+  const int d = effective_dimension(app);
+  switch (v) {
+    case AppState::ActiveView::Line1D:      return d == 1;
+    case AppState::ActiveView::Phase2D:     return d >= 2;
+    case AppState::ActiveView::Scene3D:     return system_is_3d(app);
+    case AppState::ActiveView::Bifurcation: return !app.params.empty();
+    case AppState::ActiveView::Fractal:     return app.mode == SystemMode::Map && app.state_names.size() >= 2;
+    case AppState::ActiveView::Scene3DBridge:
+      /* The Mandelbrot<->bifurcation bridge is meaningful for 1D maps (the
+       * logistic family), whose period-doubling cascade embeds in the
+       * Mandelbrot needle. It isn't relevant to general ODEs/maps, so only
+       * offer it there. */
+      return app.mode == SystemMode::Map && effective_dimension(app) == 1;
+    case AppState::ActiveView::Basins:      return app.state_names.size() >= 2;
+    case AppState::ActiveView::ParamScan2D: return app.params.size() >= 2;
+  }
+  return false;
+}
+
+/* A sensible default view for a freshly compiled system. */
+AppState::ActiveView default_view_for(const AppState &app) {
+  const int d = effective_dimension(app);
+  if (d <= 1) return AppState::ActiveView::Line1D;
+  if (d >= 3) return AppState::ActiveView::Scene3D;
+  return AppState::ActiveView::Phase2D;
+}
+
+/* Snap active_view to something valid if the current choice isn't. */
+void ensure_valid_view(AppState &app) {
+  if (view_valid(app, app.active_view)) return;
+  app.active_view = default_view_for(app);
+}
+
 /* PHASE6-UI: (re)create the offscreen color+depth target at a given
  * pixel size. Returns false if FBO setup is incomplete. */
 bool ensure_scene_fbo(AppState &app, int w, int h) {
@@ -2858,32 +3298,60 @@ PlotBounds current_phase_bounds(AppState &app, size_t ix, size_t iy) {
     b.ymin = app.phase_y_min;
     b.ymax = app.phase_y_max;
   } else {
-    b.xmin = DBL_MAX; b.xmax = -DBL_MAX;
-    b.ymin = DBL_MAX; b.ymax = -DBL_MAX;
-    auto include = [&](const State &s) {
+    /* PHASE B+: robust auto-fit. Collect the data coordinates and frame
+     * to a percentile range rather than the raw min/max, so a few extreme
+     * points — e.g. from a backward ODE trace that diverges in reverse
+     * time — don't blow the view up. This fixes the "first trajectory
+     * appears then zooms way out" problem. We still include all points,
+     * but the initial window is set from the bulk of the data. */
+    std::vector<double> xs, ys;
+    xs.reserve(4096); ys.reserve(4096);
+    auto collect = [&](const State &s) {
       const double x = state_at(s, ix);
       const double y = state_at(s, iy);
-      if (std::isfinite(x) && std::isfinite(y)) {
-        b.xmin = std::min(b.xmin, x); b.xmax = std::max(b.xmax, x);
-        b.ymin = std::min(b.ymin, y); b.ymax = std::max(b.ymax, y);
-      }
+      if (std::isfinite(x) && std::isfinite(y)) { xs.push_back(x); ys.push_back(y); }
     };
-    for (const State &s : app.history) include(s);
-    include(app.current);
+    for (const State &s : app.history) collect(s);
+    collect(app.current);
     for (const auto &traj : app.phase_trajectories) {
       if (!traj.visible) continue;
-      for (const State &s : traj.history) include(s);
+      for (const State &s : traj.history) collect(s);
     }
     for (const auto &curve : app.separatrix_curves) {
       if (!curve.visible) continue;
-      for (const State &s : curve.history) include(s);
+      for (const State &s : curve.history) collect(s);
     }
-    if (app.fixed_ready) include(app.fixed_point);
-    if (b.xmin == DBL_MAX) {
+    if (app.fixed_ready) collect(app.fixed_point);
+
+    if (xs.empty()) {
       const double x = state_at(app.current, ix);
       const double y = state_at(app.current, iy);
       b.xmin = x - 10.0; b.xmax = x + 10.0;
       b.ymin = y - 10.0; b.ymax = y + 10.0;
+    } else {
+      auto pct = [](std::vector<double> v, double lo, double hi, double *out_lo, double *out_hi) {
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        auto at = [&](double q) {
+          double idx = q * (n - 1);
+          size_t i = (size_t)idx;
+          double f = idx - i;
+          if (i + 1 < n) return v[i] * (1 - f) + v[i + 1] * f;
+          return v[i];
+        };
+        *out_lo = at(lo); *out_hi = at(hi);
+      };
+      /* if the data is small, just use full extent; for larger sets clip
+       * to 1st..99th percentile to drop divergent outliers */
+      if (xs.size() < 64) {
+        b.xmin = *std::min_element(xs.begin(), xs.end());
+        b.xmax = *std::max_element(xs.begin(), xs.end());
+        b.ymin = *std::min_element(ys.begin(), ys.end());
+        b.ymax = *std::max_element(ys.begin(), ys.end());
+      } else {
+        pct(xs, 0.01, 0.99, &b.xmin, &b.xmax);
+        pct(ys, 0.01, 0.99, &b.ymin, &b.ymax);
+      }
     }
   }
   if (b.xmax <= b.xmin) b.xmax = b.xmin + 1.0;
@@ -3512,6 +3980,168 @@ void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
  *   double-click         : auto-fit to data
  * Orbits accumulate; they are only removed by an explicit Clear.
  * ============================================================ */
+
+/* ============================================================
+ * PHASE-A: 1D view, for systems with a single effective dimension
+ * (tent map, logistic-as-1D, 1D ODEs).
+ *
+ * For MAPS: a cobweb (Verhulst) diagram — plots the identity line y=x,
+ * the map curve y=f(x), and the staircase x0 -> f(x0) -> f(f(x0)) ...
+ * that shows convergence to a fixed point, a period-n cycle, or chaos.
+ *
+ * For 1D ODEs: a flow-on-a-line — plots y = f(x) (the velocity), the
+ * zero line, and marks each equilibrium (f=0) as stable (filled) or
+ * unstable (hollow) with little flow arrows on the x-axis.
+ *
+ * The mouse sets the seed: click an x to start the cobweb / drop the
+ * state there. Wheel / +/- zoom the x-range; double-click auto-fits.
+ * ============================================================ */
+void render_line1d_background(AppState &app) {
+  if (app.state_names.empty()) return;
+  const size_t ix = 0; /* the single state variable */
+
+  const ImVec2 p0(0.0f, 0.0f);
+  const float w = static_cast<float>(app.window_width);
+  const float h = static_cast<float>(app.window_height);
+  const ImVec2 p1(w, h);
+
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  ImGuiIO &io = ImGui::GetIO();
+  const bool over_plot = !io.WantCaptureMouse;
+
+  /* x-range: reuse phase x bounds machinery on the single axis; map the
+   * y-axis to the same range for the cobweb so the y=x line is diagonal. */
+  PlotBounds b = current_phase_bounds(app, ix, ix);
+  /* current_phase_bounds with ix==iy collapses y to x's range, which is
+   * exactly what we want for a cobweb (square domain). */
+  b = sanitize_bounds(b);
+
+  const Point2 mouse_data = screen_to_plot(b, p0, w, h, io.MousePos);
+
+  /* interaction */
+  if (over_plot) {
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+      app.phase_auto_bounds = true; app.phase_bounds_valid = false;
+    } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      /* set the live state's x to the clicked value and restart */
+      State seed = app.start;
+      resize_state(seed, app.state_names.size());
+      set_state_at(seed, ix, mouse_data.x);
+      restart_main_from_state(app, seed);
+    }
+    if (io.MouseWheel != 0.0f)
+      zoom_phase_bounds(app, b, mouse_data, std::pow(0.8, (double)io.MouseWheel));
+    const Point2 c{0.5 * (b.xmin + b.xmax), 0.5 * (b.ymin + b.ymax)};
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
+      zoom_phase_bounds(app, b, c, 0.83);
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract))
+      zoom_phase_bounds(app, b, c, 1.20);
+  }
+
+  /* backdrop + axes */
+  draw->AddRectFilled(p0, p1, IM_COL32(16, 17, 22, 255));
+  draw_plot_grid(draw, p0, w, h, b);
+  draw->PushClipRect(p0, p1, true);
+
+  auto S = [&](double x, double y) {
+    const Point2 q = plot_to_screen(b, p0, w, h, x, y);
+    return ImVec2((float)q.x, (float)q.y);
+  };
+  char err[256] = {0};
+
+  if (app.mode == SystemMode::Map) {
+    /* identity line y = x */
+    draw->AddLine(S(b.xmin, b.xmin), S(b.xmax, b.xmax), IM_COL32(120, 120, 130, 200), 1.4f);
+    /* map curve y = f(x) (here f is the next-value of the single state) */
+    const int N = std::max(64, std::min((int)w, 1200));
+    ImVec2 prev; bool have_prev = false;
+    for (int i = 0; i <= N; ++i) {
+      const double x = b.xmin + (b.xmax - b.xmin) * (double)i / N;
+      State s = app.current; resize_state(s, app.state_names.size());
+      set_state_at(s, ix, x);
+      State nx{};
+      if (!step_state(app, s, &nx, err, sizeof(err))) { have_prev = false; continue; }
+      const double y = state_at(nx, ix);
+      if (!std::isfinite(y)) { have_prev = false; continue; }
+      const ImVec2 cur = S(x, y);
+      if (have_prev) draw->AddLine(prev, cur, IM_COL32(255, 170, 70, 235), 2.0f);
+      prev = cur; have_prev = true;
+    }
+    /* cobweb staircase from the current/seed x */
+    double x = state_at(app.current, ix);
+    if (std::isfinite(x)) {
+      const int steps = 200;
+      for (int i = 0; i < steps; ++i) {
+        State s = app.current; resize_state(s, app.state_names.size());
+        set_state_at(s, ix, x);
+        State nx{};
+        if (!step_state(app, s, &nx, err, sizeof(err))) break;
+        const double y = state_at(nx, ix);
+        if (!std::isfinite(y)) break;
+        /* vertical to the curve, then horizontal to the diagonal */
+        const ImU32 col = IM_COL32(120, 210, 255, 150);
+        draw->AddLine(S(x, x), S(x, y), col, 1.2f);
+        draw->AddLine(S(x, y), S(y, y), col, 1.2f);
+        x = y;
+      }
+    }
+    draw->AddText(ImVec2(p0.x + 12, p0.y + 12), IM_COL32(235, 235, 240, 230),
+                  "cobweb: orange y=f(x), grey y=x, blue staircase. Click to set start x.");
+  } else {
+    /* 1D ODE: flow on a line. Plot velocity y = f(x). */
+    const double y0 = 0.0;
+    draw->AddLine(S(b.xmin, y0), S(b.xmax, y0), IM_COL32(120, 120, 130, 200), 1.4f);
+    const int N = std::max(64, std::min((int)w, 1200));
+    ImVec2 prev; bool have_prev = false;
+    double prevf = 0.0; bool prevok = false;
+    for (int i = 0; i <= N; ++i) {
+      const double x = b.xmin + (b.xmax - b.xmin) * (double)i / N;
+      double f = 0.0;
+      State s = app.current; resize_state(s, app.state_names.size());
+      set_state_at(s, ix, x);
+      const bool ok = eval_phase_component(app, s, ix, &f, err, sizeof(err)) && std::isfinite(f);
+      if (ok) {
+        const ImVec2 cur = S(x, f);
+        if (have_prev) draw->AddLine(prev, cur, IM_COL32(255, 170, 70, 235), 2.0f);
+        prev = cur; have_prev = true;
+        /* equilibrium where f changes sign */
+        if (prevok && ((prevf <= 0 && f >= 0) || (prevf >= 0 && f <= 0))) {
+          const double xr = x; /* approximate root location */
+          const bool stable = (prevf > 0 && f < 0); /* f decreasing through 0 */
+          const ImVec2 q = S(xr, 0.0);
+          if (stable) draw->AddCircleFilled(q, 5.0f, IM_COL32(120, 220, 135, 255));
+          else { draw->AddCircle(q, 5.0f, IM_COL32(255, 150, 80, 255), 16, 2.0f); }
+        }
+      } else have_prev = false;
+      prevf = f; prevok = ok;
+    }
+    /* flow arrows along the x-axis: sign of f pushes left/right */
+    const int A = 24;
+    for (int i = 0; i < A; ++i) {
+      const double x = b.xmin + (b.xmax - b.xmin) * (i + 0.5) / A;
+      double f = 0.0;
+      State s = app.current; resize_state(s, app.state_names.size());
+      set_state_at(s, ix, x);
+      if (!eval_phase_component(app, s, ix, &f, err, sizeof(err)) || !std::isfinite(f) || f == 0) continue;
+      const ImVec2 base = S(x, 0.0);
+      const float dir = f > 0 ? 10.0f : -10.0f;
+      draw_arrow(draw, base, ImVec2(base.x + dir, base.y), IM_COL32(150, 180, 210, 200));
+    }
+    /* live state marker */
+    const double xs = state_at(app.current, ix);
+    if (std::isfinite(xs)) draw->AddCircleFilled(S(xs, 0.0), 4.0f, IM_COL32(255, 255, 255, 255));
+    draw->AddText(ImVec2(p0.x + 12, p0.y + 12), IM_COL32(235, 235, 240, 230),
+                  "flow on a line: orange y=f(x); filled=stable, hollow=unstable eq. Click to place state.");
+  }
+
+  if (over_plot) {
+    char coord[96];
+    std::snprintf(coord, sizeof(coord), "%s=%.5g", app.state_names[ix].c_str(), mouse_data.x);
+    draw->AddText(ImVec2(io.MousePos.x + 14, io.MousePos.y + 14), IM_COL32(230, 230, 235, 240), coord);
+  }
+  draw->PopClipRect();
+}
+
 void render_phase_background(AppState &app) {
   if (app.state_names.size() < 2) return;
   app.phase_x_index = std::max(0, std::min(app.phase_x_index, static_cast<int>(app.state_names.size() - 1)));
@@ -3643,6 +4273,884 @@ void render_phase_background(AppState &app) {
   draw->PopClipRect();
 }
 
+/* PHASE-A: bifurcation diagram as a full-window background view (the same
+ * data the side-panel diagram shows, but filling the plot area). */
+/* ============================================================
+ * PHASE C: escape-time fractal view — the dynamical-systems <-> fractal
+ * bridge.
+ *
+ * Iterates the system's 2D map over a region of the plane. In
+ * ParameterSpace mode each pixel is a value of two chosen parameters
+ * (c on the plane) with the initial state fixed → a Mandelbrot-type set
+ * (the locus where the orbit stays bounded). In StateSpace mode each
+ * pixel is an initial condition with the parameters fixed → a Julia-type
+ * set. For the complex-quadratic preset z->z^2+c these are exactly the
+ * Mandelbrot and Julia sets; for any other 2D map they are the natural
+ * generalizations, computed by the same engine.
+ *
+ * Coloring: escape time (how many iterations until |state| exceeds the
+ * escape radius), with optional smooth (continuous) coloring. Points
+ * that never escape (in the set) are drawn dark.
+ * ============================================================ */
+ImU32 fractal_palette(double t) {
+  /* t in [0,1): a smooth cyclic palette (à la Ultra Fractal). */
+  const double tau = 6.2831853;
+  const int r = (int)(std::round(127.5 * (1.0 + std::sin(tau * (t + 0.00)))));
+  const int g = (int)(std::round(127.5 * (1.0 + std::sin(tau * (t + 0.33)))));
+  const int b = (int)(std::round(127.5 * (1.0 + std::sin(tau * (t + 0.67)))));
+  return IM_COL32(r, g, b, 255);
+}
+
+void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &out) {
+  if (W < 2) W = 2;
+  if (H < 2) H = 2;
+  out.assign((size_t)W * H, 0xff000000u);
+  const size_t n = app.state_names.size();
+  if (n < 2) return; /* needs a 2D plane */
+  if (app.mode != SystemMode::Map) return; /* escape-time is for maps */
+
+  const int maxit = std::max(10, app.fractal_max_iter);
+  const double R2 = app.fractal_escape_r * app.fractal_escape_r;
+  const double x0 = app.fractal_xmin, x1 = app.fractal_xmax;
+  const double y0 = app.fractal_ymin, y1 = app.fractal_ymax;
+
+  const bool param_mode = (app.fractal_mode == AppState::FractalMode::ParameterSpace);
+  const int cxi = std::max(0, std::min(app.fractal_param_cx_index, (int)app.params.size() - 1));
+  const int cyi = std::max(0, std::min(app.fractal_param_cy_index, (int)app.params.size() - 1));
+
+  /* Save params we will temporarily override (param mode). */
+  std::vector<double> saved = app.param_values;
+
+  char err[128] = {0};
+  for (int py = 0; py < H; ++py) {
+    const double b_im = y0 + (y1 - y0) * (double)py / (H - 1);
+    for (int px = 0; px < W; ++px) {
+      const double a_re = x0 + (x1 - x0) * (double)px / (W - 1);
+
+      State s = make_state_like(n, 0.0);
+      if (param_mode) {
+        /* plane = (param cx, param cy); initial state = system start */
+        for (size_t i = 0; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
+        if ((size_t)cxi < app.param_values.size()) app.param_values[(size_t)cxi] = a_re;
+        if ((size_t)cyi < app.param_values.size()) app.param_values[(size_t)cyi] = b_im;
+      } else {
+        /* plane = initial (x, y); params fixed at current values */
+        app.param_values = saved;
+        set_state_at(s, 0, a_re);
+        set_state_at(s, 1, b_im);
+        for (size_t i = 2; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
+      }
+
+      int it = 0;
+      double r2 = 0.0;
+      State cur = s;
+      for (; it < maxit; ++it) {
+        State nx{};
+        if (!step_map_state(app, cur, &nx, err, sizeof(err))) { it = maxit; break; }
+        const double xx = state_at(nx, 0), yy = state_at(nx, 1);
+        r2 = xx * xx + yy * yy;
+        if (!std::isfinite(r2) || r2 > R2) { cur = nx; ++it; break; }
+        cur = nx;
+      }
+
+      uint32_t color = 0xff101014u; /* "in the set" */
+      if (it < maxit && r2 > R2) {
+        double mu = it;
+        if (app.fractal_smooth && r2 > 1.0) {
+          /* continuous (smooth) iteration count */
+          mu = it + 1.0 - std::log(std::log(std::sqrt(r2))) / std::log(2.0);
+        }
+        const double t = std::fmod(mu * 0.04, 1.0);
+        color = fractal_palette(t < 0 ? t + 1.0 : t);
+      }
+      out[(size_t)py * W + px] = color;
+    }
+  }
+  app.param_values = saved; /* restore */
+  sync_param_values(app);
+}
+
+void render_fractal_background(AppState &app) {
+  const float w = (float)app.window_width, h = (float)app.window_height;
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), IM_COL32(10, 10, 14, 255));
+
+  if (app.state_names.size() < 2 || app.mode != SystemMode::Map) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(220, 220, 230, 230),
+                  "Fractal view needs a 2D MAP. Load the 'Complex quadratic' preset");
+    draw->AddText(ImVec2(20, 66), IM_COL32(220, 220, 230, 230),
+                  "(Mandelbrot/Julia), or any 2D map in map mode.");
+    return;
+  }
+
+  /* init view once from the configured window */
+  if (!app.fractal_view_init) {
+    app.fractal_view_init = true;
+    app.fractal_dirty = true;
+  }
+
+  /* interaction: pan/zoom the complex window; mark dirty to recompute */
+  ImGuiIO &io = ImGui::GetIO();
+  if (!io.WantCaptureMouse) {
+    auto invx = [&](float pxf){ return app.fractal_xmin + (double)pxf / w * (app.fractal_xmax - app.fractal_xmin); };
+    auto invy = [&](float pyf){ return app.fractal_ymin + (double)pyf / h * (app.fractal_ymax - app.fractal_ymin); };
+    if (io.MouseWheel != 0.0f) {
+      const double mx = invx(io.MousePos.x), my = invy(io.MousePos.y);
+      const double f = std::pow(0.8, (double)io.MouseWheel);
+      app.fractal_xmin = mx + (app.fractal_xmin - mx) * f;
+      app.fractal_xmax = mx + (app.fractal_xmax - mx) * f;
+      app.fractal_ymin = my + (app.fractal_ymin - my) * f;
+      app.fractal_ymax = my + (app.fractal_ymax - my) * f;
+      app.fractal_dirty = true;
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      const double ddx = (double)io.MouseDelta.x / w * (app.fractal_xmax - app.fractal_xmin);
+      const double ddy = (double)io.MouseDelta.y / h * (app.fractal_ymax - app.fractal_ymin);
+      app.fractal_xmin -= ddx; app.fractal_xmax -= ddx;
+      app.fractal_ymin -= ddy; app.fractal_ymax -= ddy;
+      app.fractal_dirty = true;
+    }
+    /* In Julia mode, right-drag picks the constant c from the plane and
+     * recomputes — a lovely way to explore the Mandelbrot/Julia link. */
+  }
+
+  /* (re)compute the image at a capped resolution for responsiveness.
+   * Debounce: a view change (dirty) waits a few still frames before the
+   * expensive recompute, so dragging/zooming stays smooth instead of
+   * recomputing every frame (which looked like a freeze). A missing or
+   * resized texture forces an immediate compute. */
+  const int CW = std::min(app.window_width, 900);
+  const int CH = std::min(app.window_height, 700);
+  const bool force = (app.fractal_tex == 0 || app.fractal_tex_w != CW || app.fractal_tex_h != CH);
+  if (app.fractal_dirty) { app.fractal_settle = 6; app.fractal_dirty = false; }
+  bool do_compute = force;
+  if (app.fractal_settle > 0) { if (--app.fractal_settle == 0) do_compute = true; }
+  if (do_compute) {
+    std::vector<uint32_t> img;
+    compute_fractal_image(app, CW, CH, img);
+    if (app.fractal_tex == 0) glGenTextures(1, &app.fractal_tex);
+    glBindTexture(GL_TEXTURE_2D, app.fractal_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    app.fractal_tex_w = CW; app.fractal_tex_h = CH;
+  }
+
+  if (app.fractal_tex != 0)
+    draw->AddImage((ImTextureID)(uintptr_t)app.fractal_tex, ImVec2(0, 0), ImVec2(w, h));
+
+  const char *mode = app.fractal_mode == AppState::FractalMode::ParameterSpace
+                         ? "parameter space (Mandelbrot-type: orbit of the start point)"
+                         : "state space (Julia-type: sweeping the initial condition)";
+  char hud[256];
+  std::snprintf(hud, sizeof(hud), "Fractal — %s   |  re [%.4g, %.4g]  im [%.4g, %.4g]  iters %d",
+                mode, app.fractal_xmin, app.fractal_xmax, app.fractal_ymin, app.fractal_ymax, app.fractal_max_iter);
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  if (!io.WantCaptureMouse)
+    draw->AddText(ImVec2(14, h - 24), IM_COL32(150, 150, 160, 200),
+                  "drag: pan   wheel: zoom   (set mode/params/iterations in the Setup tab)");
+}
+
+/* ============================================================
+ * PHASE B/C: basins of attraction.
+ * Integrate from a grid of initial conditions over the current 2D view;
+ * color each pixel by which attractor its trajectory settles onto
+ * (attractors discovered automatically by clustering endpoints). The
+ * basin boundaries are the interesting object — often fractal (Newton's
+ * method, forced oscillators). Works for both ODEs (one integrator step
+ * via step_state) and maps (one iteration).
+ * ============================================================ */
+ImU32 basin_color(int label, int nlabels, float speed, bool shade) {
+  if (label < 0) return IM_COL32(8, 8, 12, 255); /* diverged / none */
+  /* distinct hues around the wheel */
+  const double h = nlabels > 0 ? (double)label / std::max(1, nlabels) : 0.0;
+  const double H = h * 6.0;
+  const int i = (int)H; const double f = H - i;
+  double r, g, b;
+  const double q = 1 - f, t = f;
+  switch (i % 6) {
+    case 0: r=1; g=t; b=0; break;
+    case 1: r=q; g=1; b=0; break;
+    case 2: r=0; g=1; b=t; break;
+    case 3: r=0; g=q; b=1; break;
+    case 4: r=t; g=0; b=1; break;
+    default: r=1; g=0; b=q; break;
+  }
+  float br = shade ? (0.35f + 0.65f * std::max(0.0f, std::min(1.0f, speed))) : 1.0f;
+  return IM_COL32((int)(r * 255 * br), (int)(g * 255 * br), (int)(b * 255 * br), 255);
+}
+
+void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out) {
+  if (W < 2) W = 2;
+  if (H < 2) H = 2;
+  out.assign((size_t)W * H, 0xff000000u);
+  const size_t n = app.state_names.size();
+  if (n < 2) return;
+
+  app.phase_x_index = std::max(0, std::min(app.phase_x_index, (int)n - 1));
+  app.phase_y_index = std::max(0, std::min(app.phase_y_index, (int)n - 1));
+  const size_t ix = (size_t)app.phase_x_index, iy = (size_t)app.phase_y_index;
+  PlotBounds b = sanitize_bounds(current_phase_bounds(app, ix, iy));
+
+  /* advance(x,y): set the two plane coords on a copy of the start state,
+   * step once, read them back. Other state dims are held at their start
+   * values (the basin is a 2D slice of the full state space).
+   *
+   * IMPORTANT: force a cheap fixed-step method during the grid sweep. The
+   * adaptive integrators (RKF45/DOPRI45) can take many internal substeps
+   * per call, which — multiplied by thousands of steps over hundreds of
+   * thousands of cells — would hang the UI. RK4 with the current dt is
+   * accurate enough for basin classification. Saved/restored around the
+   * sweep. */
+  const Integrator saved_integrator = app.integrator;
+  if (app.mode == SystemMode::ODE &&
+      (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45))
+    app.integrator = Integrator::RK4;
+
+  char err[128] = {0};
+  bool eval_err = false;
+  auto advance = [&](double x, double y, double *nx, double *ny) -> bool {
+    State s = app.start;
+    resize_state(s, n);
+    set_state_at(s, ix, x);
+    set_state_at(s, iy, y);
+    State out_s{};
+    if (!step_state(app, s, &out_s, err, sizeof(err))) { eval_err = true; return false; }
+    *nx = state_at(out_s, ix);
+    *ny = state_at(out_s, iy);
+    return true;
+  };
+
+  dynsys::analysis::BasinOptions opt;
+  opt.xmin = b.xmin; opt.xmax = b.xmax; opt.ymin = b.ymin; opt.ymax = b.ymax;
+  opt.width = W; opt.height = H;
+  opt.max_steps = std::max(50, app.basin_steps);
+  opt.cluster_tol = app.basin_cluster_tol;
+  opt.settle_tol = (app.mode == SystemMode::Map) ? 1e-6 : 1e-5;
+
+  dynsys::analysis::BasinResult R = dynsys::analysis::compute_basins(advance, opt);
+  app.integrator = saved_integrator; /* restore the user's choice */
+  app.basin_attractor_count = (int)R.attractors.size();
+  if (!R.ok) return;
+  const int nl = (int)R.attractors.size();
+  for (int j = 0; j < H; ++j)
+    for (int i = 0; i < W; ++i) {
+      const size_t idx = (size_t)j * W + i;
+      out[idx] = basin_color(R.cell_attractor[idx], nl, R.cell_speed[idx], app.basin_shade_speed);
+    }
+}
+
+void render_basin_background(AppState &app) {
+  const float w = (float)app.window_width, h = (float)app.window_height;
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), IM_COL32(10, 10, 14, 255));
+  if (app.state_names.size() < 2) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(220, 220, 230, 230),
+                  "Basins need a system with >= 2 state variables.");
+    return;
+  }
+
+  /* pan/zoom reuse the phase bounds so basins and the phase portrait share
+   * a coordinate frame; any view change marks the image dirty. */
+  const size_t ix = (size_t)app.phase_x_index, iy = (size_t)app.phase_y_index;
+  PlotBounds b = sanitize_bounds(current_phase_bounds(app, ix, iy));
+  ImGuiIO &io = ImGui::GetIO();
+  if (!io.WantCaptureMouse) {
+    const ImVec2 p0(0, 0);
+    const Point2 m = screen_to_plot(b, p0, w, h, io.MousePos);
+    if (io.MouseWheel != 0.0f) { zoom_phase_bounds(app, b, m, std::pow(0.8, (double)io.MouseWheel)); app.basin_dirty = true; }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      const double ddx = (double)io.MouseDelta.x / w * (b.xmax - b.xmin);
+      const double ddy = (double)io.MouseDelta.y / h * (b.ymax - b.ymin);
+      pan_phase_bounds(app, b, -ddx, ddy);
+      app.basin_dirty = true;
+    }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { app.phase_bounds_valid = false; app.basin_dirty = true; }
+  }
+
+  const int CW = std::min(app.window_width, 700);
+  const int CH = std::min(app.window_height, 560);
+  const bool bforce = (app.basin_tex == 0 || app.basin_tex_w != CW || app.basin_tex_h != CH);
+  if (app.basin_dirty) { app.basin_settle = 6; app.basin_dirty = false; }
+  bool bcompute = bforce;
+  if (app.basin_settle > 0) { if (--app.basin_settle == 0) bcompute = true; }
+  if (bcompute) {
+    std::vector<uint32_t> img;
+    compute_basin_image(app, CW, CH, img);
+    if (app.basin_tex == 0) glGenTextures(1, &app.basin_tex);
+    glBindTexture(GL_TEXTURE_2D, app.basin_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    app.basin_tex_w = CW; app.basin_tex_h = CH;
+    app.basin_dirty = false;
+  }
+  if (app.basin_tex != 0)
+    draw->AddImage((ImTextureID)(uintptr_t)app.basin_tex, ImVec2(0, 0), ImVec2(w, h));
+
+  char hud[256];
+  std::snprintf(hud, sizeof(hud),
+                "Basins of attraction — %d basins   |  %s vs %s   (each color = one attractor; brightness = convergence speed)",
+                app.basin_attractor_count, app.state_names[ix].c_str(), app.state_names[iy].c_str());
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  if (!io.WantCaptureMouse)
+    draw->AddText(ImVec2(14, h - 24), IM_COL32(150, 150, 160, 200),
+                  "drag: pan   wheel: zoom   double-click: reset   (settings in the Setup tab)");
+}
+
+/* ============================================================
+ * PHASE B: 2-parameter scan ("shrimp" map).
+ * Sweep two parameters over a grid; at each (p1,p2) estimate the largest
+ * Lyapunov exponent (renormalized shadow orbit) and color by it. Periodic
+ * windows (lambda < 0) form the characteristic shrimp shapes embedded in
+ * the chaotic sea (lambda > 0). Works for ODEs (RK4 forced, like basins)
+ * and maps.
+ * ============================================================ */
+ImU32 scan_color(double lyap, double lo, double hi) {
+  if (!std::isfinite(lyap)) return IM_COL32(0, 0, 0, 255);
+  if (lyap < 0) {
+    /* periodic: cool, darker for more strongly stable */
+    double t = (lo < 0) ? (lyap / lo) : 0.0; /* 0..1, 1 = most negative */
+    t = std::max(0.0, std::min(1.0, t));
+    int v = (int)(40 + 150 * (1.0 - t));
+    return IM_COL32(v / 3, v / 2, v, 255); /* blue-ish, dark when stable */
+  }
+  /* chaotic: warm, brighter for larger exponent */
+  double t = (hi > 0) ? (lyap / hi) : 0.0;
+  t = std::max(0.0, std::min(1.0, t));
+  int r = (int)(160 + 95 * t), g = (int)(90 + 120 * t), b = (int)(30 * (1.0 - t));
+  return IM_COL32(r, g, b, 255);
+}
+
+void compute_scan_image(AppState &app, int W, int H, std::vector<uint32_t> &out) {
+  if (W < 2) W = 2;
+  if (H < 2) H = 2;
+  out.assign((size_t)W * H, 0xff000000u);
+  const size_t dim = app.state_names.size();
+  if (dim == 0 || app.params.size() < 2) return;
+
+  const int pxi = std::max(0, std::min(app.scan_px_index, (int)app.params.size() - 1));
+  const int pyi = std::max(0, std::min(app.scan_py_index, (int)app.params.size() - 1));
+  const double leps = app.lyapunov_epsilon > 0 ? app.lyapunov_epsilon : 1e-8;
+  const int transient = std::max(50, app.scan_transient);
+  const int iters = std::max(100, app.scan_iterations);
+
+  /* force fixed-step for ODEs (adaptive would hang per cell) */
+  const Integrator saved_integrator = app.integrator;
+  if (app.mode == SystemMode::ODE &&
+      (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45))
+    app.integrator = Integrator::RK4;
+  const std::vector<double> saved_params = app.param_values;
+
+  std::vector<float> ly((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
+  double lo = 1e300, hi = -1e300;
+  char err[128] = {0};
+
+  for (int j = 0; j < H; ++j) {
+    const double py = app.scan_ymin + (app.scan_ymax - app.scan_ymin) * (double)j / (H - 1);
+    for (int i = 0; i < W; ++i) {
+      const double px = app.scan_xmin + (app.scan_xmax - app.scan_xmin) * (double)i / (W - 1);
+      if ((size_t)pxi < app.param_values.size()) app.param_values[(size_t)pxi] = px;
+      if ((size_t)pyi < app.param_values.size()) app.param_values[(size_t)pyi] = py;
+
+      State s = app.start; resize_state(s, dim);
+      bool bad = false;
+      for (int k = 0; k < transient; ++k) {
+        State nx{};
+        if (!step_state(app, s, &nx, err, sizeof(err))) { bad = true; break; }
+        s = nx;
+      }
+      if (bad) { ly[(size_t)j * W + i] = std::numeric_limits<float>::quiet_NaN(); continue; }
+      State shadow = s; resize_state(shadow, dim);
+      shadow.v[0] += leps;
+      double ly_sum = 0.0; long ly_n = 0;
+      for (int k = 0; k < iters; ++k) {
+        State n1{}, n2{};
+        if (!step_state(app, s, &n1, err, sizeof(err))) { bad = true; break; }
+        if (!step_state(app, shadow, &n2, err, sizeof(err))) { bad = true; break; }
+        double d2 = 0.0;
+        for (size_t q = 0; q < dim; ++q) { const double d = state_at(n2, q) - state_at(n1, q); d2 += d * d; }
+        const double dist = std::sqrt(d2);
+        if (dist > 1e-300 && std::isfinite(dist)) {
+          ly_sum += std::log(dist / leps); ly_n++;
+          const double sc = leps / dist;
+          shadow = make_state_like(dim, n1.t);
+          for (size_t q = 0; q < dim; ++q) {
+            const double d = state_at(n2, q) - state_at(n1, q);
+            set_state_at(shadow, q, state_at(n1, q) + d * sc);
+          }
+        }
+        s = n1;
+      }
+      double val = std::numeric_limits<float>::quiet_NaN();
+      if (!bad && ly_n > 0) {
+        const double dt_factor = (app.mode == SystemMode::Map) ? 1.0 : app.dt;
+        val = ly_sum / (ly_n * (dt_factor > 0 ? dt_factor : 1.0));
+        if (std::isfinite(val)) { lo = std::min(lo, val); hi = std::max(hi, val); }
+      }
+      ly[(size_t)j * W + i] = (float)val;
+    }
+  }
+  app.param_values = saved_params; sync_param_values(app);
+  app.integrator = saved_integrator;
+  if (lo > hi) { lo = -1; hi = 1; }
+  app.scan_lyap_min = lo; app.scan_lyap_max = hi;
+  for (int idx = 0; idx < W * H; ++idx)
+    out[(size_t)idx] = scan_color(ly[(size_t)idx], lo, hi);
+}
+
+void render_scan_background(AppState &app) {
+  const float w = (float)app.window_width, h = (float)app.window_height;
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), IM_COL32(10, 10, 14, 255));
+  if (app.params.size() < 2) {
+    draw->AddText(ImVec2(20, 48), IM_COL32(220, 220, 230, 230),
+                  "2-parameter scan needs a system with >= 2 parameters.");
+    draw->AddText(ImVec2(20, 66), IM_COL32(180, 180, 190, 220),
+                  "Try the Henon or Tinkerbell map, or add a second parameter.");
+    return;
+  }
+
+  if (!app.scan_view_init) {
+    /* default the ranges to the two params' declared [min,max] */
+    const int pxi = std::max(0, std::min(app.scan_px_index, (int)app.params.size() - 1));
+    const int pyi = std::max(0, std::min(app.scan_py_index, (int)app.params.size() - 1));
+    if (app.params[pxi].has_range) { app.scan_xmin = app.params[pxi].min_value; app.scan_xmax = app.params[pxi].max_value; }
+    if (app.params[pyi].has_range) { app.scan_ymin = app.params[pyi].min_value; app.scan_ymax = app.params[pyi].max_value; }
+    app.scan_view_init = true; app.scan_dirty = true;
+  }
+
+  /* pan/zoom the parameter window */
+  ImGuiIO &io = ImGui::GetIO();
+  if (!io.WantCaptureMouse) {
+    auto invx = [&](float pxf){ return app.scan_xmin + (double)pxf / w * (app.scan_xmax - app.scan_xmin); };
+    auto invy = [&](float pyf){ return app.scan_ymin + (double)(h - pyf) / h * (app.scan_ymax - app.scan_ymin); };
+    if (io.MouseWheel != 0.0f) {
+      const double mx = invx(io.MousePos.x), my = invy(io.MousePos.y);
+      const double f = std::pow(0.8, (double)io.MouseWheel);
+      app.scan_xmin = mx + (app.scan_xmin - mx) * f; app.scan_xmax = mx + (app.scan_xmax - mx) * f;
+      app.scan_ymin = my + (app.scan_ymin - my) * f; app.scan_ymax = my + (app.scan_ymax - my) * f;
+      app.scan_dirty = true;
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      const double ddx = (double)io.MouseDelta.x / w * (app.scan_xmax - app.scan_xmin);
+      const double ddy = (double)io.MouseDelta.y / h * (app.scan_ymax - app.scan_ymin);
+      app.scan_xmin -= ddx; app.scan_xmax -= ddx;
+      app.scan_ymin += ddy; app.scan_ymax += ddy;
+      app.scan_dirty = true;
+    }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { app.scan_view_init = false; app.scan_dirty = true; }
+  }
+
+  /* scans are expensive — keep the grid modest and debounce recompute */
+  const int CW = std::min(app.window_width, 480);
+  const int CH = std::min(app.window_height, 380);
+  const bool sforce = (app.scan_tex == 0 || app.scan_tex_w != CW || app.scan_tex_h != CH);
+  if (app.scan_dirty) { app.scan_settle = 8; app.scan_dirty = false; }
+  bool scompute = sforce;
+  if (app.scan_settle > 0) { if (--app.scan_settle == 0) scompute = true; }
+  if (scompute) {
+    std::vector<uint32_t> img;
+    compute_scan_image(app, CW, CH, img);
+    if (app.scan_tex == 0) glGenTextures(1, &app.scan_tex);
+    glBindTexture(GL_TEXTURE_2D, app.scan_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    app.scan_tex_w = CW; app.scan_tex_h = CH;
+    app.scan_dirty = false;
+  }
+  if (app.scan_tex != 0)
+    draw->AddImage((ImTextureID)(uintptr_t)app.scan_tex, ImVec2(0, 0), ImVec2(w, h));
+
+  const int pxi = std::max(0, std::min(app.scan_px_index, (int)app.params.size() - 1));
+  const int pyi = std::max(0, std::min(app.scan_py_index, (int)app.params.size() - 1));
+  char hud[320];
+  std::snprintf(hud, sizeof(hud),
+                "2-parameter scan (largest Lyapunov)  |  x=%s [%.3g,%.3g]  y=%s [%.3g,%.3g]  |  lambda in [%.3f, %.3f]",
+                app.params[pxi].name.c_str(), app.scan_xmin, app.scan_xmax,
+                app.params[pyi].name.c_str(), app.scan_ymin, app.scan_ymax,
+                app.scan_lyap_min, app.scan_lyap_max);
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
+                "blue/dark = periodic (shrimps);  warm/bright = chaotic.  drag: pan  wheel: zoom");
+}
+
+/* ============================================================
+ * PHASE C+: the "3D bridge" — Mandelbrot set + bifurcation diagram in one
+ * 3D scene.
+ *
+ * The deep fact being visualized: the logistic map x -> r x(1-x) and the
+ * complex map z -> z^2 + c are conjugate, so the logistic period-doubling
+ * cascade corresponds exactly to the real-axis ("needle") of the
+ * Mandelbrot set. We draw the Mandelbrot set lying flat in the world x-z
+ * plane (re -> x, im -> z) at height y=0, and the logistic bifurcation
+ * diagram rising in world-y above the real axis (im=0 line). Where a
+ * Mandelbrot bulb sits on the real axis, the bifurcation diagram shows
+ * the matching period — the same cascade seen two ways.
+ *
+ * Geometry is built once into a dedicated point-cloud VBO and rendered
+ * with the existing camera (drag-rotate / wheel-zoom).
+ *
+ * Coordinate mapping (world units, roughly in [-25,25] like the attractor
+ * scenes): the Mandelbrot c-plane re in [-2.2, 0.7] -> x, im in
+ * [-1.2,1.2] -> z; logistic r in [2.6, 4.0] mapped onto the same real-axis
+ * span as the Mandelbrot needle so the cascades align; attractor x in
+ * [0,1] -> world-y * bridge_height.
+ * ============================================================ */
+namespace bridge_detail {
+/* Mandelbrot escape time from z0 = 0; returns iters (maxit if bounded). */
+inline int mandel_escape(double cre, double cim, int maxit, double R2) {
+  double x = 0, y = 0;
+  int it = 0;
+  for (; it < maxit; ++it) {
+    const double nx = x * x - y * y + cre;
+    const double ny = 2 * x * y + cim;
+    x = nx; y = ny;
+    if (x * x + y * y > R2) { ++it; break; }
+  }
+  return it;
+}
+}  // namespace bridge_detail
+
+void build_bridge_geometry(AppState &app) {
+  std::vector<Point> pts;
+  std::vector<float> cols;
+  pts.reserve(200000);
+  cols.reserve(600000);
+
+  /* world mapping helpers */
+  const double re_lo = -2.2, re_hi = 0.7;
+  const double im_lo = -1.2, im_hi = 1.2;
+  const double WX = 44.0; /* world width across re range */
+  const double WZ = 38.0; /* world depth across im range */
+  auto wx = [&](double re) { return (float)((re - re_lo) / (re_hi - re_lo) * WX - WX * 0.5); };
+  auto wz = [&](double im) { return (float)((im - im_lo) / (im_hi - im_lo) * WZ - WZ * 0.5); };
+
+  /* ---- Mandelbrot set in the y=0 plane ---- */
+  if (app.bridge_show_mandelbrot) {
+    const int RES = std::max(80, app.bridge_mandel_res);
+    const int maxit = 200;
+    const double R2 = 16.0;
+    for (int j = 0; j < RES; ++j) {
+      const double im = im_lo + (im_hi - im_lo) * j / (RES - 1);
+      for (int i = 0; i < RES; ++i) {
+        const double re = re_lo + (re_hi - re_lo) * i / (RES - 1);
+        const int it = bridge_detail::mandel_escape(re, im, maxit, R2);
+        const bool inside = (it >= maxit);
+        /* draw interior solidly (deep blue) and a thin escaped halo */
+        if (inside) {
+          pts.push_back(Point{wx(re), 0.0f, wz(im)});
+          cols.push_back(0.10f); cols.push_back(0.18f); cols.push_back(0.42f);
+        } else if (it > 4 && (it % 2 == 0)) {
+          /* sparse colored exterior bands for context, near the set only */
+          const double t = std::fmod(it * 0.06, 1.0);
+          pts.push_back(Point{wx(re), 0.0f, wz(im)});
+          cols.push_back(0.15f + 0.25f * (float)t);
+          cols.push_back(0.10f + 0.20f * (float)t);
+          cols.push_back(0.25f + 0.15f * (float)t);
+        }
+      }
+    }
+  }
+
+  /* ---- logistic bifurcation diagram rising in +y above the real axis ---- *
+   * Map logistic r in [2.6,4.0] onto the Mandelbrot real-axis span where
+   * the matching cascade lives: r=2.6..4.0 corresponds (via conjugacy) to
+   * c roughly in [-0.75, -2.0]. We place the diagram along z=0 (im=0). */
+  if (app.bridge_show_bifurcation) {
+    const int slices = std::max(100, app.bridge_bif_slices);
+    const int discard = 800;
+    const int keep = std::max(20, app.bridge_bif_keep);
+    /* r in [2.6,4]; c(r) = (2r - r^2)/4 is the logistic<->quadratic map's
+     * parameter conjugacy (c = r/2 - r^2/4). This lands the cascade onto
+     * the Mandelbrot needle. */
+    auto c_of_r = [](double r) { return r / 2.0 - r * r / 4.0; };
+    for (int s = 0; s < slices; ++s) {
+      const double r = 2.6 + (4.0 - 2.6) * s / (slices - 1);
+      double x = 0.5;
+      for (int k = 0; k < discard; ++k) x = r * x * (1.0 - x);
+      const double cre = c_of_r(r);
+      for (int k = 0; k < keep; ++k) {
+        x = r * x * (1.0 - x);
+        if (!std::isfinite(x)) break;
+        /* world position: x-axis from the conjugate c, z=0 (real axis),
+         * y = attractor value lifted by bridge_height */
+        const float wy = (float)x * app.bridge_height;
+        pts.push_back(Point{wx(cre), wy, wz(0.0)});
+        /* color by height: cyan low -> yellow high */
+        const float t = (float)x;
+        cols.push_back(0.2f + 0.8f * t);
+        cols.push_back(0.7f + 0.3f * t);
+        cols.push_back(0.9f - 0.6f * t);
+      }
+    }
+  }
+
+  app.bridge_point_count = (int)pts.size();
+  if (pts.empty()) { app.bridge_built = true; return; }
+
+  if (app.bridge_vao == 0) glGenVertexArrays(1, &app.bridge_vao);
+  if (app.bridge_vbo == 0) glGenBuffers(1, &app.bridge_vbo);
+  if (app.bridge_cbo == 0) glGenBuffers(1, &app.bridge_cbo);
+  glBindVertexArray(app.bridge_vao);
+  glBindBuffer(GL_ARRAY_BUFFER, app.bridge_vbo);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(pts.size() * sizeof(Point)), pts.data(), GL_STATIC_DRAW);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Point), (void *)0);
+  glEnableVertexAttribArray(0);
+  glBindBuffer(GL_ARRAY_BUFFER, app.bridge_cbo);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(cols.size() * sizeof(float)), cols.data(), GL_STATIC_DRAW);
+  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
+  glEnableVertexAttribArray(1);
+  glBindVertexArray(0);
+  app.bridge_built = true;
+}
+
+void render_bridge_scene(AppState &app) {
+  glViewport(0, 0, app.window_width, app.window_height);
+  const float aspect = (float)app.window_width / std::max(1.0f, (float)app.window_height);
+
+  if (!app.bridge_built) build_bridge_geometry(app);
+
+  glEnable(GL_DEPTH_TEST);
+  glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glUseProgram(app.shader_program);
+
+  mat4 projection;
+  if (app.orthographic_3d) {
+    const float hh = 30.0f / std::max(app.zoom, 0.001f);
+    glm_ortho(-hh * aspect, hh * aspect, -hh, hh, -10000.0f, 10000.0f, projection);
+  } else {
+    glm_perspective(glm_rad(45.0f), aspect, 0.01f, 10000.0f, projection);
+  }
+  mat4 model, view;
+  glm_mat4_identity(model);
+  glm_mat4_identity(view);
+  vec3 tr{}; set_vec3(tr, app.center_x, app.center_y, app.center_z); glm_translate(model, tr);
+  const float es = app.orthographic_3d ? app.scene_scale : app.scene_scale * app.zoom;
+  vec3 sc{}; set_vec3(sc, es, es, es); glm_scale(model, sc);
+  vec3 ax{}; set_vec3(ax, 1, 0, 0); glm_rotate(model, glm_rad(app.angle_x), ax);
+  vec3 ay{}; set_vec3(ay, 0, 1, 0); glm_rotate(model, glm_rad(app.angle_y), ay);
+  vec3 vt{}; set_vec3(vt, 0, 0, -app.camera_distance); glm_translate(view, vt);
+  glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "model"), 1, GL_FALSE, (float *)model);
+  glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "view"), 1, GL_FALSE, (float *)view);
+  glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "projection"), 1, GL_FALSE, (float *)projection);
+
+  if (app.bridge_point_count > 0 && app.bridge_vao != 0) {
+    glBindVertexArray(app.bridge_vao);
+    glDrawArrays(GL_POINTS, 0, app.bridge_point_count);
+    glBindVertexArray(0);
+  }
+
+  /* camera interaction (same scheme as the attractor scene) */
+  ImGuiIO &io = ImGui::GetIO();
+  if (!io.WantCaptureMouse) {
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+      app.angle_y += io.MouseDelta.x * 0.4f;
+      app.angle_x += io.MouseDelta.y * 0.4f;
+    }
+    if (io.MouseWheel != 0.0f) {
+      app.zoom *= std::pow(1.15f, io.MouseWheel);
+      app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
+    }
+  }
+
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235),
+                "3D bridge — Mandelbrot set (flat) + logistic bifurcation (rising along the real axis)");
+  draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
+                "they line up because z^2+c and the logistic map are conjugate.  drag: rotate   wheel: zoom");
+}
+
+/* PHASE B+: high-quality bifurcation view.
+ * Instead of plotting each point as a faint dot (which looks sparse and
+ * loses density information), we accumulate hits into a per-pixel-column
+ * density buffer and color by log-density, so dense bands glow and the
+ * fine structure of the period-doubling cascade is visible. The view
+ * supports pan (left-drag) and zoom (wheel / +/-) over both axes, and
+ * draws tick labels. The Lyapunov curve is overlaid with its own scale. */
+void render_bifurcation_background(AppState &app) {
+  const ImVec2 p0(0.0f, 0.0f);
+  const float w = static_cast<float>(app.window_width);
+  const float h = static_cast<float>(app.window_height);
+  const ImVec2 p1(w, h);
+  ImDrawList *draw = ImGui::GetBackgroundDrawList();
+  draw->AddRectFilled(p0, p1, IM_COL32(12, 13, 17, 255));
+
+  /* PHASE B+: a small always-visible control strip inside the view, so the
+   * bifurcation diagram is one click to (re)compute without hunting in the
+   * side panel. This is also what makes "enter the view -> see something"
+   * work even before the user finds the Analysis tab. */
+  const auto &pts = app.bifurcation_points;
+  if (pts.empty()) {
+    draw->AddText(ImVec2(p0.x + 18, p0.y + 44), IM_COL32(225, 225, 235, 235),
+                  "Bifurcation view is empty. Click 'Run bifurcation' in the top toolbar to compute.");
+    draw->AddText(ImVec2(p0.x + 18, p0.y + 64), IM_COL32(190, 190, 200, 220),
+                  "For the classic period-doubling tree, load the 'Logistic map' preset, then Run.");
+    draw->AddText(ImVec2(p0.x + 18, p0.y + 84), IM_COL32(190, 190, 200, 220),
+                  "Sweep parameter & range: set them in the Analysis tab (left panel).");
+    return;
+  }
+
+  const float pad_l = 64.0f, pad_b = 40.0f, pad_t = 36.0f, pad_r = 18.0f;
+  const float plot_w = std::max(16.0f, w - pad_l - pad_r);
+  const float plot_h = std::max(16.0f, h - pad_b - pad_t);
+
+  /* data extents (full sweep) */
+  double dx_min = std::min(app.bif_start, app.bif_end);
+  double dx_max = std::max(app.bif_start, app.bif_end);
+  if (dx_max <= dx_min) dx_max = dx_min + 1.0;
+  double dy_min = DBL_MAX, dy_max = -DBL_MAX;
+  for (const auto &p : pts) if (std::isfinite(p.y)) { dy_min = std::min(dy_min, p.y); dy_max = std::max(dy_max, p.y); }
+  if (!(dy_max > dy_min)) { dy_min -= 1.0; dy_max += 1.0; }
+
+  /* initialize the interactive view window to the data extents once */
+  if (!app.bif_view_valid) {
+    const double mx = 0.02 * (dx_max - dx_min), my = 0.04 * (dy_max - dy_min);
+    app.bif_view_xmin = dx_min - mx; app.bif_view_xmax = dx_max + mx;
+    app.bif_view_ymin = dy_min - my; app.bif_view_ymax = dy_max + my;
+    app.bif_view_valid = true;
+  }
+  double vx0 = app.bif_view_xmin, vx1 = app.bif_view_xmax;
+  double vy0 = app.bif_view_ymin, vy1 = app.bif_view_ymax;
+  if (vx1 <= vx0) vx1 = vx0 + 1e-9;
+  if (vy1 <= vy0) vy1 = vy0 + 1e-9;
+
+  auto sx = [&](double x){ return pad_l + (float)((x - vx0) / (vx1 - vx0)) * plot_w; };
+  auto sy = [&](double y){ return pad_t + plot_h - (float)((y - vy0) / (vy1 - vy0)) * plot_h; };
+  auto inv_x = [&](float px){ return vx0 + (double)(px - pad_l) / plot_w * (vx1 - vx0); };
+  auto inv_y = [&](float py){ return vy0 + (double)(pad_t + plot_h - py) / plot_h * (vy1 - vy0); };
+
+  /* ---- interaction (when not over a panel) ---- */
+  ImGuiIO &io = ImGui::GetIO();
+  const bool over = !io.WantCaptureMouse;
+  if (over) {
+    const double mx = inv_x(io.MousePos.x), my = inv_y(io.MousePos.y);
+    if (io.MouseWheel != 0.0f) {
+      const double f = std::pow(0.85, (double)io.MouseWheel);
+      vx0 = mx + (vx0 - mx) * f; vx1 = mx + (vx1 - mx) * f;
+      vy0 = my + (vy0 - my) * f; vy1 = my + (vy1 - my) * f;
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      const double ddx = (double)io.MouseDelta.x / plot_w * (vx1 - vx0);
+      const double ddy = -(double)io.MouseDelta.y / plot_h * (vy1 - vy0);
+      vx0 -= ddx; vx1 -= ddx; vy0 += ddy; vy1 += ddy;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)) {
+      const double cx=0.5*(vx0+vx1), cy=0.5*(vy0+vy1), f=0.83;
+      vx0=cx+(vx0-cx)*f; vx1=cx+(vx1-cx)*f; vy0=cy+(vy0-cy)*f; vy1=cy+(vy1-cy)*f;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)) {
+      const double cx=0.5*(vx0+vx1), cy=0.5*(vy0+vy1), f=1.20;
+      vx0=cx+(vx0-cx)*f; vx1=cx+(vx1-cx)*f; vy0=cy+(vy0-cy)*f; vy1=cy+(vy1-cy)*f;
+    }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) app.bif_view_valid = false;
+    app.bif_view_xmin=vx0; app.bif_view_xmax=vx1; app.bif_view_ymin=vy0; app.bif_view_ymax=vy1;
+  }
+
+  /* ---- density accumulation into an integer grid ---- */
+  const int GW = std::max(1, (int)plot_w);
+  const int GH = std::max(1, (int)plot_h);
+  static std::vector<float> dens; /* reused buffer */
+  dens.assign((size_t)GW * GH, 0.0f);
+  float dmax = 0.0f;
+  for (const auto &p : pts) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+    if (p.x < vx0 || p.x > vx1 || p.y < vy0 || p.y > vy1) continue;
+    const int gx = (int)((p.x - vx0) / (vx1 - vx0) * (GW - 1) + 0.5);
+    const int gy = (int)((p.y - vy0) / (vy1 - vy0) * (GH - 1) + 0.5);
+    if (gx < 0 || gx >= GW || gy < 0 || gy >= GH) continue;
+    float &c = dens[(size_t)gy * GW + gx];
+    c += 1.0f;
+    if (c > dmax) dmax = c;
+  }
+
+  /* draw the density as short vertical runs per (gx,gy) cell, colored by
+   * log-density (a clean blue->cyan->white ramp). Drawing 1px rects is
+   * fine for a single frame at typical window sizes. */
+  if (dmax > 0.0f) {
+    const float inv_log = 1.0f / std::log(1.0f + dmax);
+    for (int gy = 0; gy < GH; ++gy) {
+      for (int gx = 0; gx < GW; ++gx) {
+        const float c = dens[(size_t)gy * GW + gx];
+        if (c <= 0.0f) continue;
+        const float t = std::log(1.0f + c) * inv_log; /* 0..1 */
+        /* ramp: dark blue -> cyan -> white */
+        int r, g, b;
+        if (t < 0.5f) { const float u = t / 0.5f; r = (int)(20 + 20*u); g = (int)(90 + 130*u); b = (int)(160 + 80*u); }
+        else { const float u = (t - 0.5f) / 0.5f; r = (int)(40 + 215*u); g = (int)(220 + 35*u); b = (int)(240 + 15*u); }
+        const float px = pad_l + gx;
+        const float py = pad_t + gy;
+        draw->AddRectFilled(ImVec2(px, py), ImVec2(px + 1.0f, py + 1.0f),
+                            IM_COL32(r, g, b, 255));
+      }
+    }
+  }
+
+  /* ---- axes + tick labels ---- */
+  const ImU32 axcol = IM_COL32(140, 140, 150, 200);
+  draw->AddRect(ImVec2(pad_l, pad_t), ImVec2(pad_l + plot_w, pad_t + plot_h), axcol);
+  auto nice_step = [](double range, int target){
+    double raw = range / std::max(1, target);
+    double mag = std::pow(10.0, std::floor(std::log10(raw)));
+    double n = raw / mag;
+    double s = n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10;
+    return s * mag;
+  };
+  const double xs = nice_step(vx1 - vx0, 8);
+  for (double xv = std::ceil(vx0 / xs) * xs; xv <= vx1; xv += xs) {
+    const float X = sx(xv);
+    draw->AddLine(ImVec2(X, pad_t + plot_h), ImVec2(X, pad_t + plot_h + 4), axcol);
+    char b[32]; std::snprintf(b, sizeof(b), "%.4g", xv);
+    draw->AddText(ImVec2(X - 12, pad_t + plot_h + 6), IM_COL32(190,190,200,220), b);
+  }
+  const double ys = nice_step(vy1 - vy0, 6);
+  for (double yv = std::ceil(vy0 / ys) * ys; yv <= vy1; yv += ys) {
+    const float Y = sy(yv);
+    draw->AddLine(ImVec2(pad_l - 4, Y), ImVec2(pad_l, Y), axcol);
+    char b[32]; std::snprintf(b, sizeof(b), "%.4g", yv);
+    draw->AddText(ImVec2(6, Y - 7), IM_COL32(190,190,200,220), b);
+  }
+
+  /* ---- Lyapunov overlay (own scale, zero line) ---- */
+  if (app.bif_compute_lyapunov && !app.bifurcation_lyapunov.empty()) {
+    double lo=DBL_MAX, hi=-DBL_MAX;
+    for (const auto &p : app.bifurcation_lyapunov) if (std::isfinite(p.y)) { lo=std::min(lo,p.y); hi=std::max(hi,p.y); }
+    if (std::isfinite(lo) && hi>lo) {
+      hi=std::max(hi,0.05); lo=std::min(lo,-0.05);
+      auto lyy=[&](double y){ return pad_t + plot_h - (float)((y-lo)/(hi-lo))*plot_h; };
+      const float zl = lyy(0.0);
+      draw->AddLine(ImVec2(pad_l, zl), ImVec2(pad_l + plot_w, zl), IM_COL32(160,160,160,110), 1.0f);
+      bool have=false; ImVec2 prev;
+      for (const auto &pt : app.bifurcation_lyapunov) {
+        if (!std::isfinite(pt.y)) { have=false; continue; }
+        if (pt.x < vx0 || pt.x > vx1) { have=false; continue; }
+        const ImVec2 cur(sx(pt.x), lyy(pt.y));
+        const ImU32 col = pt.y > 0 ? IM_COL32(255,110,90,235) : IM_COL32(120,230,140,235);
+        if (have) draw->AddLine(prev, cur, col, 1.6f);
+        prev = cur; have = true;
+      }
+    }
+  }
+
+  /* ---- labels ---- */
+  char title[360];
+  std::snprintf(title, sizeof(title), "Bifurcation diagram   %s (vertical)  vs  %s (horizontal)   |  %zu points",
+                app.bif_observable, app.bif_param, pts.size());
+  draw->AddText(ImVec2(pad_l, 10), IM_COL32(235, 235, 240, 235), title);
+  if (over)
+    draw->AddText(ImVec2(pad_l, pad_t + plot_h + 22),
+                  IM_COL32(150,150,160,200),
+                  "drag: pan   wheel/+/-: zoom   double-click: reset   (blue->white = density;  red Lyapunov>0 = chaos)");
+}
+
 void draw_series_plot(AppState &app, const char *title, const char *value_name, ImVec2 size) {
   ImGui::TextUnformatted(title);
   ImDrawList *draw = ImGui::GetWindowDrawList();
@@ -3699,6 +5207,81 @@ void draw_scatter_plot(const char *title, const std::vector<Point2> &points, ImV
       const float sx = p0.x + static_cast<float>((p.x - min_x) / (max_x - min_x)) * size.x;
       const float sy = p1.y - static_cast<float>((p.y - min_y) / (max_y - min_y)) * size.y;
       draw->AddCircleFilled(ImVec2(sx, sy), 1.2f, IM_COL32(255, 190, 80, 230));
+    }
+  }
+  ImGui::Dummy(size);
+}
+
+/* PHASE7: render the bifurcation (orbit) diagram, optionally with the
+ * Lyapunov-exponent curve overlaid on the same parameter axis. */
+[[maybe_unused]] void draw_bifurcation_diagram(AppState &app, ImVec2 size) {
+  ImGui::Text("bifurcation: %s vs %s  (%zu points)", app.bif_observable,
+              app.bif_param, app.bifurcation_points.size());
+  ImDrawList *draw = ImGui::GetWindowDrawList();
+  ImVec2 p0 = ImGui::GetCursorScreenPos();
+  ImVec2 p1(p0.x + size.x, p0.y + size.y);
+  draw->AddRectFilled(p0, p1, IM_COL32(16, 17, 22, 255));
+  draw->AddRect(p0, p1, IM_COL32(120, 120, 120, 200));
+
+  const auto &pts = app.bifurcation_points;
+  if (pts.empty()) {
+    draw->AddText(ImVec2(p0.x + 10, p0.y + 10), IM_COL32(200, 200, 210, 220),
+                  "press 'Run bifurcation' to compute");
+    ImGui::Dummy(size);
+    return;
+  }
+
+  double px_min = std::min(app.bif_start, app.bif_end);
+  double px_max = std::max(app.bif_start, app.bif_end);
+  if (px_max <= px_min) px_max = px_min + 1.0;
+  double py_min = DBL_MAX, py_max = -DBL_MAX;
+  for (const auto &p : pts) {
+    if (!std::isfinite(p.y)) continue;
+    py_min = std::min(py_min, p.y);
+    py_max = std::max(py_max, p.y);
+  }
+  if (!(py_max > py_min)) { py_min -= 1.0; py_max += 1.0; }
+
+  auto sx = [&](double x) {
+    return p0.x + static_cast<float>((x - px_min) / (px_max - px_min)) * size.x;
+  };
+  auto sy = [&](double y) {
+    return p1.y - static_cast<float>((y - py_min) / (py_max - py_min)) * size.y;
+  };
+
+  for (const auto &p : pts) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+    draw->AddRectFilled(ImVec2(sx(p.x), sy(p.y)),
+                        ImVec2(sx(p.x) + 1.0f, sy(p.y) + 1.0f),
+                        IM_COL32(120, 200, 255, 90));
+  }
+
+  if (app.bif_compute_lyapunov && !app.bifurcation_lyapunov.empty()) {
+    double ly_min = DBL_MAX, ly_max = -DBL_MAX;
+    for (const auto &p : app.bifurcation_lyapunov) {
+      if (!std::isfinite(p.y)) continue;
+      ly_min = std::min(ly_min, p.y);
+      ly_max = std::max(ly_max, p.y);
+    }
+    if (std::isfinite(ly_min) && ly_max > ly_min) {
+      ly_max = std::max(ly_max, 0.05);
+      ly_min = std::min(ly_min, -0.05);
+      auto lyy = [&](double y) {
+        return p1.y - static_cast<float>((y - ly_min) / (ly_max - ly_min)) * size.y;
+      };
+      const float zline = lyy(0.0);
+      draw->AddLine(ImVec2(p0.x, zline), ImVec2(p1.x, zline),
+                    IM_COL32(150, 150, 150, 120), 1.0f);
+      for (size_t i = 1; i < app.bifurcation_lyapunov.size(); ++i) {
+        const auto &a = app.bifurcation_lyapunov[i - 1];
+        const auto &b = app.bifurcation_lyapunov[i];
+        if (!std::isfinite(a.y) || !std::isfinite(b.y)) continue;
+        const ImU32 col = b.y > 0 ? IM_COL32(255, 110, 90, 230)
+                                  : IM_COL32(120, 230, 140, 230);
+        draw->AddLine(ImVec2(sx(a.x), lyy(a.y)), ImVec2(sx(b.x), lyy(b.y)), col, 1.6f);
+      }
+      draw->AddText(ImVec2(p0.x + 8, p0.y + 8), IM_COL32(235, 235, 240, 230),
+                    "red Lyapunov>0 (chaos), green<0 (stable); blue: attractor");
     }
   }
   ImGui::Dummy(size);
@@ -4183,7 +5766,7 @@ void run_equilibrium_continuation(AppState &app) {
   app.analysis_message = msg;
 }
 
-[[maybe_unused]] void run_bifurcation(AppState &app) {
+void run_bifurcation(AppState &app) {
   AppState::Param *param = find_param(app, app.bif_param);
   if (param == nullptr) {
     app.analysis_message = std::string("unknown parameter for bifurcation: ") + app.bif_param;
@@ -4195,31 +5778,160 @@ void run_equilibrium_continuation(AppState &app) {
   node_t *obs = parse_expression_or_fail(&tmp_arena, app.bif_observable, "bifurcation observable", &err_msg);
   if (obs == nullptr) { app.analysis_message = err_msg; arena_destroy(&tmp_arena); return; }
   app.bifurcation_points.clear();
+  app.bifurcation_lyapunov.clear();
   const double old_value = param->value;
+  /* Force a cheap fixed-step method for the sweep (adaptive integrators
+   * would take many substeps per step over hundreds of slices and hang). */
+  const Integrator saved_integrator = app.integrator;
+  if (app.mode == SystemMode::ODE &&
+      (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45))
+    app.integrator = Integrator::RK4;
   char err[256] = {0};
   const int slices = std::max(2, app.bif_slices);
+  const size_t dim = app.state_names.size();
+  const double leps = app.lyapunov_epsilon > 0 ? app.lyapunov_epsilon : 1e-8;
   for (int i = 0; i < slices; ++i) {
     const double u = static_cast<double>(i) / static_cast<double>(slices - 1);
     param->value = app.bif_start + u * (app.bif_end - app.bif_start);
     State s = app.start;
     for (int j = 0; j < app.bif_discard; ++j) {
       State next{};
-      if (!step_state(app, s, &next, err, sizeof(err))) { app.analysis_message = err; param->value = old_value; arena_destroy(&tmp_arena); return; }
+      if (!step_state(app, s, &next, err, sizeof(err))) { app.analysis_message = err; param->value = old_value; app.integrator = saved_integrator; arena_destroy(&tmp_arena); return; }
       s = next;
+    }
+    /* Lyapunov accumulation via a renormalized shadow orbit, run over the
+     * same kept iterations that build the orbit diagram. */
+    double ly_sum = 0.0;
+    long ly_n = 0;
+    /* ODE local-maxima detection window (for the bifurcation section) */
+    double obs_w0 = 0, obs_w1 = 0, obs_w2 = 0;
+    int obs_have = 0;
+    State shadow = s;
+    if (app.bif_compute_lyapunov && dim > 0) {
+      resize_state(shadow, dim);
+      shadow.v[0] += leps;
     }
     for (int j = 0; j < app.bif_keep; ++j) {
       State next{};
-      if (!step_state(app, s, &next, err, sizeof(err))) { app.analysis_message = err; param->value = old_value; arena_destroy(&tmp_arena); return; }
+      if (!step_state(app, s, &next, err, sizeof(err))) { app.analysis_message = err; param->value = old_value; app.integrator = saved_integrator; arena_destroy(&tmp_arena); return; }
+      if (app.bif_compute_lyapunov && dim > 0) {
+        State nshadow{};
+        if (step_state(app, shadow, &nshadow, err, sizeof(err))) {
+          double d2 = 0.0;
+          for (size_t k = 0; k < dim; ++k) {
+            const double d = state_at(nshadow, k) - state_at(next, k);
+            d2 += d * d;
+          }
+          const double dist = std::sqrt(d2);
+          if (dist > 1e-300 && std::isfinite(dist)) {
+            ly_sum += std::log(dist / leps);
+            ly_n += 1;
+            /* renormalize shadow back to leps along the separation dir */
+            const double scale = leps / dist;
+            shadow = make_state_like(dim, next.t);
+            for (size_t k = 0; k < dim; ++k) {
+              const double d = state_at(nshadow, k) - state_at(next, k);
+              set_state_at(shadow, k, state_at(next, k) + d * scale);
+            }
+          }
+        }
+      }
       s = next;
       double val = 0.0;
-      if (eval_expr_at(app, obs, s, &val, err, sizeof(err))) {
+      if (!eval_expr_at(app, obs, s, &val, err, sizeof(err))) continue;
+      if (app.mode == SystemMode::Map) {
+        /* maps: every iterate is an attractor sample (the classic tree) */
         app.bifurcation_points.push_back(Point2{param->value, val});
+      } else {
+        /* ODEs: raw time-steps trace the whole orbit and smear into a band
+         * (or a single horizontal line at a fixed point). The standard
+         * bifurcation diagram for a flow records a Poincare-style section
+         * — here, the LOCAL MAXIMA of the observable. We keep a 3-sample
+         * window and emit the middle when it's a peak. */
+        obs_w0 = obs_w1; obs_w1 = obs_w2; obs_w2 = val;
+        obs_have = std::min(obs_have + 1, 3);
+        if (obs_have == 3 && obs_w1 > obs_w0 && obs_w1 >= obs_w2)
+          app.bifurcation_points.push_back(Point2{param->value, obs_w1});
       }
     }
+    if (app.bif_compute_lyapunov && ly_n > 0)
+      app.bifurcation_lyapunov.push_back(Point2{param->value, ly_sum / static_cast<double>(ly_n)});
   }
   param->value = old_value;
+  app.integrator = saved_integrator; /* restore the user's solver choice */
   arena_destroy(&tmp_arena);
+  app.bif_view_valid = false; /* refit the diagram view to the new sweep */
   app.analysis_message = "bifurcation scan completed";
+}
+
+/* PHASE B: compute the full Lyapunov spectrum + Kaplan-Yorke dimension
+ * for the current system at its current parameters, starting from the
+ * current state. Builds a Model whose vector_field is the ODE rhs (for
+ * ODEs) or the map's next-state (for maps), with the Jacobian supplied by
+ * forward-mode AD over the appropriate program set. */
+void run_lyapunov_spectrum(AppState &app) {
+  const size_t n = app.state_names.size();
+  if (n == 0) { app.lyap_spectrum_msg = "no state variables"; app.lyap_spectrum_ready = false; return; }
+  const bool is_map = (app.mode == SystemMode::Map);
+  const auto &progs = is_map ? app.next_equation_programs : app.equation_programs;
+  if (progs.size() != n) { app.lyap_spectrum_msg = "equations not compiled"; app.lyap_spectrum_ready = false; return; }
+
+  dynsys::analysis::Model model;
+  model.n = n;
+  model.vector_field = [&app, n, is_map](const double *x, double, double *f_out, std::string *err) -> bool {
+    State s = make_state_like(n, app.current.t);
+    for (size_t i = 0; i < n; ++i) set_state_at(s, i, x[i]);
+    char buf[256] = {0};
+    if (is_map) {
+      State nx{};
+      if (!step_state(app, s, &nx, buf, sizeof(buf))) { if (err) *err = buf; return false; }
+      for (size_t i = 0; i < n; ++i) f_out[i] = state_at(nx, i);
+    } else {
+      State d{};
+      if (!eval_rhs(app, s, &d, buf, sizeof(buf))) { if (err) *err = buf; return false; }
+      for (size_t i = 0; i < n; ++i) f_out[i] = state_at(d, i);
+    }
+    return true;
+  };
+  model.jacobian_x = [&app, n, &progs](const double *x, double, double *jac_out, std::string *err) -> bool {
+    State s = make_state_like(n, app.current.t);
+    for (size_t i = 0; i < n; ++i) set_state_at(s, i, x[i]);
+    dynsys::ir::RunContext rc;
+    rc.state = s.v.data(); rc.n_state = s.v.size(); rc.t = s.t;
+    rc.params = app.param_values.data(); rc.n_params = app.param_values.size();
+    rc.defs = app.definition_programs.data(); rc.n_defs = app.definition_programs.size();
+    char buf[256] = {0};
+    for (size_t col = 0; col < n; ++col) {
+      dynsys::ir::DualSeed seed{dynsys::ir::DualSeed::Kind::State, col};
+      for (size_t row = 0; row < n; ++row) {
+        double v = 0.0, d = 0.0;
+        if (!dynsys::ir::run_dual(progs[row], rc, seed, app.ad_scratch, &v, &d, buf, sizeof(buf))) {
+          if (err) *err = buf;
+          return false;
+        }
+        jac_out[row * n + col] = d;
+      }
+    }
+    return true;
+  };
+
+  std::vector<double> x0(n);
+  for (size_t i = 0; i < n; ++i) x0[i] = state_at(app.current, i);
+
+  dynsys::analysis::LyapunovOptions opt;
+  opt.is_map = is_map;
+  opt.dt = app.dt > 0 ? app.dt : 0.01;
+  opt.transient = std::max(0, app.lyap_spec_transient);
+  opt.steps = std::max(100, app.lyap_spec_steps);
+  opt.reorth_every = 1;
+
+  dynsys::analysis::LyapunovResult r =
+      dynsys::analysis::lyapunov_spectrum(model, x0, 0.0, opt);
+  app.lyap_spectrum = r.exponents;
+  app.lyap_kaplan_yorke = r.kaplan_yorke;
+  app.lyap_spectrum_sum = r.sum;
+  app.lyap_spectrum_ready = r.ok;
+  app.lyap_spectrum_msg = r.ok ? "spectrum computed" : r.message;
 }
 
 /* PHASE6-UI: the 3D view as an ImGui panel. Renders the scene to the
@@ -4299,22 +6011,24 @@ void draw_top_toolbar(AppState &app) {
   ImGui::SameLine();
   ImGui::TextUnformatted("|"); ImGui::SameLine();
 
-  /* View switch — 3D only offered when the system is 3D. */
-  const bool can3d = system_is_3d(app);
-  if (ImGui::RadioButton("2D phase", app.active_view == AppState::ActiveView::Phase2D))
-    app.active_view = AppState::ActiveView::Phase2D;
-  ImGui::SameLine();
-  if (can3d) {
-    if (ImGui::RadioButton("3D", app.active_view == AppState::ActiveView::Scene3D))
-      app.active_view = AppState::ActiveView::Scene3D;
-  } else {
-    ImGui::BeginDisabled();
-    bool dummy = false;
-    ImGui::RadioButton("3D", dummy);
-    ImGui::EndDisabled();
-    app.active_view = AppState::ActiveView::Phase2D;
-  }
-  ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
+  /* View switch — offer only the views valid for this system. */
+  ensure_valid_view(app);
+  auto view_radio = [&](const char *label, AppState::ActiveView v) {
+    const bool ok = view_valid(app, v);
+    if (!ok) ImGui::BeginDisabled();
+    if (ImGui::RadioButton(label, app.active_view == v) && ok) app.active_view = v;
+    if (!ok) ImGui::EndDisabled();
+    ImGui::SameLine();
+  };
+  view_radio("1D", AppState::ActiveView::Line1D);
+  view_radio("2D phase", AppState::ActiveView::Phase2D);
+  view_radio("3D", AppState::ActiveView::Scene3D);
+  view_radio("bifurcation", AppState::ActiveView::Bifurcation);
+  view_radio("fractal", AppState::ActiveView::Fractal);
+  view_radio("3D bridge", AppState::ActiveView::Scene3DBridge);
+  view_radio("basins", AppState::ActiveView::Basins);
+  view_radio("param scan", AppState::ActiveView::ParamScan2D);
+  ImGui::TextUnformatted("|"); ImGui::SameLine();
 
   if (ImGui::Button(app.paused ? "Play" : "Pause")) app.paused = !app.paused;
   ImGui::SameLine();
@@ -4322,6 +6036,23 @@ void draw_top_toolbar(AppState &app) {
   ImGui::SameLine();
   if (app.active_view == AppState::ActiveView::Phase2D) {
     if (ImGui::Button("Clear orbits")) { app.phase_trajectories.clear(); app.separatrix_curves.clear(); }
+    ImGui::SameLine();
+  }
+  if (app.active_view == AppState::ActiveView::Bifurcation && !app.params.empty()) {
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::BeginCombo("##bifp", app.bif_param)) {
+      for (const auto &pr : app.params)
+        if (ImGui::Selectable(pr.name.c_str(), pr.name == app.bif_param)) {
+          std::snprintf(app.bif_param, sizeof(app.bif_param), "%s", pr.name.c_str());
+          if (pr.has_range) { app.bif_start = pr.min_value; app.bif_end = pr.max_value; app.bif_view_valid = false; }
+        }
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine(); ImGui::SetNextItemWidth(64);
+    ImGui::InputDouble("##bifs", &app.bif_start, 0, 0, "%.3g"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(64);
+    ImGui::InputDouble("##bife", &app.bif_end, 0, 0, "%.3g"); ImGui::SameLine();
+    if (ImGui::Button("Run bifurcation")) run_bifurcation(app);
     ImGui::SameLine();
   }
   ImGui::TextDisabled("  %d FPS | %s | %dD%s", app.fps, mode_name(app.mode),
@@ -4334,9 +6065,18 @@ void draw_top_toolbar(AppState &app) {
 }
 
 void draw_gui(AppState &app) {
-  /* PHASE6-UI: render the active background plot first (behind panels). */
-  if (!(system_is_3d(app) && app.active_view == AppState::ActiveView::Scene3D))
-    render_phase_background(app);
+  /* PHASE-A: render the active full-area view behind the panels. (3D is
+   * already drawn straight to the backbuffer in the main loop.) */
+  switch (app.active_view) {
+    case AppState::ActiveView::Line1D:      render_line1d_background(app); break;
+    case AppState::ActiveView::Phase2D:     render_phase_background(app); break;
+    case AppState::ActiveView::Bifurcation: render_bifurcation_background(app); break;
+    case AppState::ActiveView::Fractal:     render_fractal_background(app); break;
+    case AppState::ActiveView::Scene3DBridge: /* drawn to backbuffer in main loop */ break;
+    case AppState::ActiveView::Basins:      render_basin_background(app); break;
+    case AppState::ActiveView::ParamScan2D: render_scan_background(app); break;
+    case AppState::ActiveView::Scene3D:     /* drawn in main loop */ break;
+  }
 
   draw_top_toolbar(app);
 
@@ -4364,6 +6104,12 @@ void draw_gui(AppState &app) {
     ImGui::Text("largest Lyapunov estimate: %.6g (%lld samples)", app.lyapunov_estimate, app.lyapunov_samples);
   }
   ImGui::Separator();
+
+  /* PHASE-A: group the (previously 12) control sections into a few tabs
+   * so nothing is buried in one long scroll. Within each tab the old
+   * collapsing headers are kept. */
+  if (ImGui::BeginTabBar("control_tabs")) {
+  if (ImGui::BeginTabItem("Setup")) {
 
   /* PHASE6-UI: phase-plane controls (axes, layers, seeding) — the plot
    * itself is the window background; this drives it. Shown in 2D view. */
@@ -4443,6 +6189,106 @@ void draw_gui(AppState &app) {
     if (window != nullptr) glfwSetWindowShouldClose(window, GLFW_TRUE);
   }
 
+  /* PHASE C: fractal controls (shown when the fractal view is active). */
+  if (app.active_view == AppState::ActiveView::Fractal &&
+      app.mode == SystemMode::Map && app.state_names.size() >= 2) {
+    if (ImGui::CollapsingHeader("Fractal", ImGuiTreeNodeFlags_DefaultOpen)) {
+      int mode = (int)app.fractal_mode;
+      const char *modes[] = {"parameter space (Mandelbrot-type)", "state space (Julia-type)"};
+      if (ImGui::Combo("mode", &mode, modes, 2)) {
+        app.fractal_mode = (AppState::FractalMode)mode;
+        app.fractal_dirty = true;
+      }
+      ImGui::TextWrapped("Mandelbrot = which parameter values keep the start orbit bounded. "
+                         "Julia = which initial points stay bounded for fixed parameters. "
+                         "The logistic bifurcation diagram is the real-axis slice of this.");
+      if (app.fractal_mode == AppState::FractalMode::ParameterSpace && app.params.size() >= 1) {
+        if (ImGui::BeginCombo("re axis = param", app.params[std::min((size_t)app.fractal_param_cx_index, app.params.size()-1)].name.c_str())) {
+          for (int i = 0; i < (int)app.params.size(); ++i)
+            if (ImGui::Selectable(app.params[i].name.c_str(), i == app.fractal_param_cx_index)) { app.fractal_param_cx_index = i; app.fractal_dirty = true; }
+          ImGui::EndCombo();
+        }
+        if (app.params.size() >= 2 && ImGui::BeginCombo("im axis = param", app.params[std::min((size_t)app.fractal_param_cy_index, app.params.size()-1)].name.c_str())) {
+          for (int i = 0; i < (int)app.params.size(); ++i)
+            if (ImGui::Selectable(app.params[i].name.c_str(), i == app.fractal_param_cy_index)) { app.fractal_param_cy_index = i; app.fractal_dirty = true; }
+          ImGui::EndCombo();
+        }
+      }
+      if (ImGui::SliderInt("max iterations", &app.fractal_max_iter, 20, 2000)) app.fractal_dirty = true;
+      if (ImGui::InputDouble("escape radius", &app.fractal_escape_r, 0.5, 1.0, "%.3g")) app.fractal_dirty = true;
+      if (ImGui::Checkbox("smooth coloring", &app.fractal_smooth)) app.fractal_dirty = true;
+      if (ImGui::Button("Reset view")) {
+        app.fractal_xmin = -2.5; app.fractal_xmax = 1.0;
+        app.fractal_ymin = -1.5; app.fractal_ymax = 1.5;
+        app.fractal_dirty = true;
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Recompute")) app.fractal_dirty = true;
+      ImGui::TextDisabled("Tip: load the 'Complex quadratic' preset for the classic Mandelbrot/Julia.");
+    }
+  }
+
+  /* PHASE C+: controls for the 3D bridge scene. */
+  if (app.active_view == AppState::ActiveView::Scene3DBridge) {
+    if (ImGui::CollapsingHeader("3D bridge", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::TextWrapped("The Mandelbrot set (flat) with the logistic bifurcation diagram "
+                         "rising along its real axis. They align because z^2+c and the "
+                         "logistic map are conjugate.");
+      bool changed = false;
+      changed |= ImGui::Checkbox("show Mandelbrot", &app.bridge_show_mandelbrot);
+      ImGui::SameLine();
+      changed |= ImGui::Checkbox("show bifurcation", &app.bridge_show_bifurcation);
+      changed |= ImGui::SliderInt("Mandelbrot resolution", &app.bridge_mandel_res, 120, 700);
+      changed |= ImGui::SliderInt("bifurcation slices", &app.bridge_bif_slices, 100, 1500);
+      changed |= ImGui::SliderInt("attractor points/slice", &app.bridge_bif_keep, 20, 400);
+      changed |= ImGui::SliderFloat("bifurcation height", &app.bridge_height, 5.0f, 40.0f, "%.1f");
+      if (ImGui::Button("Rebuild bridge") || changed) app.bridge_built = false;
+      ImGui::TextDisabled("%d points. drag to rotate, wheel to zoom.", app.bridge_point_count);
+    }
+  }
+
+  /* PHASE B/C: basin-of-attraction controls. */
+  if (app.active_view == AppState::ActiveView::Basins && app.state_names.size() >= 2) {
+    if (ImGui::CollapsingHeader("Basins of attraction", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::TextWrapped("Each initial condition is integrated until it settles; pixels are "
+                         "colored by which attractor they reach. The basin boundaries are "
+                         "often fractal. Try a system with several attractors (e.g. Newton's "
+                         "method, or the Duffing oscillator).");
+      if (ImGui::SliderInt("steps per cell", &app.basin_steps, 100, 6000)) app.basin_dirty = true;
+      if (ImGui::InputDouble("cluster tolerance", &app.basin_cluster_tol, 1e-3, 1e-2, "%.1e")) app.basin_dirty = true;
+      if (ImGui::Checkbox("shade by convergence speed", &app.basin_shade_speed)) app.basin_dirty = true;
+      if (ImGui::Button("Recompute basins")) app.basin_dirty = true;
+      ImGui::TextDisabled("%d basins found. Pan/zoom shares the phase-plane view.", app.basin_attractor_count);
+    }
+  }
+
+  /* PHASE B: 2-parameter scan controls. */
+  if (app.active_view == AppState::ActiveView::ParamScan2D && app.params.size() >= 2) {
+    if (ImGui::CollapsingHeader("2-parameter scan", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::TextWrapped("Largest Lyapunov exponent over a grid of two parameters. Periodic "
+                         "windows (dark/blue) form the shrimp shapes inside the chaotic sea "
+                         "(bright/warm). Best on maps (Henon, Tinkerbell).");
+      if (ImGui::BeginCombo("x param", app.params[std::min((size_t)app.scan_px_index, app.params.size()-1)].name.c_str())) {
+        for (int i = 0; i < (int)app.params.size(); ++i)
+          if (ImGui::Selectable(app.params[i].name.c_str(), i == app.scan_px_index)) { app.scan_px_index = i; app.scan_view_init = false; }
+        ImGui::EndCombo();
+      }
+      if (ImGui::BeginCombo("y param", app.params[std::min((size_t)app.scan_py_index, app.params.size()-1)].name.c_str())) {
+        for (int i = 0; i < (int)app.params.size(); ++i)
+          if (ImGui::Selectable(app.params[i].name.c_str(), i == app.scan_py_index)) { app.scan_py_index = i; app.scan_view_init = false; }
+        ImGui::EndCombo();
+      }
+      ImGui::InputDouble("x min", &app.scan_xmin, 0.0, 0.0, "%.4g"); ImGui::SameLine();
+      ImGui::InputDouble("x max", &app.scan_xmax, 0.0, 0.0, "%.4g");
+      ImGui::InputDouble("y min", &app.scan_ymin, 0.0, 0.0, "%.4g"); ImGui::SameLine();
+      ImGui::InputDouble("y max", &app.scan_ymax, 0.0, 0.0, "%.4g");
+      ImGui::SliderInt("transient", &app.scan_transient, 50, 4000);
+      ImGui::SliderInt("iterations", &app.scan_iterations, 100, 4000);
+      if (ImGui::Button("Recompute scan")) app.scan_dirty = true;
+      ImGui::TextDisabled("Note: scans are heavy; the grid is capped for responsiveness.");
+    }
+  }
+
   if (ImGui::CollapsingHeader("System editor", ImGuiTreeNodeFlags_DefaultOpen)) {
     const char *current_preset_name = kPresets[std::max(0, std::min(app.selected_preset, kPresetCount - 1))].name;
     if (ImGui::BeginCombo("Preset", current_preset_name)) {
@@ -4520,9 +6366,17 @@ void draw_gui(AppState &app) {
 
   if (ImGui::CollapsingHeader("Simulation", ImGuiTreeNodeFlags_DefaultOpen)) {
     int integrator_idx = static_cast<int>(app.integrator);
-    const char *integrators[] = {"Euler", "RK2 midpoint", "RK4"};
-    if (ImGui::Combo("integrator", &integrator_idx, integrators, 3)) app.integrator = static_cast<Integrator>(integrator_idx);
-    ImGui::InputDouble("dt", &app.dt, 0.001, 0.01, "%.8f");
+    const char *integrators[] = {"Euler", "RK2 midpoint", "Heun (RK2)", "RK4",
+                                 "RK 3/8", "RKF45 (adaptive)", "Dormand-Prince (adaptive)"};
+    if (ImGui::Combo("integrator", &integrator_idx, integrators, 7)) app.integrator = static_cast<Integrator>(integrator_idx);
+    const bool adaptive = (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45);
+    ImGui::InputDouble(adaptive ? "dt (output step)" : "dt", &app.dt, 0.001, 0.01, "%.8f");
+    if (adaptive) {
+      ImGui::InputDouble("tolerance", &app.adaptive_tol, 1e-7, 1e-6, "%.1e");
+      ImGui::InputDouble("min substep", &app.adaptive_dt_min, 1e-7, 1e-6, "%.1e"); ImGui::SameLine();
+      ImGui::InputDouble("max substep", &app.adaptive_dt_max, 1e-3, 1e-2, "%.1e");
+      ImGui::TextDisabled("adaptive: subdivides each dt to meet the tolerance (last substep %.2e)", app.last_adaptive_dt);
+    }
     ImGui::SliderInt("steps/frame", &app.steps_per_frame, 1, 2000);
     resize_state(app.start, app.state_names.size());
     for (size_t i = 0; i < app.state_names.size(); ++i) {
@@ -4540,11 +6394,39 @@ void draw_gui(AppState &app) {
     ImGui::Text("history buffer: %d (tied to 3D point buffer)", app.history_limit);
   }
 
+  ImGui::EndTabItem(); } /* Setup */
+  if (ImGui::BeginTabItem("Analysis")) {
+
   if (ImGui::CollapsingHeader("Analysis", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Checkbox("estimate largest Lyapunov exponent", &app.lyapunov_enabled);
     ImGui::InputDouble("Lyapunov epsilon", &app.lyapunov_epsilon, 1e-6, 1e-5, "%.1e");
     ImGui::SameLine();
     if (ImGui::Button("Reset Lyapunov")) reset_lyapunov(app);
+
+    /* PHASE B: full Lyapunov spectrum + Kaplan-Yorke (fractal) dimension */
+    ImGui::SeparatorText("Lyapunov spectrum (all exponents)");
+    ImGui::SliderInt("transient##lyap", &app.lyap_spec_transient, 0, 20000);
+    ImGui::SliderInt("average steps##lyap", &app.lyap_spec_steps, 1000, 200000);
+    if (ImGui::Button("Compute Lyapunov spectrum")) run_lyapunov_spectrum(app);
+    if (app.lyap_spectrum_ready && !app.lyap_spectrum.empty()) {
+      std::string s = "exponents:";
+      for (double l : app.lyap_spectrum) { char b[48]; std::snprintf(b, sizeof(b), " %.4f", l); s += b; }
+      ImGui::TextWrapped("%s", s.c_str());
+      ImGui::Text("sum = %.4f  (phase-space contraction rate)", app.lyap_spectrum_sum);
+      ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                         "Kaplan-Yorke (fractal) dimension = %.4f", app.lyap_kaplan_yorke);
+      /* quick interpretation */
+      if (!app.lyap_spectrum.empty()) {
+        const double l0 = app.lyap_spectrum[0];
+        const char *verdict = l0 > 1e-3 ? "chaotic (largest exponent > 0)"
+                             : (l0 < -1e-3 ? "stable (all exponents < 0)"
+                                           : "marginal / periodic (largest ~ 0)");
+        ImGui::TextDisabled("%s", verdict);
+      }
+    } else if (!app.lyap_spectrum_msg.empty()) {
+      ImGui::TextDisabled("%s", app.lyap_spectrum_msg.c_str());
+    }
+
     ImGui::Text("Poincare points: %zu", app.poincare_points.size());
     if (ImGui::Button("Clear Poincare")) app.poincare_points.clear();
     ImGui::Separator();
@@ -4705,6 +6587,56 @@ void draw_gui(AppState &app) {
     }
   }
 
+  if (ImGui::CollapsingHeader("Bifurcation diagram", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (app.params.empty()) {
+      ImGui::TextDisabled("declare a param to sweep (e.g. param r = 3.9 [0,4]).");
+    } else {
+      /* One-click: set the sweep to this system's first parameter and its
+       * declared range, observable = first state var. This is the fix for
+       * "I can't set the right params" — it can't be wrong for the loaded
+       * system. */
+      if (ImGui::Button("Auto-configure for this system")) {
+        const auto &p0 = app.params[0];
+        std::snprintf(app.bif_param, sizeof(app.bif_param), "%s", p0.name.c_str());
+        if (p0.has_range) { app.bif_start = p0.min_value; app.bif_end = p0.max_value; }
+        else { app.bif_start = p0.value - 1.0; app.bif_end = p0.value + 1.0; }
+        if (!app.state_names.empty())
+          std::snprintf(app.bif_observable, sizeof(app.bif_observable), "%s", app.state_names[0].c_str());
+        if (app.mode == SystemMode::Map) { app.bif_discard = 1000; app.bif_keep = 200; app.bif_slices = 800; }
+        else { app.bif_discard = 4000; app.bif_keep = 2000; app.bif_slices = 400; }
+        app.bif_view_valid = false;
+      }
+      /* parameter picker: when chosen, also snap the range to its [min,max] */
+      if (ImGui::BeginCombo("sweep param", app.bif_param)) {
+        for (const auto &p : app.params)
+          if (ImGui::Selectable(p.name.c_str(), p.name == app.bif_param)) {
+            std::snprintf(app.bif_param, sizeof(app.bif_param), "%s", p.name.c_str());
+            if (p.has_range) { app.bif_start = p.min_value; app.bif_end = p.max_value; app.bif_view_valid = false; }
+          }
+        ImGui::EndCombo();
+      }
+      ImGui::InputText("observable", app.bif_observable, sizeof(app.bif_observable));
+      ImGui::InputDouble("start", &app.bif_start, 0.0, 0.0, "%.4g"); ImGui::SameLine();
+      ImGui::InputDouble("end", &app.bif_end, 0.0, 0.0, "%.4g");
+      ImGui::SliderInt("param slices", &app.bif_slices, 50, 1200);
+      ImGui::SliderInt("discard (transient)", &app.bif_discard, 0, 5000); ImGui::SameLine();
+      ImGui::SliderInt("keep", &app.bif_keep, 10, 5000);
+      if (app.mode != SystemMode::Map)
+        ImGui::TextDisabled("ODE: records local maxima of the observable (a Poincare-style section)");
+      ImGui::Checkbox("compute Lyapunov vs param", &app.bif_compute_lyapunov);
+      if (ImGui::Button("Run bifurcation")) { run_bifurcation(app); app.active_view = AppState::ActiveView::Bifurcation; }
+      ImGui::SameLine();
+      if (ImGui::Button("View in full window")) app.active_view = AppState::ActiveView::Bifurcation;
+      ImGui::SameLine();
+      if (ImGui::Button("Clear")) { app.bifurcation_points.clear(); app.bifurcation_lyapunov.clear(); }
+      ImGui::TextDisabled("sweeping %s in [%.4g, %.4g], observing %s",
+                          app.bif_param, app.bif_start, app.bif_end, app.bif_observable);
+    }
+  }
+
+  ImGui::EndTabItem(); } /* Analysis */
+  if (ImGui::BeginTabItem("Data & view")) {
+
   if (ImGui::CollapsingHeader("Exports")) {
     ImGui::InputText("CSV path", app.export_path, sizeof(app.export_path));
     if (ImGui::Button("Export trajectory CSV")) export_trajectory_csv(app);
@@ -4763,6 +6695,10 @@ void draw_gui(AppState &app) {
   if (ImGui::CollapsingHeader("Poincare section")) {
     draw_scatter_plot("Poincare section", app.poincare_points, ImVec2(-FLT_MIN, 300));
   }
+
+  ImGui::EndTabItem(); } /* Data & view */
+  ImGui::EndTabBar();
+  } /* control_tabs */
 
   ImGui::End(); /* controls side panel */
 }
@@ -4868,8 +6804,7 @@ int run_headless(int argc, char **argv) {
   std::printf("dim=%zu mode=%s integrator=%s dt=%.6f steps=%lld defs=%zu params=%zu path=%s\n",
               app.state_names.size(),
               app.mode == SystemMode::Map ? "map" : "ode",
-              app.integrator == Integrator::Euler ? "euler" :
-              app.integrator == Integrator::RK2 ? "rk2" : "rk4",
+              integrator_name(app.integrator),
               app.dt, steps, app.definitions.size(), app.params.size(),
               use_ast ? "ast" : "ir");
   std::printf("initial: t=%.6f", app.current.t);
@@ -4954,14 +6889,16 @@ int main(int argc, char **argv) {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
-    /* PHASE6-UI: the active plot is the full-window background. For 3D we
-     * render geometry straight to the backbuffer now; for 2D we clear and
-     * the phase plane paints itself via the ImGui background draw list
-     * inside draw_gui. */
-    const bool want_3d = system_is_3d(app) &&
-                         app.active_view == AppState::ActiveView::Scene3D;
-    if (want_3d) {
+    /* PHASE-A: render the active full-area view. 3D goes straight to the
+     * backbuffer; the others paint via the ImGui background draw list
+     * inside draw_gui. Snap to a valid view first (e.g. after switching
+     * to a system of different dimension). */
+    ensure_valid_view(app);
+    if (app.active_view == AppState::ActiveView::Scene3D &&
+        view_valid(app, AppState::ActiveView::Scene3D)) {
       render_scene_background(app);
+    } else if (app.active_view == AppState::ActiveView::Scene3DBridge) {
+      render_bridge_scene(app);
     } else {
       draw_scene(app);
     }
@@ -4977,6 +6914,12 @@ int main(int argc, char **argv) {
   glDeleteProgram(app.shader_program);
   if (app.scene_fbo) glDeleteFramebuffers(1, &app.scene_fbo);
   if (app.scene_tex) glDeleteTextures(1, &app.scene_tex);
+  if (app.fractal_tex) glDeleteTextures(1, &app.fractal_tex);
+  if (app.basin_tex) glDeleteTextures(1, &app.basin_tex);
+  if (app.scan_tex) glDeleteTextures(1, &app.scan_tex);
+  if (app.bridge_vbo) glDeleteBuffers(1, &app.bridge_vbo);
+  if (app.bridge_cbo) glDeleteBuffers(1, &app.bridge_cbo);
+  if (app.bridge_vao) glDeleteVertexArrays(1, &app.bridge_vao);
   if (app.scene_depth) glDeleteRenderbuffers(1, &app.scene_depth);
   shutdown_imgui();
   glfwDestroyWindow(window);

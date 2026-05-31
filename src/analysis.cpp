@@ -840,4 +840,265 @@ std::vector<FixedPoint2D> scan_fixed_points_2d(const PlanarField &field,
   return out;
 }
 
+/* ---- Lyapunov spectrum --------------------------------------- */
+
+double kaplan_yorke_dimension(const std::vector<double> &l) {
+  const std::size_t n = l.size();
+  if (n == 0) return 0.0;
+  if (l[0] < 0.0) return 0.0; /* attracting fixed point */
+  double partial = 0.0;
+  std::size_t j = 0;
+  /* find largest j such that sum_{i=0}^{j} lambda_i >= 0 */
+  for (std::size_t i = 0; i < n; ++i) {
+    const double next = partial + l[i];
+    if (next < 0.0) break;
+    partial = next;
+    j = i + 1; /* count of exponents included */
+  }
+  if (j >= n) return static_cast<double>(n); /* whole sum >= 0 */
+  /* D = j + (sum of first j) / |lambda_j|  (0-indexed: l[j] is next) */
+  const double denom = std::fabs(l[j]);
+  if (denom < 1e-300) return static_cast<double>(j);
+  return static_cast<double>(j) + partial / denom;
+}
+
+namespace {
+/* y += a * x  over n entries */
+inline void axpy(std::size_t n, double a, const double *x, double *y) {
+  for (std::size_t i = 0; i < n; ++i) y[i] += a * x[i];
+}
+/* dot product */
+inline double dot(std::size_t n, const double *a, const double *b) {
+  double s = 0.0;
+  for (std::size_t i = 0; i < n; ++i) s += a[i] * b[i];
+  return s;
+}
+/* J*v -> out (J row-major n x n) */
+inline void matvec(std::size_t n, const double *J, const double *v, double *out) {
+  for (std::size_t i = 0; i < n; ++i) {
+    double s = 0.0;
+    for (std::size_t k = 0; k < n; ++k) s += J[i * n + k] * v[k];
+    out[i] = s;
+  }
+}
+/* Modified Gram-Schmidt on the columns of Q (n rows, m cols, column-major
+ * storage: col c occupies Q[c*n .. c*n+n-1]). Writes the diagonal R
+ * values (the norms after orthogonalization) into r_diag[c]. */
+void mgs(std::size_t n, std::size_t m, std::vector<double> &Q,
+         std::vector<double> &r_diag) {
+  for (std::size_t c = 0; c < m; ++c) {
+    double *vc = &Q[c * n];
+    for (std::size_t k = 0; k < c; ++k) {
+      const double *vk = &Q[k * n];
+      const double proj = dot(n, vk, vc);
+      axpy(n, -proj, vk, vc);
+    }
+    const double nrm = std::sqrt(std::fmax(0.0, dot(n, vc, vc)));
+    r_diag[c] = nrm;
+    if (nrm > 1e-300) {
+      const double inv = 1.0 / nrm;
+      for (std::size_t i = 0; i < n; ++i) vc[i] *= inv;
+    }
+  }
+}
+}  // namespace
+
+LyapunovResult lyapunov_spectrum(const Model &m, const std::vector<double> &x0,
+                                 double p, const LyapunovOptions &opt) {
+  LyapunovResult R;
+  const std::size_t n = m.n;
+  if (n == 0 || x0.size() < n || !m.vector_field) {
+    R.message = "lyapunov: invalid model/state";
+    return R;
+  }
+  const long reorth = std::max<long>(1, opt.reorth_every);
+  std::string err;
+
+  std::vector<double> x(x0.begin(), x0.begin() + n);
+  std::vector<double> Jbuf(n * n, 0.0);
+  auto jac = [&](const double *xx, double *Jout) -> bool {
+    if (m.jacobian_x) return m.jacobian_x(xx, p, Jout, &err);
+    if (!finite_diff_jacobian(m, xx, p, &Jbuf, &err, 1e-7)) return false;
+    std::copy(Jbuf.begin(), Jbuf.end(), Jout);
+    return true;
+  };
+
+  /* one step of the base state; returns false on error */
+  auto step_state = [&](std::vector<double> &xx) -> bool {
+    if (opt.is_map) {
+      std::vector<double> f(n);
+      if (!m.vector_field(xx.data(), p, f.data(), &err)) return false;
+      xx = f; /* map: x <- f(x) */
+      return true;
+    }
+    /* RK4 for the ODE */
+    std::vector<double> k1(n), k2(n), k3(n), k4(n), tmp(n);
+    const double h = opt.dt;
+    if (!m.vector_field(xx.data(), p, k1.data(), &err)) return false;
+    for (std::size_t i = 0; i < n; ++i) tmp[i] = xx[i] + 0.5 * h * k1[i];
+    if (!m.vector_field(tmp.data(), p, k2.data(), &err)) return false;
+    for (std::size_t i = 0; i < n; ++i) tmp[i] = xx[i] + 0.5 * h * k2[i];
+    if (!m.vector_field(tmp.data(), p, k3.data(), &err)) return false;
+    for (std::size_t i = 0; i < n; ++i) tmp[i] = xx[i] + h * k3[i];
+    if (!m.vector_field(tmp.data(), p, k4.data(), &err)) return false;
+    for (std::size_t i = 0; i < n; ++i)
+      xx[i] += (h / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+    return true;
+  };
+
+  /* settle onto the attractor */
+  for (long t = 0; t < opt.transient; ++t) {
+    if (!step_state(x)) { R.message = "lyapunov: " + err; return R; }
+    bool fin = true;
+    for (double v : x) fin = fin && std::isfinite(v);
+    if (!fin) { R.message = "lyapunov: trajectory diverged in transient"; return R; }
+  }
+
+  /* tangent frame Q: n columns of length n, init to identity */
+  std::vector<double> Q(n * n, 0.0);
+  for (std::size_t i = 0; i < n; ++i) Q[i * n + i] = 1.0;
+  std::vector<double> accum(n, 0.0);
+  std::vector<double> r_diag(n, 0.0);
+
+  /* propagate one tangent vector by the linearization for `reorth` base
+   * steps. For a map: v <- J(x_k) v each step. For an ODE: integrate
+   * v' = J(x(t)) v with RK4 using the Jacobian at the current x (frozen
+   * across the substep — adequate for small dt). */
+  std::vector<double> J(n * n);
+
+  long used = 0;
+  for (long t = 0; t < opt.steps; ++t) {
+    if (opt.is_map) {
+      if (!jac(x.data(), J.data())) { R.message = "lyapunov(jac): " + err; return R; }
+      /* advance each column: v <- J v */
+      std::vector<double> tmp(n);
+      for (std::size_t c = 0; c < n; ++c) {
+        matvec(n, J.data(), &Q[c * n], tmp.data());
+        for (std::size_t i = 0; i < n; ++i) Q[c * n + i] = tmp[i];
+      }
+      if (!step_state(x)) { R.message = "lyapunov: " + err; return R; }
+    } else {
+      /* ODE: RK4 on the linear variational system, Jacobian frozen at x
+       * for this step, then advance the base state. */
+      if (!jac(x.data(), J.data())) { R.message = "lyapunov(jac): " + err; return R; }
+      const double h = opt.dt;
+      std::vector<double> k1(n), k2(n), k3(n), k4(n), tmp(n);
+      for (std::size_t c = 0; c < n; ++c) {
+        double *v = &Q[c * n];
+        matvec(n, J.data(), v, k1.data());
+        for (std::size_t i = 0; i < n; ++i) tmp[i] = v[i] + 0.5 * h * k1[i];
+        matvec(n, J.data(), tmp.data(), k2.data());
+        for (std::size_t i = 0; i < n; ++i) tmp[i] = v[i] + 0.5 * h * k2[i];
+        matvec(n, J.data(), tmp.data(), k3.data());
+        for (std::size_t i = 0; i < n; ++i) tmp[i] = v[i] + h * k3[i];
+        matvec(n, J.data(), tmp.data(), k4.data());
+        for (std::size_t i = 0; i < n; ++i)
+          v[i] += (h / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+      }
+      if (!step_state(x)) { R.message = "lyapunov: " + err; return R; }
+    }
+
+    bool fin = true;
+    for (double v : x) fin = fin && std::isfinite(v);
+    if (!fin) { R.message = "lyapunov: trajectory diverged"; return R; }
+
+    if (((t + 1) % reorth) == 0 || t + 1 == opt.steps) {
+      mgs(n, n, Q, r_diag);
+      for (std::size_t c = 0; c < n; ++c)
+        if (r_diag[c] > 1e-300) accum[c] += std::log(r_diag[c]);
+      ++used;
+    }
+  }
+
+  if (used == 0) { R.message = "lyapunov: no samples"; return R; }
+  /* time spanned per accumulation block */
+  const double block_time = opt.is_map ? static_cast<double>(reorth)
+                                       : static_cast<double>(reorth) * opt.dt;
+  const double total_time = block_time * static_cast<double>(used);
+
+  R.exponents.resize(n);
+  for (std::size_t c = 0; c < n; ++c) R.exponents[c] = accum[c] / total_time;
+  std::sort(R.exponents.begin(), R.exponents.end(), std::greater<double>());
+  R.sum = 0.0;
+  for (double l : R.exponents) R.sum += l;
+  R.kaplan_yorke = kaplan_yorke_dimension(R.exponents);
+  R.steps_used = used;
+  R.ok = true;
+  R.message = "ok";
+  return R;
+}
+
+/* ---- Basins of attraction ------------------------------------ */
+BasinResult compute_basins(const std::function<bool(double, double, double *, double *)> &advance,
+                           const BasinOptions &opt) {
+  BasinResult R;
+  const int W = std::max(2, opt.width), H = std::max(2, opt.height);
+  R.width = W; R.height = H;
+  R.cell_attractor.assign((size_t)W * H, -1);
+  R.cell_speed.assign((size_t)W * H, 0.0f);
+  const double R2 = opt.diverge_r * opt.diverge_r;
+  const double clus2 = opt.cluster_tol * opt.cluster_tol;
+
+  for (int j = 0; j < H; ++j) {
+    const double y0 = opt.ymin + (opt.ymax - opt.ymin) * (double)j / (H - 1);
+    for (int i = 0; i < W; ++i) {
+      const double x0 = opt.xmin + (opt.xmax - opt.xmin) * (double)i / (W - 1);
+
+      double x = x0, y = y0;
+      long steps = 0;
+      bool diverged = false, settled = false;
+      double px = x, py = y;
+      /* check "settled" on a short stride so periodic attractors (which
+       * don't stop moving) still register once the orbit stops drifting
+       * its average — we use slow movement over a stride as the signal. */
+      const long stride = 8;
+      double acc_move = 0.0;
+      for (; steps < opt.max_steps; ++steps) {
+        double nx = x, ny = y;
+        if (!advance(x, y, &nx, &ny)) { diverged = true; break; }
+        if (!std::isfinite(nx) || !std::isfinite(ny) || nx * nx + ny * ny > R2) { diverged = true; break; }
+        acc_move += std::fabs(nx - x) + std::fabs(ny - y);
+        x = nx; y = ny;
+        if ((steps % stride) == (stride - 1)) {
+          const double drift = std::fabs(x - px) + std::fabs(y - py);
+          if (drift < opt.settle_tol) { settled = true; }
+          px = x; py = y;
+          if (settled) break;
+        }
+      }
+
+      const size_t idx = (size_t)j * W + i;
+      if (diverged) { R.cell_attractor[idx] = -1; R.cell_speed[idx] = 0.0f; continue; }
+
+      /* match endpoint to an existing attractor cluster, else add one */
+      int label = -1;
+      for (size_t a = 0; a < R.attractors.size(); ++a) {
+        const double dx = x - R.attractors[a].first, dy = y - R.attractors[a].second;
+        if (dx * dx + dy * dy < clus2) { label = (int)a; break; }
+      }
+      if (label < 0) {
+        if ((int)R.attractors.size() < opt.max_attractors) {
+          R.attractors.push_back({x, y});
+          label = (int)R.attractors.size() - 1;
+        } else {
+          /* over the cap: attach to nearest existing */
+          double best = 1e300; int bi = -1;
+          for (size_t a = 0; a < R.attractors.size(); ++a) {
+            const double dx = x - R.attractors[a].first, dy = y - R.attractors[a].second;
+            const double d = dx * dx + dy * dy;
+            if (d < best) { best = d; bi = (int)a; }
+          }
+          label = bi;
+        }
+      }
+      R.cell_attractor[idx] = label;
+      /* convergence speed: faster settle => brighter (1 at 0 steps, ->0 at max) */
+      R.cell_speed[idx] = (float)(1.0 - (double)steps / (double)opt.max_steps);
+    }
+  }
+  R.ok = true;
+  R.message = "ok";
+  return R;
+}
+
 }  // namespace dynsys::analysis

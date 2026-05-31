@@ -58,6 +58,13 @@ AD_TEST_TARGET := $(BUILD_DIR)/ad_smoke$(EXEEXT)
 NULLCLINE_TEST_TARGET := $(BUILD_DIR)/nullcline_smoke$(EXEEXT)
 DIM_TEST_TARGET := $(BUILD_DIR)/dim_detect_smoke$(EXEEXT)
 FP_TEST_TARGET := $(BUILD_DIR)/fixedpoints_smoke$(EXEEXT)
+LYAP_TEST_TARGET := $(BUILD_DIR)/lyapunov_smoke$(EXEEXT)
+FRACTAL_TEST_TARGET := $(BUILD_DIR)/fractal_smoke$(EXEEXT)
+BRIDGE_TEST_TARGET := $(BUILD_DIR)/bridge_smoke$(EXEEXT)
+BASIN_TEST_TARGET := $(BUILD_DIR)/basin_smoke$(EXEEXT)
+SOLVER_TEST_TARGET := $(BUILD_DIR)/solver_smoke$(EXEEXT)
+SCAN_TEST_TARGET := $(BUILD_DIR)/scan_smoke$(EXEEXT)
+ODEBIF_TEST_TARGET := $(BUILD_DIR)/odebif_smoke$(EXEEXT)
 TEST_OBJ_DIR := $(BUILD_DIR)/obj-test
 
 PREFIX ?= /usr/local
@@ -198,7 +205,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -291,7 +298,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -320,6 +327,55 @@ test-fp: $(FP_TEST_TARGET)
 $(FP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp -o $@ -lm
+
+test-lyap: $(LYAP_TEST_TARGET)
+	./$(LYAP_TEST_TARGET)
+
+$(LYAP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/lyapunov_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/lyapunov_smoke.cpp -o $@ -lm
+
+test-fractal: $(FRACTAL_TEST_TARGET)
+	./$(FRACTAL_TEST_TARGET)
+
+$(FRACTAL_TEST_TARGET): test/fractal_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/fractal_smoke.cpp -o $@ -lm
+
+test-bridge: $(BRIDGE_TEST_TARGET)
+	./$(BRIDGE_TEST_TARGET)
+
+$(BRIDGE_TEST_TARGET): test/bridge_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/bridge_smoke.cpp -o $@ -lm
+
+test-basin: $(BASIN_TEST_TARGET)
+	./$(BASIN_TEST_TARGET)
+
+$(BASIN_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/basin_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/basin_smoke.cpp -o $@ -lm
+
+test-solver: $(SOLVER_TEST_TARGET)
+	./$(SOLVER_TEST_TARGET)
+
+$(SOLVER_TEST_TARGET): test/solver_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/solver_smoke.cpp -o $@ -lm
+
+test-scan: $(SCAN_TEST_TARGET)
+	./$(SCAN_TEST_TARGET)
+
+$(SCAN_TEST_TARGET): test/scan_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/scan_smoke.cpp -o $@ -lm
+
+test-odebif: $(ODEBIF_TEST_TARGET)
+	./$(ODEBIF_TEST_TARGET)
+
+$(ODEBIF_TEST_TARGET): test/odebif_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/odebif_smoke.cpp -o $@ -lm
 
 test-ad: $(AD_TEST_TARGET)
 	./$(AD_TEST_TARGET)

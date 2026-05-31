@@ -185,4 +185,82 @@ std::vector<FixedPoint2D> scan_fixed_points_2d(const PlanarField &field,
                                                int seeds = 11,
                                                double dedup_tol_frac = 0.01);
 
+/* ---- Lyapunov spectrum (Benettin / Gram-Schmidt) ----------- *
+ * Integrate the system together with n perturbation vectors evolving
+ * under the variational (linearized) flow; periodically QR-reorthonormali
+ * ze and accumulate the log growth of each direction. The time-averaged
+ * logs are the Lyapunov exponents (sorted descending). From them we get
+ * the Kaplan-Yorke (Lyapunov) dimension — a real fractal dimension.
+ *
+ * Works for both ODEs and maps via the Model's vector_field/jacobian_x:
+ *   - ODE: x' = f(x);   tangent vectors obey  v' = Df(x) v.
+ *   - map: x_{k+1} = f(x_k);  tangent vectors  v_{k+1} = Df(x_k) v_k.
+ * AppState-free: the caller supplies the Model and tells us map vs ODE.
+ */
+struct LyapunovResult {
+  bool ok = false;
+  std::vector<double> exponents;   /* sorted descending, length n */
+  double kaplan_yorke = 0.0;       /* Lyapunov dimension */
+  double sum = 0.0;                /* sum of exponents (phase-space contraction) */
+  long steps_used = 0;
+  std::string message;
+};
+
+struct LyapunovOptions {
+  bool is_map = false;     /* true: discrete map; false: continuous ODE */
+  double dt = 0.01;        /* integration step (ODE only) */
+  long transient = 2000;   /* steps to settle onto the attractor first */
+  long steps = 20000;      /* steps over which to average */
+  long reorth_every = 1;   /* QR reorthonormalize every k steps (>=1) */
+};
+
+LyapunovResult lyapunov_spectrum(const Model &m, const std::vector<double> &x0,
+                                 double p, const LyapunovOptions &opt);
+
+/* Kaplan-Yorke dimension from an already-sorted-descending spectrum.
+ * D_KY = j + (sum_{i<=j} lambda_i) / |lambda_{j+1}|, where j is the
+ * largest index with a non-negative partial sum. Returns 0 if the first
+ * exponent is negative (point attractor), n if the whole sum is >= 0. */
+double kaplan_yorke_dimension(const std::vector<double> &sorted_desc);
+
+/* ---- Basins of attraction ----------------------------------- *
+ * For a planar system, integrate from a grid of initial conditions and
+ * color each cell by which attractor its trajectory settles onto. The
+ * attractors are discovered automatically by clustering the trajectory
+ * endpoints (so fixed points and periodic attractors are both handled).
+ * The result is the basin-of-attraction picture — a fractal whenever the
+ * basin boundaries are fractal (e.g. Newton's method, forced oscillators).
+ *
+ * A Julia set is the special case where the "attractor" is infinity:
+ * cells whose orbit escapes vs. stay bounded.
+ *
+ * AppState-free and headless-testable: the caller supplies a stepping
+ * function advance(x,y) -> (x',y') that performs one integration step (or
+ * one map iteration).
+ */
+struct BasinResult {
+  bool ok = false;
+  int width = 0, height = 0;
+  std::vector<int> cell_attractor;   /* width*height; index into attractors, or -1 = diverged/none */
+  std::vector<float> cell_speed;     /* width*height; 0..1 convergence speed (1 = fast) */
+  std::vector<std::pair<double,double>> attractors; /* representative (x,y) of each basin */
+  std::string message;
+};
+
+struct BasinOptions {
+  double xmin = -2, xmax = 2, ymin = -2, ymax = 2;
+  int width = 200, height = 200;
+  long max_steps = 2000;       /* integration steps per cell */
+  double settle_tol = 1e-4;    /* movement below this = settled */
+  double cluster_tol = 1e-2;   /* endpoints within this = same attractor */
+  double diverge_r = 1e6;      /* |state| beyond this = diverged */
+  int max_attractors = 16;     /* cap distinct basins */
+};
+
+/* advance: one step of the dynamics, (x,y) -> (*nx,*ny); return false on
+ * error. For an ODE pass a small fixed-step integrator; for a map, one
+ * iteration. */
+BasinResult compute_basins(const std::function<bool(double x, double y, double *nx, double *ny)> &advance,
+                           const BasinOptions &opt);
+
 }  // namespace dynsys::analysis

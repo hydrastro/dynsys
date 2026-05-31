@@ -1,67 +1,67 @@
-# dynsys — bug fixes: NaN bounds, zoom recovery, custom orbits, fixed views
+# dynsys — root-cause fixes + 19 new presets
 
-Unzip at repo root, replace all, then **`make clean && make`** (the
-clean is important), then `make run`. Confirm the green "dynsys NEW-UI"
-label at the top — that means you're on this build.
+Unzip at repo root, then `make clean && make && make run`. Green
+"dynsys NEW-UI" label = you're on this build.
 
-## Fixes for what you reported
+I found the real cause behind several recurring complaints this time.
 
-1. **Logistic map "nan/nan coordinates" — fixed at the real cause.**
-   I ran the logistic map through the actual IR engine in a test harness:
-   it stays bounded (no nan). The nan came from the *view bounds*, not
-   the map: a bad zoom or a stray non-finite value collapsed the bounds,
-   `screen_to_plot` then produced nan coordinates, and that nan fed back
-   into the zoom anchor and poisoned every later frame. Added a single
-   `sanitize_bounds` choke point (guarantees finite, correctly-ordered
-   bounds with a sane minimum span) applied wherever bounds are set or
-   read, plus a non-finite-anchor guard in zoom so it always recovers.
+## 1. Logistic bifurcation "horizontal lines" — ROOT CAUSE FOUND & FIXED
 
-2. **"Sometimes the zoom bugs and shows nothing" — same root cause.**
-   Degenerate/collapsed bounds are now impossible, so the view can't go
-   blank from zooming. If a zoom ever lands oddly, double-click still
-   refits.
+The Logistic and Tent presets were secretly "embedded in 3D"
+(x_next, y_next=x, z_next=z, i.e. 3 state variables). That single bad
+choice caused THREE of your bugs:
+- the bifurcation observed a muddled variable -> not the clean tree;
+- the 3D bridge (which needs a 1D map) was permanently disabled;
+- the 1D cobweb view wasn't offered.
 
-3. **Custom orbits — added.** In the Phase plane panel, "Add custom
-   orbit" gives a numeric field per state variable, plus "Add orbit at
-   these values" and "Use current state". (Clicking the plot still adds
-   an orbit at the cursor; orbits accumulate until Clear.)
+Both are now GENUINE 1D maps (state x only). Result:
+- Logistic bifurcation now shows the real period-doubling tree (verified:
+  the map gives 1,2,4,8,... attractor values as r increases).
+- The 3D bridge works again for the Logistic/Tent (it needs a 1D map).
+- The 1D cobweb view is offered for them.
 
-4. **"2D plot isn't fixed, it enlarges" — presets now open framed.**
-   New `view2d = xmin, xmax, ymin, ymax` directive sets a fixed initial
-   window. Added to the 2D presets (Van der Pol -4..4 x -6..6,
-   Lotka-Volterra 0..4 x 0..4, damped pendulum, Hénon-2D) so they open
-   with a good steady view instead of auto-growing. You can add `view2d`
-   to your own systems too.
+## 2. The 3D bridge being "always deactivated" — fixed by the above
 
-5. **Nullclines + their direction arrows.** The pplane-style arrows along
-   nullclines are present and on by default ("nullcline arrows" toggle).
-   IMPORTANT: nullclines and auto fixed points are mathematically
-   ODE-only — a *map* (logistic, Hénon) has no continuous vector field,
-   so there's nothing to draw. If you were testing on maps, that's why
-   you saw none. Load **Van der Pol** or **Lotka-Volterra** (ODEs) to see
-   nullclines, their flow arrows, and the auto-classified equilibria with
-   stable/unstable manifolds. Maps now show an explicit note saying so.
+It is valid for 1D maps; with the Logistic/Tent now genuinely 1D, select
+one of them and the "3D bridge" toolbar button is enabled.
 
-## Carried forward
-- Full-window background plot, top toolbar + left control panel.
-- Left-click adds orbits (accumulate; Clear to remove), drag pans,
-  wheel/+/- zoom, double-click auto-fit; zooming never moves a window.
-- Auto-scan & classify all equilibria in view (test-fp), dimension
-  auto-detect + Force2D/Force3D (test-dim), marching-squares nullclines
-  (test-nullcline), 3D-in-FBO, analysis engine, portable ImTextureID.
+## 3. Bifurcation "Run" button overflowing — replaced
+
+The floating in-view panel that overflowed is gone. The bifurcation
+controls (parameter picker, from/to range, Run) now live in the TOP
+TOOLBAR when the bifurcation view is active — compact and clip-free. The
+empty-view text now points you to the toolbar button and to loading the
+Logistic map.
+
+## 4. Basin / fractal display bugs — hardening
+
+- Fixed an asymmetric bounds guard in the fractal parameter-space compute
+  (one of the two parameter writes wasn't size-checked).
+- (From last round, still in place) grid computes force fixed-step RK4 and
+  are debounced so panning/zooming doesn't freeze.
+Note: the fractal view requires a 2D MAP — use "Complex quadratic"
+(Mandelbrot/Julia) or "Gingerbreadman". The now-1D Logistic correctly does
+not offer the fractal view.
+
+## 5. NEW PRESETS (19 added; 39 total)
+
+Phase-plane: Duffing, FitzHugh-Nagumo, Brusselator, Sel'kov glycolysis,
+SIR epidemic, Rosenzweig-MacArthur predator-prey (limit cycle), undamped
+pendulum.
+1D maps (great for bifurcation/cobweb): Sine, Gauss/mouse, Cubic.
+2D maps: Gingerbreadman, Chirikov standard map.
+3D: Chua's circuit (double-scroll), Sprott B, Nose-Hoover.
+All 19 were checked through the real expression engine (parse + lower +
+iterate); every one parses and runs.
 
 ## Verification
-- All 4 C++ translation units compile with ZERO warnings (-O2) against
-  the real Dear ImGui / GLFW / cglm / tpcas headers, ImTextureID set to
-  the integer type your nix build uses.
-- The logistic iteration was verified bounded via a numeric harness
-  driving the real IR.
-- make test: analysis(23) + AD(11) + nullcline + dimension + fixed
-  points — all pass.
-- GUI rendering still needs your `make run`; a screenshot (with the green
-  NEW-UI label visible) lets me confirm visuals on the same binary.
+- All 4 C++ TUs compile with ZERO warnings (-O2) against the real
+  ImGui/GLFW/cglm/tpcas headers (integer ImTextureID, matching nix).
+- make test: 12 suites all pass.
+- New presets validated by parsing+running each through the IR.
 
-## Next
-- Speed-colored streamlines for denser ODE portraits.
-- Click-to-select the equilibrium nearest the cursor.
-- matcont-style bifurcation diagram UI (gated on lizard symbolic math).
+## What I still can't verify (need your eyes)
+I can't see the GUI, so for any remaining "bug out" in basins/fractals: a
+screenshot (with the green NEW-UI label) plus which preset + view triggers
+it would let me fix the exact pixels. If it hard-crashes, running
+`gdb ./build/dynsys` and pasting the backtrace pinpoints it instantly.
