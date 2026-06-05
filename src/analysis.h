@@ -154,6 +154,30 @@ struct Branch {
 Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
                             double p0, const ContinuationSettings &settings);
 
+/* ---- Hopf first Lyapunov coefficient (normal-form classification) -------- *
+ * At a Hopf point the Jacobian has a pure-imaginary pair +/- i*omega. The
+ * sign of the first Lyapunov coefficient l1 decides the criticality:
+ *   l1 < 0 : SUPERcritical Hopf  (a stable limit cycle is born)
+ *   l1 > 0 : SUBcritical  Hopf  (an unstable limit cycle; hard loss of stab.)
+ *   l1 ~ 0 : degenerate (Bautin / generalized Hopf — a codim-2 point)
+ * This is the quantity MatCont reports and pplane/XPPAUT do not. Computed from
+ * the 2nd and 3rd derivatives of the vector field at the equilibrium via the
+ * standard projection onto the critical eigenvector (Kuznetsov's formula),
+ * using finite differences on m.vector_field (so it works for any system).
+ * Returns false if there is no clean imaginary pair at (x,p) or on eval error;
+ * on success *l1 holds the coefficient and *omega the frequency. */
+bool hopf_first_lyapunov(const Model &m, const std::vector<double> &x, double p,
+                         double *l1, double *omega, std::string *err);
+
+/* Fold (limit point) normal-form coefficient a (Kuznetsov):
+ *   a = (1/2) <p, B(q,q)> / <p, q>,   A q = 0,  p^T A = 0.
+ * a != 0 is the fold non-degeneracy condition; a ~ 0 signals a CUSP (codim-2).
+ * This is the limit-point counterpart of the Hopf l1 above and the quantity
+ * MatCont reports at an LP. On success *a holds the coefficient and *lambda0
+ * the magnitude of the near-zero eigenvalue (small => genuinely at a fold). */
+bool fold_normal_form(const Model &m, const std::vector<double> &x, double p,
+                      double *a, double *lambda0, std::string *err);
+
 /* ---- 2D fixed-point scanning (pplane-style) ----------------- *
  * Find ALL equilibria of a planar vector field inside a rectangle by
  * launching Newton from a grid of seeds, deduplicating the converged

@@ -1,49 +1,54 @@
-# dynsys — Phase E slice 1b: certified eigenvalues in the equilibrium readout
-#           + a Sangaku CAS module that fills real gaps
+# dynsys — 3D bridge reset bug fixed, + two MatCont normal-form coefficients
 
-Unzip at repo root, `make clean && make && make run`. With Nix, `nix develop`
-provides the Lizard interpreter + Sangaku so the CAS features light up.
+Unzip at repo root, `make clean && make && make run`.
 
-## 1. Certified eigenvalues wired into the fixed-point panel (slice 1b)
-After "Find fixed point", when the CAS is reachable, a new button
-**"Certified eigenvalues (CAS)"** appears in the Analysis tab. It:
-- takes the Jacobian dynsys already computed at the equilibrium
-  (app.fixed_jacobian, doubles),
-- rationalizes each entry (continued fractions; flags whether every entry is
-  exactly rational),
-- runs Sangaku via Lizard and shows the EXACT eigenvalues, an exact
-  Routh-Hurwitz stability verdict (stable / unstable / marginal), the
-  Re<0 / Re>0 / Re=0 counts, and — when a pair sits precisely on the
-  imaginary axis — an "exact Hopf point (Re = 0 exactly)" note.
-The numeric spectrum above it is untouched and always stands alone; the CAS
-section is purely additive and silently absent when LIZARD/SANGAKU_ROOT
-aren't set. If the Jacobian isn't exactly rational, the result is clearly
-labelled "approximate (nearest rational system)".
+## 1. The 3D bridge (and other caches) now reset on EVERY system (re)compile
+You were right: the bridge could keep showing a previous system. The reset was
+gated on the variable/parameter NAMES changing — so loading a different system
+that happened to reuse the same names (e.g. both use x,y and a parameter a, but
+different equations) would NOT clear the bridge, bifurcation diagram, fractal,
+basin, or scan caches. Now those stale-data invalidations run unconditionally
+on every successful compile (the name-gated block still handles only the
+name-structural defaults like the bifurcation parameter range/observable).
+Concretely, each recompile now clears: the bifurcation point cloud, the 3D
+bridge geometry, and marks the fractal/basin/scan images dirty, plus the
+certified-eigenvalue and Hopf/fold classifications.
 
-New in src/cas_bridge.h: `rationalize()` (double -> exact rational with a
-tolerance + denominator bound) and `eigen_report_from_doubles()` (the
-UI entry point). Verified live: Lorenz origin -> -8/3 and (-11±sqrt1201)/2,
-1 RHP (saddle-type); Van der Pol origin -> (1±i sqrt3)/2, unstable; stable
-nodes/focis classified correctly.
+## 2. MatCont normal-form coefficients at equilibria
+Two codim-1 normal-form quantities MatCont reports and most teaching tools
+don't — both computed from finite differences of the vector field, so they
+work for ANY system, and both verified against textbook normal forms:
 
-## 2. Sangaku CAS module (shipped separately as sangaku_dynsys_contrib.zip)
-I audited Sangaku and implemented the biggest dynamical-systems gaps as a new
-library module cas/dynsys.lisp (with a golden test + example 392). It adds
-multivariate partial derivatives, the Jacobian of a polynomial vector field,
-exact eigenvalues at an equilibrium, divergence, gradient, and Hessian — none
-of which existed in Sangaku before. Verified on Lorenz (exact Jacobian,
-eigenvalues, and the constant divergence -41/3). This means the WHOLE chain —
-polynomial field -> exact symbolic Jacobian -> exact eigenvalues — can run
-inside the certified CAS, not just dynsys-assembled matrices.
+- Hopf FIRST LYAPUNOV COEFFICIENT l1 (this had been implemented but never
+  shipped). At a Hopf point: l1<0 supercritical (a stable limit cycle is
+  born), l1>0 subcritical (hard loss of stability), l1~0 degenerate (Bautin /
+  generalized-Hopf codim-2). Button: "Classify Hopf (first Lyapunov coeff)".
 
-## 3. What's still missing in Sangaku
-See docs/SANGAKU_GAPS.md: the remaining candidates (transcendental
-multivariate certified derivatives, packaged eigenvectors, an in-CAS
-half-plane/Hurwitz decision, a turnkey exact-equilibria wrapper, and the
-certified-decimal realizer) with effort/value notes, plus the deliberate
-non-gaps (FP linear algebra / numeric ODE — dynsys's job, not Sangaku's).
+- Fold (limit point) NORMAL-FORM COEFFICIENT a (new this round): a = (1/2)
+  <p,B(q,q)>/<p,q> from the right/left null vectors at the fold. a != 0 is the
+  genuine quadratic-fold condition; a ~ 0 signals a CUSP (codim-2). Button:
+  "Classify fold (normal-form coeff a)". It self-checks for a near-zero
+  eigenvalue and tells you when the equilibrium isn't actually at a fold.
+
+Both appear in the Analysis tab's fixed-point block once an equilibrium is in
+hand. Verification (headless, under ASan/UBSan):
+- fold x'=p+x^2 at the fold -> a = 1 exactly; planar saddle-node -> |a| = 1;
+  cubic x'=p+x^3 -> a ~ 0 (correctly flags the cusp).
+- supercritical Hopf normal form -> l1 < 0; subcritical -> l1 > 0.
+
+These join the existing equilibrium continuation with fold/Hopf detection, so
+dynsys now both DETECTS codim-1 points on a branch and CLASSIFIES their
+criticality the way MatCont does.
 
 ## Verification
 - All 4 C++ TUs compile with ZERO warnings (-O2 -Wall -Wextra).
-- make test: 25 groups + graceful CAS skip (26 with the CAS present); the new
-  UI path is covered by the cas bridge tests (from-doubles cases).
+- Brace/tab structure balanced after edits.
+- make test: 27 groups (added test-foldnf) + graceful CAS skip.
+- New fold coefficient + Hopf l1 verified against known normal forms under
+  AddressSanitizer + UBSan.
+
+## Still pending toward fuller MatCont parity (not in this build)
+Codim-2 point detection ON a branch (Bogdanov-Takens, cusp, generalized Hopf
+located automatically during continuation), branch switching at branch points,
+and limit-cycle continuation by collocation. Exact equilibria via the CAS
+(solve-poly / Groebner) also remain as the next CAS slice.

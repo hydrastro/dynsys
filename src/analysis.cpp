@@ -752,6 +752,318 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
   return branch;
 }
 
+/* ---- Hopf first Lyapunov coefficient ------------------------------------ */
+namespace {
+
+using Cplx = std::complex<double>;
+
+/* Solve the complex n x n system M z = b by writing it as a real 2n x 2n
+ * system [[Re,-Im],[Im,Re]] [zr; zi] = [br; bi] and reusing solve_linear. */
+bool solve_complex(const std::vector<Cplx> &M, const std::vector<Cplx> &b,
+                   std::size_t n, std::vector<Cplx> *z) {
+  std::vector<double> A(4 * n * n, 0.0), rhs(2 * n, 0.0);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      const double re = M[i * n + j].real(), im = M[i * n + j].imag();
+      A[(i) * (2 * n) + (j)] = re;          /* top-left  Re */
+      A[(i) * (2 * n) + (j + n)] = -im;     /* top-right -Im */
+      A[(i + n) * (2 * n) + (j)] = im;      /* bot-left  Im */
+      A[(i + n) * (2 * n) + (j + n)] = re;  /* bot-right Re */
+    }
+    rhs[i] = b[i].real();
+    rhs[i + n] = b[i].imag();
+  }
+  std::vector<double> sol;
+  if (!solve_linear(A, rhs, &sol)) return false;
+  z->assign(n, Cplx(0, 0));
+  for (std::size_t i = 0; i < n; ++i) (*z)[i] = Cplx(sol[i], sol[i + n]);
+  return true;
+}
+
+/* B(u,v): the symmetric bilinear form of second derivatives of f at x,
+ *   B_i(u,v) = sum_{j,k} d^2 f_i/dx_j dx_k * u_j v_k,
+ * by central finite differences of the directional second derivative
+ *   B(u,v) = (1/2)[ D^2 f(x; u+v) - D^2 f(x; u) - D^2 f(x; v) ]  (polarization)
+ * where D^2 f(x; w) = (f(x+hw) - 2 f(x) + f(x-hw)) / h^2 (real directions).
+ * u,v are complex; we expand bilinearly from real/imag parts. */
+struct DerivCtx {
+  const Model *m; const double *x0; double p; std::size_t n; double h;
+  std::vector<double> f_p, f_m, f_0, xt; std::string *err;
+};
+
+bool dir_second_real(DerivCtx &c, const std::vector<double> &w, std::vector<double> *out) {
+  /* (f(x+hw) - 2 f0 + f(x-hw)) / h^2 */
+  const std::size_t n = c.n; const double h = c.h;
+  c.xt.assign(n, 0.0);
+  for (std::size_t i = 0; i < n; ++i) c.xt[i] = c.x0[i] + h * w[i];
+  if (!c.m->vector_field(c.xt.data(), c.p, c.f_p.data(), c.err)) return false;
+  for (std::size_t i = 0; i < n; ++i) c.xt[i] = c.x0[i] - h * w[i];
+  if (!c.m->vector_field(c.xt.data(), c.p, c.f_m.data(), c.err)) return false;
+  out->assign(n, 0.0);
+  for (std::size_t i = 0; i < n; ++i) (*out)[i] = (c.f_p[i] - 2.0 * c.f_0[i] + c.f_m[i]) / (h * h);
+  return true;
+}
+
+/* real bilinear B(a,b) for real vectors via polarization */
+bool B_real(DerivCtx &c, const std::vector<double> &a, const std::vector<double> &b,
+            std::vector<double> *out) {
+  std::vector<double> spp, sa, sb, wpp(c.n);
+  for (std::size_t i = 0; i < c.n; ++i) wpp[i] = a[i] + b[i];
+  if (!dir_second_real(c, wpp, &spp)) return false;
+  if (!dir_second_real(c, a, &sa)) return false;
+  if (!dir_second_real(c, b, &sb)) return false;
+  out->assign(c.n, 0.0);
+  for (std::size_t i = 0; i < c.n; ++i) (*out)[i] = 0.5 * (spp[i] - sa[i] - sb[i]);
+  return true;
+}
+
+/* complex B(u,v) expanded from real/imag: with u=ur+i ui, v=vr+i vi,
+ * B(u,v) = [B(ur,vr)-B(ui,vi)] + i[B(ur,vi)+B(ui,vr)]. */
+bool B_cplx(DerivCtx &c, const std::vector<Cplx> &u, const std::vector<Cplx> &v,
+            std::vector<Cplx> *out) {
+  std::vector<double> ur(c.n), ui(c.n), vr(c.n), vi(c.n);
+  for (std::size_t i = 0; i < c.n; ++i) { ur[i]=u[i].real(); ui[i]=u[i].imag(); vr[i]=v[i].real(); vi[i]=v[i].imag(); }
+  std::vector<double> rr, ii, ri, ir;
+  if (!B_real(c, ur, vr, &rr)) return false;
+  if (!B_real(c, ui, vi, &ii)) return false;
+  if (!B_real(c, ur, vi, &ri)) return false;
+  if (!B_real(c, ui, vr, &ir)) return false;
+  out->assign(c.n, Cplx(0,0));
+  for (std::size_t i = 0; i < c.n; ++i) (*out)[i] = Cplx(rr[i]-ii[i], ri[i]+ir[i]);
+  return true;
+}
+
+/* real trilinear C(a,b,d) via mixed differences using the cubic directional
+ * derivative and polarization. We use C(w,w,w) = D^3 f(x;w) and the identity
+ *   6 C(a,b,d) = D3(a+b+d) - D3(a+b) - D3(a+d) - D3(b+d) + D3(a)+D3(b)+D3(d)
+ * with D3 f(x;w) = (f(x+2hw) -2 f(x+hw) +2 f(x-hw) - f(x-2hw)) / (2 h^3)
+ * (the standard 3rd-derivative stencil, all in the real direction w). */
+bool dir_third_real(DerivCtx &c, const std::vector<double> &w, std::vector<double> *out) {
+  const std::size_t n = c.n; const double h = c.h;
+  std::vector<double> fp2(n), fp1(n), fm1(n), fm2(n);
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+2*h*w[i];
+  if (!c.m->vector_field(c.xt.data(), c.p, fp2.data(), c.err)) return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+h*w[i];
+  if (!c.m->vector_field(c.xt.data(), c.p, fp1.data(), c.err)) return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-h*w[i];
+  if (!c.m->vector_field(c.xt.data(), c.p, fm1.data(), c.err)) return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-2*h*w[i];
+  if (!c.m->vector_field(c.xt.data(), c.p, fm2.data(), c.err)) return false;
+  out->assign(n,0.0);
+  for (std::size_t i=0;i<n;i++) (*out)[i] = (fp2[i]-2*fp1[i]+2*fm1[i]-fm2[i])/(2*h*h*h);
+  return true;
+}
+bool C_real(DerivCtx &c, const std::vector<double> &a, const std::vector<double> &b,
+            const std::vector<double> &d, std::vector<double> *out) {
+  auto add=[&](const std::vector<double>&u,const std::vector<double>&v,const std::vector<double>&w){
+    std::vector<double> s(c.n); for(std::size_t i=0;i<c.n;i++) s[i]=u[i]+v[i]+w[i]; return s; };
+  std::vector<double> zero(c.n,0.0);
+  std::vector<double> d_abd,d_ab,d_ad,d_bd,d_a,d_b,d_d;
+  if(!dir_third_real(c, add(a,b,d), &d_abd)) return false;
+  if(!dir_third_real(c, add(a,b,zero), &d_ab)) return false;
+  if(!dir_third_real(c, add(a,d,zero), &d_ad)) return false;
+  if(!dir_third_real(c, add(b,d,zero), &d_bd)) return false;
+  if(!dir_third_real(c, a, &d_a)) return false;
+  if(!dir_third_real(c, b, &d_b)) return false;
+  if(!dir_third_real(c, d, &d_d)) return false;
+  out->assign(c.n,0.0);
+  for(std::size_t i=0;i<c.n;i++)
+    (*out)[i] = (d_abd[i]-d_ab[i]-d_ad[i]-d_bd[i]+d_a[i]+d_b[i]+d_d[i])/6.0;
+  return true;
+}
+/* complex C(q,q,qbar): expand from parts. With all args built from qr,qi this
+ * is most simply assembled by summing real C over the binary expansion. */
+bool C_qqqbar(DerivCtx &c, const std::vector<Cplx> &q, std::vector<Cplx> *out) {
+  std::vector<double> qr(c.n), qi(c.n);
+  for (std::size_t i=0;i<c.n;i++){ qr[i]=q[i].real(); qi[i]=q[i].imag(); }
+  /* C(q,q,qbar) with q=qr+i qi, qbar=qr-i qi. Expand trilinearly:
+   * real part  = C(qr,qr,qr) + C(qr,qi,qi) + C(qi,qr,qi) - C(qi,qi,qr)
+   *            (collect terms with even # of imag factors, sign from i^2)
+   * Rather than track by hand, sum over the 8 sign combinations. */
+  out->assign(c.n, Cplx(0,0));
+  /* q index sign: +1 -> qr, +i -> qi. For each of the three slots, the factor
+   * is (qr + s*i*qi) with s=+1 for q and s=-1 for qbar (third slot). */
+  const int s3[3] = {+1,+1,-1};
+  for (int b0=0;b0<2;b0++) for (int b1=0;b1<2;b1++) for (int b2=0;b2<2;b2++){
+    /* b=0 picks real part qr (factor 1), b=1 picks imag part qi (factor i*s) */
+    const std::vector<double> &a0 = b0? qi: qr;
+    const std::vector<double> &a1 = b1? qi: qr;
+    const std::vector<double> &a2 = b2? qi: qr;
+    Cplx coef(1,0);
+    if (b0) coef *= Cplx(0, s3[0]);
+    if (b1) coef *= Cplx(0, s3[1]);
+    if (b2) coef *= Cplx(0, s3[2]);
+    std::vector<double> cr;
+    if (!C_real(c, a0, a1, a2, &cr)) return false;
+    for (std::size_t i=0;i<c.n;i++) (*out)[i] += coef * cr[i];
+  }
+  return true;
+}
+
+Cplx cdot(const std::vector<Cplx> &a, const std::vector<Cplx> &b, std::size_t n) {
+  Cplx s(0,0); for (std::size_t i=0;i<n;i++) s += std::conj(a[i]) * b[i]; return s; /* <a,b> = conj(a).b */
+}
+
+} // namespace
+
+bool hopf_first_lyapunov(const Model &m, const std::vector<double> &x, double p,
+                         double *l1, double *omega, std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 2 || x.size() < n) { if (err) *err = "need a 2+ dim system"; return false; }
+  /* Jacobian at the point */
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+  /* eigenvalues -> find the imaginary pair */
+  std::vector<Cplx> ev;
+  if (!eigenvalues(J, n, &ev)) { if (err) *err="eigenvalue failure"; return false; }
+  double w = 0.0; bool found = false;
+  for (const auto &lam : ev) {
+    if (lam.imag() > 1e-6 && std::fabs(lam.real()) < 1e-3 * (1.0 + std::fabs(lam.imag()))) {
+      w = lam.imag(); found = true; break;
+    }
+  }
+  if (!found) { if (err) *err = "no pure-imaginary pair at this point (not a Hopf point)"; return false; }
+
+  /* critical eigenvector q: (J - i w I) q = 0  -> nullspace via inverse
+   * iteration on the complex matrix. Adjoint p: (J^T + i w I) pp = 0. */
+  std::vector<Cplx> Jc(n * n), JTc(n * n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++){
+    Jc[i*n+j]  = Cplx(J[i*n+j], 0) - ((i==j)? Cplx(0,w):Cplx(0,0));
+    JTc[i*n+j] = Cplx(J[j*n+i], 0) + ((i==j)? Cplx(0,w):Cplx(0,0));
+  }
+  /* inverse iteration: solve (M + eps) q_{k+1} = q_k, normalize */
+  auto inv_iter = [&](std::vector<Cplx> M, std::vector<Cplx> *vec)->bool{
+    for (std::size_t i=0;i<n;i++) M[i*n+i] += Cplx(1e-8,0); /* regularize singular M */
+    std::vector<Cplx> v(n, Cplx(1.0/std::sqrt((double)n),0)); v[0]=Cplx(1,0);
+    for (int it=0; it<60; ++it) {
+      std::vector<Cplx> nv;
+      if (!solve_complex(M, v, n, &nv)) return false;
+      double nrm=0; for (auto &z:nv) nrm += std::norm(z); nrm=std::sqrt(nrm);
+      if (nrm < 1e-300) return false;
+      for (auto &z:nv) z/=nrm;
+      v = nv;
+    }
+    *vec = v; return true;
+  };
+  std::vector<Cplx> q, pp;
+  if (!inv_iter(Jc, &q)) { if (err) *err="eigenvector solve failed"; return false; }
+  if (!inv_iter(JTc, &pp)) { if (err) *err="adjoint solve failed"; return false; }
+  /* normalize so <pp,q> = 1 (complex) */
+  Cplx pq = cdot(pp, q, n);
+  if (std::abs(pq) < 1e-300) { if (err) *err="degenerate eigenvectors"; return false; }
+  for (auto &z : pp) z = std::conj(Cplx(1,0)/pq) * z; /* scale adjoint: <pp,q>=1 */
+  /* recheck and rescale robustly */
+  pq = cdot(pp, q, n);
+  for (auto &z : pp) z /= pq;
+
+  /* derivative context */
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=1e-3;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+
+  std::vector<Cplx> qbar(n); for (std::size_t i=0;i<n;i++) qbar[i]=std::conj(q[i]);
+
+  /* B(q,qbar) -> solve J a = -B(q,qbar) ; (real linear system since result real) */
+  std::vector<Cplx> Bqqb, Bqq, Cqqqb;
+  if (!B_cplx(c, q, qbar, &Bqqb)) return false;
+  if (!B_cplx(c, q, q, &Bqq)) return false;
+  if (!C_qqqbar(c, q, &Cqqqb)) return false;
+
+  /* a = -J^{-1} B(q,qbar)  (J real, B(q,qbar) real up to rounding) */
+  std::vector<Cplx> Jreal(n*n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) Jreal[i*n+j]=Cplx(J[i*n+j],0);
+  std::vector<Cplx> negBqqb(n); for (std::size_t i=0;i<n;i++) negBqqb[i]=-Bqqb[i];
+  std::vector<Cplx> avec;
+  if (!solve_complex(Jreal, negBqqb, n, &avec)) { if(err)*err="singular J in l1"; return false; }
+
+  /* b = (2 i w I - J)^{-1} B(q,q) */
+  std::vector<Cplx> M2(n*n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++)
+    M2[i*n+j] = ((i==j)?Cplx(0,2*w):Cplx(0,0)) - Cplx(J[i*n+j],0);
+  std::vector<Cplx> bvec;
+  if (!solve_complex(M2, Bqq, n, &bvec)) { if(err)*err="singular (2iwI-J)"; return false; }
+
+  /* h1 = C(q,q,qbar) - 2 B(q,a) + B(qbar,b) ; l1 = (1/2w) Re <pp, h1> */
+  std::vector<Cplx> Bqa, Bqbb;
+  if (!B_cplx(c, q, avec, &Bqa)) return false;
+  if (!B_cplx(c, qbar, bvec, &Bqbb)) return false;
+  std::vector<Cplx> h1(n);
+  for (std::size_t i=0;i<n;i++) h1[i] = Cqqqb[i] - 2.0*Bqa[i] + Bqbb[i];
+  Cplx g = cdot(pp, h1, n);
+  *l1 = g.real() / (2.0 * w);
+  *omega = w;
+  return true;
+}
+
+/* Fold (limit point) normal-form coefficient a.
+ *
+ * At a fold/saddle-node the Jacobian A has a simple zero eigenvalue with right
+ * null vector q (A q = 0) and left null vector p (p^T A = 0). The restriction
+ * of the dynamics to the center manifold is, to leading order,
+ *   y' = a y^2 + ...,     a = (1/2) <p, B(q,q)> / <p, q>,
+ * where B is the bilinear form of second derivatives (Kuznetsov, Elements of
+ * Applied Bifurcation Theory). a != 0 is the non-degeneracy condition for a
+ * quadratic fold; a ~ 0 signals a CUSP (codim-2). This is the limit-point
+ * counterpart of the Hopf first Lyapunov coefficient and the quantity MatCont
+ * reports at an LP. Reuses the same finite-difference bilinear B as the Hopf
+ * routine. Returns the coefficient in *a and an estimate of the zero
+ * eigenvalue's magnitude in *lambda0 (small => genuinely at the fold). */
+bool fold_normal_form(const Model &m, const std::vector<double> &x, double p,
+                      double *a, double *lambda0, std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 1 || x.size() < n) { if (err) *err = "need a 1+ dim system"; return false; }
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+
+  /* find the smallest-magnitude eigenvalue (should be ~0 at a fold) */
+  std::vector<Cplx> ev;
+  if (eigenvalues(J, n, &ev)) {
+    double best = 1e300;
+    for (const auto &lam : ev) best = std::min(best, std::abs(lam));
+    if (lambda0) *lambda0 = best;
+  } else if (lambda0) *lambda0 = -1.0;
+
+  /* real null vector via inverse iteration on (M + eps I) */
+  auto inv_iter_real = [&](const std::vector<double> &Min, std::vector<double> *vec)->bool{
+    std::vector<double> M = Min;
+    for (std::size_t i=0;i<n;i++) M[i*n+i] += 1e-9;            /* regularize */
+    std::vector<double> v(n, 1.0/std::sqrt((double)n));
+    for (int it=0; it<80; ++it) {
+      std::vector<double> nv;
+      if (!solve_linear(M, v, &nv)) return false;
+      double nrm=0; for (double z:nv) nrm+=z*z; nrm=std::sqrt(nrm);
+      if (nrm < 1e-300) return false;
+      for (double &z:nv) z/=nrm;
+      v = nv;
+    }
+    *vec = v; return true;
+  };
+  std::vector<double> JT(n*n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) JT[i*n+j]=J[j*n+i];
+  std::vector<double> q, pvec;
+  if (!inv_iter_real(J, &q))  { if (err) *err="null-vector solve failed"; return false; }
+  if (!inv_iter_real(JT, &pvec)) { if (err) *err="adjoint null-vector solve failed"; return false; }
+
+  /* normalize <q,q>=1 and scale p so <p,q>=1 */
+  double qn=0; for (double z:q) qn+=z*z; qn=std::sqrt(qn);
+  if (qn < 1e-300) { if (err) *err="degenerate q"; return false; }
+  for (double &z:q) z/=qn;
+  double pq=0; for (std::size_t i=0;i<n;i++) pq+=pvec[i]*q[i];
+  if (std::abs(pq) < 1e-300) { if (err) *err="p and q orthogonal (not a simple fold)"; return false; }
+  for (double &z:pvec) z/=pq;
+
+  /* B(q,q) via the shared finite-difference bilinear form */
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=1e-3;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+  std::vector<double> Bqq;
+  if (!B_real(c, q, q, &Bqq)) return false;
+
+  double val=0; for (std::size_t i=0;i<n;i++) val += pvec[i]*Bqq[i];
+  if (a) *a = 0.5 * val;
+  return true;
+}
+
 /* ---- 2D fixed-point scanning -------------------------------- */
 
 std::vector<FixedPoint2D> scan_fixed_points_2d(const PlanarField &field,

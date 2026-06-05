@@ -342,6 +342,16 @@ struct AppState {
   std::vector<PhaseTrajectory> phase_trajectories;
 
   int fps = 0;
+  /* Adaptive performance governor: when frames get expensive (heavy fractal /
+   * IFS / large step counts), automatically shed load to keep the UI
+   * responsive, and restore it when there's headroom. perf_frame_ms is an
+   * exponentially-smoothed frame time; perf_throttle in [0,1] is how much we're
+   * currently holding back (0 = full speed, 1 = maximally throttled). User can
+   * disable from the Setup tab. */
+  bool perf_governor_enabled = true;
+  double perf_frame_ms = 16.0;   /* smoothed ms/frame */
+  double perf_throttle = 0.0;    /* 0..1 current throttle level */
+  bool perf_throttle_active = false; /* true while throttling (for the HUD note) */
   int window_width = 1100;
   int window_height = 820;
   std::string screenshot_msg;     /* transient "saved <path>" toast */
@@ -513,6 +523,18 @@ struct AppState {
   float bridge_height = 18.0f;   /* vertical scale of the bifurcation */
   bool bridge_show_mandelbrot = true;
   bool bridge_show_bifurcation = true;
+  /* The 3D bridge has two modes. CLASSIC is the famous logistic/Mandelbrot
+   * bridge (the quadratic family's cascade rising out of the Mandelbrot set) —
+   * a special correspondence that exists ONLY for the quadratic family.
+   * CURRENT_SYSTEM lifts the CURRENT system's own bifurcation diagram into 3D,
+   * sweeping bif_param along x, the attractor value as height (y), and a SECOND
+   * parameter (bridge_param2) along z, so any system's bifurcation structure
+   * can be explored as a 3D surface of stacked diagrams. */
+  enum class BridgeMode { Classic, CurrentSystem };
+  BridgeMode bridge_mode = BridgeMode::Classic;
+  char bridge_param2[64] = "";     /* second swept parameter (z axis) */
+  double bridge_p2_min = 0.0, bridge_p2_max = 1.0;
+  int bridge_p2_slices = 24;       /* number of stacked diagrams along z */
 
   /* PHASE B/C: basins of attraction. Integrate a grid of initial
    * conditions over the current 2D view and color each pixel by which
@@ -524,6 +546,7 @@ struct AppState {
   int basin_tex_w = 0, basin_tex_h = 0;
   bool basin_dirty = true;
   int basin_settle = 0;
+  int basin_prog_level = 0;       /* progressive refine downscale (0 = done), like the fractal */
   int basin_steps = 1500;        /* integration steps per cell */
   int basin_res = 1;             /* unused placeholder for future supersampling */
   double basin_cluster_tol = 1e-2;
@@ -581,6 +604,15 @@ struct AppState {
    * panel; this richer classification works in any dimension. */
   dynsys::analysis::Classification fixed_general{};
   bool fixed_general_ready = false;
+  /* Hopf first Lyapunov coefficient (normal-form criticality) at the located
+   * equilibrium, computed on demand. l1<0 supercritical, l1>0 subcritical. */
+  bool hopf_l1_ready = false;
+  double hopf_l1 = 0.0, hopf_omega = 0.0;
+  std::string hopf_l1_msg;
+  /* Fold (limit point) normal-form coefficient at the located equilibrium. */
+  bool fold_a_ready = false;
+  double fold_a = 0.0, fold_lambda0 = 0.0;
+  std::string fold_a_msg;
   /* PHASE E: cached exact eigenvalue report from the Sangaku CAS for the
    * located equilibrium (computed on demand via the button, not every frame).
    * cas_eig_requested guards recomputation; cas_eig_exact records whether the
@@ -2394,6 +2426,7 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   app.basin_dirty = true;   /* PHASE B/C: recompute basins for the new system */
   app.scan_dirty = true; app.scan_view_init = false; /* PHASE B: recompute 2-param scan */
   app.fixed_ready = false;
+  app.cas_eig_ready = false; /* stale certified spectrum from the previous system */
   app.fixed_jacobian.clear();
   app.fixed_classification.clear();
   app.fixed_eigenvalues.clear();
@@ -2438,6 +2471,23 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
     app.cont_autorun_done = false; /* and re-trace continuation on entry */
     app.lcc_autorun_done = false; app.lcc_has_data = false; /* re-sweep LC on a new system */
   }
+  /* Invalidate stale per-system DATA on EVERY successful (re)compile — not only
+   * when the variable/parameter NAMES change. Two different systems can share
+   * the same names (e.g. both use x,y and a) but have different equations, in
+   * which case the bridge/bifurcation/scan caches would otherwise keep showing
+   * the previous system until manually rebuilt. The defaults above (bif range,
+   * observable) are name-structural and stay gated; these clears are not. */
+  app.bifurcation_points.clear();
+  app.bifurcation_lyapunov.clear();
+  app.bifurcation_period.clear();
+  app.bridge_built = false;
+  app.bridge_point_count = 0;
+  app.fractal_dirty = true;
+  app.basin_dirty = true;
+  app.scan_view_init = false;
+  app.cas_eig_ready = false;   /* stale certified spectrum from the previous system */
+  app.hopf_l1_ready = false;   /* stale Hopf classification */
+  app.fold_a_ready = false;    /* stale fold classification */
   return true;
 }
 
@@ -3248,8 +3298,8 @@ const char *view_requirement(AppState::ActiveView v) {
     case AppState::ActiveView::Phase2D:     return "2 or more state variables";
     case AppState::ActiveView::Scene3D:     return "3-D systems (three state variables)";
     case AppState::ActiveView::Bifurcation: return "a system with at least one parameter";
-    case AppState::ActiveView::Fractal:     return "a 2-D map (escape-time iteration)";
-    case AppState::ActiveView::Scene3DBridge: return "a 1-D map (the logistic/Mandelbrot bridge)";
+    case AppState::ActiveView::Fractal:     return "a map: a parameter (parameter-space) or 2 state vars (state-space Julia)";
+    case AppState::ActiveView::Scene3DBridge: return "a 1-D map (classic mode) or any system with a parameter (current-system mode)";
     case AppState::ActiveView::Basins:      return "2+ state variables (and ideally several attractors)";
     case AppState::ActiveView::ParamScan2D: return "at least two parameters";
     case AppState::ActiveView::Continuation: return "an ODE with a parameter (equilibrium tracing)";
@@ -3272,9 +3322,20 @@ bool view_valid(const AppState &app, AppState::ActiveView v) {
     case AppState::ActiveView::Phase2D:     return d >= 2;
     case AppState::ActiveView::Scene3D:     return system_is_3d(app);
     case AppState::ActiveView::Bifurcation: return !app.params.empty();
-    case AppState::ActiveView::Fractal:     return app.mode == SystemMode::Map && app.state_names.size() >= 2;
+    case AppState::ActiveView::Fractal:
+      /* parameter-space escape map needs >=1 parameter; state-space (Julia)
+       * needs >=2 state variables. A 1-D map (e.g. the logistic map) is valid
+       * via parameter space — its escape set IS the classic Mandelbrot-type
+       * picture. */
+      return app.mode == SystemMode::Map &&
+             (!app.params.empty() || app.state_names.size() >= 2);
     case AppState::ActiveView::Scene3DBridge:
-      return app.mode == SystemMode::Map && effective_dimension(app) == 1;
+      /* Classic logistic/Mandelbrot mode needs a 1-D map (the quadratic
+       * family). The CurrentSystem mode lifts ANY system's bifurcation diagram
+       * into 3D, so it's valid for any system that has at least one parameter
+       * to sweep and at least one state variable to observe. */
+      return (app.mode == SystemMode::Map && effective_dimension(app) == 1) ||
+             (!app.params.empty() && !app.state_names.empty());
     case AppState::ActiveView::Basins:      return app.state_names.size() >= 2;
     case AppState::ActiveView::ParamScan2D: return app.params.size() >= 2;
     case AppState::ActiveView::Continuation: return app.mode == SystemMode::ODE && !app.params.empty();
@@ -4128,6 +4189,14 @@ void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
     ImGui::InputFloat("y max", &app.phase_y_max, 0.1f, 1.0f, "%.4g");
   }
 
+  /* CRASH FIX (same class as the basins one): clamp the plane indices to the
+   * current state dimension before using them to index state_names / states.
+   * A stale phase_y_index left over from a higher-dimensional system would
+   * otherwise read out of bounds after switching to a smaller system. */
+  if (!app.state_names.empty()) {
+    app.phase_x_index = std::max(0, std::min(app.phase_x_index, (int)app.state_names.size() - 1));
+    app.phase_y_index = std::max(0, std::min(app.phase_y_index, (int)app.state_names.size() - 1));
+  }
   const size_t ix = static_cast<size_t>(app.phase_x_index);
   const size_t iy = static_cast<size_t>(app.phase_y_index);
   const float w = size.x <= 0.0f ? ImGui::GetContentRegionAvail().x : size.x;
@@ -4661,7 +4730,15 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
   if (n < 2) return; /* needs a 2D plane */
   if (app.mode != SystemMode::Map) return; /* escape-time is for maps */
 
-  const int maxit = std::max(10, app.fractal_max_iter);
+  /* Honor the performance governor: when throttling, cap the per-pixel
+   * iteration budget (down to ~25% at full throttle, floor 10) so a deep zoom
+   * on a heavy fractal can't lock up the frame. The progressive refine still
+   * sharpens later once load drops and the throttle eases. */
+  int maxit = std::max(10, app.fractal_max_iter);
+  if (app.perf_throttle > 0.02) {
+    maxit = (int)(maxit * (1.0 - 0.75 * app.perf_throttle));
+    if (maxit < 10) maxit = 10;
+  }
   const double R2 = app.fractal_escape_r * app.fractal_escape_r;
   const double x0 = app.fractal_xmin, x1 = app.fractal_xmax;
   const double y0 = app.fractal_ymin, y1 = app.fractal_ymax;
@@ -4690,10 +4767,12 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
         if ((size_t)cxi < app.param_values.size()) app.param_values[(size_t)cxi] = a_re;
         if ((size_t)cyi < app.param_values.size()) app.param_values[(size_t)cyi] = b_im;
       } else {
-        /* plane = initial (x, y); params fixed at current values */
+        /* plane = initial (x, y); params fixed at current values. For a 1-D
+         * map there's no second state, so state-space mode isn't meaningful
+         * (the view forces parameter-space for 1-D); guard the write anyway. */
         if (px == 0 && py == 0) app.param_values = saved;
         set_state_at(s, 0, a_re);
-        set_state_at(s, 1, b_im);
+        if (n > 1) set_state_at(s, 1, b_im);
         for (size_t i = 2; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
       }
 
@@ -4702,7 +4781,8 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
       for (size_t i = 0; i < n; ++i) set_state_at(cur, i, state_at(s, i));
       for (; it < maxit; ++it) {
         if (!step_map_state(app, cur, &nx, err, sizeof(err))) { it = maxit; break; }
-        const double xx = state_at(nx, 0), yy = state_at(nx, 1);
+        const double xx = state_at(nx, 0);
+        const double yy = (n > 1) ? state_at(nx, 1) : 0.0; /* 1-D map: |x| only */
         r2 = xx * xx + yy * yy;
         if (!std::isfinite(r2) || r2 > R2) { ++it; break; }
         std::swap(cur.v, nx.v); cur.t = nx.t;
@@ -5031,10 +5111,18 @@ ImU32 basin_color(int label, int nlabels, float speed, bool shade) {
   return IM_COL32((int)(r * 255 * br), (int)(g * 255 * br), (int)(b * 255 * br), 255);
 }
 
-void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out) {
+void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out, int step = 1) {
   if (W < 2) W = 2;
   if (H < 2) H = 2;
+  if (step < 1) step = 1;
   out.assign((size_t)W * H, 0xff000000u);
+  /* Progressive refinement: when step>1 we classify a coarse (W/step x H/step)
+   * grid and block-upscale it into the full image, so the first frames are
+   * cheap and the picture sharpens 8 -> 4 -> 2 -> 1 over subsequent frames
+   * instead of one multi-hundred-million-step stall. The compute grid is the
+   * reduced size; cw/ch below are that grid's dimensions. */
+  const int cw = std::max(2, W / step);
+  const int ch = std::max(2, H / step);
   const size_t n = app.state_names.size();
   if (n < 2) return;
 
@@ -5074,7 +5162,7 @@ void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out
 
   dynsys::analysis::BasinOptions opt;
   opt.xmin = b.xmin; opt.xmax = b.xmax; opt.ymin = b.ymin; opt.ymax = b.ymax;
-  opt.width = W; opt.height = H;
+  opt.width = cw; opt.height = ch;            /* compute on the reduced grid */
   opt.max_steps = std::max(50, app.basin_steps);
   opt.cluster_tol = app.basin_cluster_tol;
   opt.settle_tol = (app.mode == SystemMode::Map) ? 1e-6 : 1e-5;
@@ -5087,11 +5175,17 @@ void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out
   app.basin_n_nonconvergent = R.n_nonconvergent;
   if (!R.ok) return;
   const int nl = (int)R.attractors.size();
-  for (int j = 0; j < H; ++j)
+  /* block-upscale the coarse cw x ch classification into the full W x H image
+   * (nearest-neighbor). When step==1, cw==W and ch==H so this is 1:1. */
+  for (int j = 0; j < H; ++j) {
+    int cj = (j * ch) / H; if (cj >= ch) cj = ch - 1;
     for (int i = 0; i < W; ++i) {
-      const size_t idx = (size_t)j * W + i;
-      out[idx] = basin_color(R.cell_attractor[idx], nl, R.cell_speed[idx], app.basin_shade_speed);
+      int ci = (i * cw) / W; if (ci >= cw) ci = cw - 1;
+      const size_t cidx = (size_t)cj * cw + ci;
+      out[(size_t)j * W + i] =
+          basin_color(R.cell_attractor[cidx], nl, R.cell_speed[cidx], app.basin_shade_speed);
     }
+  }
 }
 
 void render_basin_background(AppState &app) {
@@ -5105,7 +5199,15 @@ void render_basin_background(AppState &app) {
   }
 
   /* pan/zoom reuse the phase bounds so basins and the phase portrait share
-   * a coordinate frame; any view change marks the image dirty. */
+   * a coordinate frame; any view change marks the image dirty.
+   * CRASH FIX: clamp the plane indices to the CURRENT state dimension before
+   * using them. When a system with fewer variables is loaded (e.g. switching
+   * from a 3-var to a 2-var system) the stale phase_y_index could index past
+   * state_names, reading out of bounds in the HUD below. Clamp (and persist)
+   * here exactly as compute_basin_image does. */
+  const size_t nstate = app.state_names.size();
+  app.phase_x_index = std::max(0, std::min(app.phase_x_index, (int)nstate - 1));
+  app.phase_y_index = std::max(0, std::min(app.phase_y_index, (int)nstate - 1));
   const size_t ix = (size_t)app.phase_x_index, iy = (size_t)app.phase_y_index;
   PlotBounds b = sanitize_bounds(current_phase_bounds(app, ix, iy));
   ImGuiIO &io = ImGui::GetIO();
@@ -5126,11 +5228,16 @@ void render_basin_background(AppState &app) {
   const int CH = std::min(app.window_height, 560);
   const bool bforce = (app.basin_tex == 0 || app.basin_tex_w != CW || app.basin_tex_h != CH);
   if (app.basin_dirty) { app.basin_settle = 6; app.basin_dirty = false; }
-  bool bcompute = bforce;
-  if (app.basin_settle > 0) { if (--app.basin_settle == 0) bcompute = true; }
-  if (bcompute) {
+  bool start_progress = bforce;
+  if (app.basin_settle > 0) { if (--app.basin_settle == 0) start_progress = true; }
+  /* begin a coarse->fine pass: 8 -> 4 -> 2 -> 1. Under the performance
+   * governor's throttle, stop refining early (a coarser final level) so a
+   * heavy basin can't lock the UI. */
+  if (start_progress) app.basin_prog_level = 8;
+  if (app.basin_prog_level > 0) {
+    int step = app.basin_prog_level;
     std::vector<uint32_t> img;
-    compute_basin_image(app, CW, CH, img);
+    compute_basin_image(app, CW, CH, img, step);
     if (app.basin_tex == 0) glGenTextures(1, &app.basin_tex);
     glBindTexture(GL_TEXTURE_2D, app.basin_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
@@ -5139,16 +5246,21 @@ void render_basin_background(AppState &app) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     app.basin_tex_w = CW; app.basin_tex_h = CH;
-    app.basin_dirty = false;
+    /* next finer level; if heavily throttled, stop at a coarser floor */
+    int floor_level = 1;
+    if (app.perf_throttle > 0.6) floor_level = 4;
+    else if (app.perf_throttle > 0.3) floor_level = 2;
+    app.basin_prog_level = (step > floor_level) ? step / 2 : 0;
   }
   if (app.basin_tex != 0)
     draw->AddImage((ImTextureID)(uintptr_t)app.basin_tex, ImVec2(0, 0), ImVec2(w, h));
 
-  char hud[320];
+  char hud[360];
   std::snprintf(hud, sizeof(hud),
-                "Basins of attraction — %d basin(s)  |  %s vs %s  |  converged %ld, escaped %ld, non-convergent %ld",
+                "Basins of attraction — %d basin(s)  |  %s vs %s  |  converged %ld, escaped %ld, non-convergent %ld%s",
                 app.basin_attractor_count, app.state_names[ix].c_str(), app.state_names[iy].c_str(),
-                app.basin_n_converged, app.basin_n_diverged, app.basin_n_nonconvergent);
+                app.basin_n_converged, app.basin_n_diverged, app.basin_n_nonconvergent,
+                app.basin_prog_level > 1 ? "   [refining…]" : "");
   draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
 
   /* If almost nothing converged, the system likely has a single chaotic
@@ -5389,6 +5501,195 @@ void build_bridge_geometry(AppState &app) {
   pts.reserve(200000);
   cols.reserve(600000);
 
+  /* ---- CURRENT-SYSTEM mode: lift THIS system's bifurcation diagram into 3D.
+   * x = primary parameter (bif_param), y = attractor value (height), z = a
+   * second parameter (bridge_param2) swept over a few stacked slices. This
+   * generalizes the bridge to ANY 1-D observable of ANY system, beyond the
+   * classical logistic/Mandelbrot correspondence. The sweep is self-contained
+   * (its own step loop on a state copy) so it doesn't disturb the 2D
+   * bifurcation view's data or the integrator setting. ---- */
+  if (app.bridge_mode == AppState::BridgeMode::CurrentSystem) {
+    AppState::Param *p1 = find_param(app, app.bif_param);
+    AppState::Param *p2 = find_param(app, app.bridge_param2);
+    const size_t dim = app.state_names.size();
+    if (p1 == nullptr || dim == 0) { app.bridge_point_count = 0; app.bridge_built = true; return; }
+
+    /* observable: a state index if bif_observable names one, else state 0. */
+    size_t obs_idx = 0;
+    for (size_t i = 0; i < app.state_names.size(); ++i)
+      if (app.state_names[i] == app.bif_observable) { obs_idx = i; break; }
+
+    /* world extents (shared by the floor and the lifted diagram so they line
+     * up along the parameter axis — this is the whole point of the bridge). */
+    const double WX = 44.0, WZ = 38.0;
+    auto wx = [&](double u) { return (float)(u * WX - WX * 0.5); };       /* u in [0,1] */
+    auto wz = [&](double v) { return (float)(v * WZ - WZ * 0.5); };       /* v in [0,1] */
+
+    /* ---- the FRACTAL FLOOR (z=0 plane) -----------------------------------
+     * The bridge's real idea: show the object that GENERATES the cascade with
+     * the cascade rising out of it, sharing the parameter axis. For a MAP that
+     * has an escape-to-infinity criterion, the natural floor is the
+     * parameter-space escape set: x = the bifurcation parameter (same axis as
+     * the diagram above), and the perpendicular axis sweeps the system's first
+     * state variable's initial value. A point is "in the set" when the orbit
+     * stays bounded — exactly the Mandelbrot construction, but for THIS map.
+     * (For ODEs there's no escape fractal; the floor is skipped and only the
+     * lifted diagram is drawn.) The floor is laid in the plane y=0, with the
+     * bifurcation parameter mapped to the SAME wx() the diagram uses. */
+    if (app.bridge_show_mandelbrot && app.mode == SystemMode::Map) {
+      const int RES = std::max(80, app.bridge_mandel_res);
+      const int fmaxit = 120;
+      const double FR2 = 100.0;            /* escape radius^2 for the floor */
+      const double p1lo = app.bif_start, p1hi = app.bif_end;
+      /* perpendicular axis: first state initial value over a sensible window */
+      const double s0 = state_at(app.start, 0);
+      const double ic_lo = s0 - 1.0, ic_hi = s0 + 1.0;
+      const double pin = (p1 ? p1->value : 0.0);
+      State cur = app.start, nxt = app.start;
+      resize_state(cur, dim); resize_state(nxt, dim);
+      char ferr[128] = {0};
+      for (int jz = 0; jz < RES; ++jz) {
+        const double v = (double)jz / (RES - 1);
+        const double ic = ic_lo + (ic_hi - ic_lo) * v;
+        for (int ix2 = 0; ix2 < RES; ++ix2) {
+          const double u = (double)ix2 / (RES - 1);
+          if (p1) p1->value = p1lo + (p1hi - p1lo) * u;
+          sync_param_values(app);
+          for (size_t i = 0; i < dim; ++i) set_state_at(cur, i, state_at(app.start, i));
+          set_state_at(cur, 0, ic);
+          bool escaped = false; int it = 0;
+          for (; it < fmaxit; ++it) {
+            if (!step_map_state(app, cur, &nxt, ferr, sizeof(ferr))) { escaped = true; break; }
+            const double xx = state_at(nxt, 0), yy = (dim > 1) ? state_at(nxt, 1) : 0.0;
+            const double r2 = xx * xx + yy * yy;
+            if (!std::isfinite(r2) || r2 > FR2) { escaped = true; break; }
+            for (size_t i = 0; i < dim; ++i) set_state_at(cur, i, state_at(nxt, i));
+          }
+          if (!escaped) { /* bounded: part of the floor "set" */
+            pts.push_back(Point{wx(u), 0.0f, wz(v)});
+            cols.push_back(0.10f); cols.push_back(0.18f); cols.push_back(0.42f);
+          } else if (it > 3 && (it % 2 == 0)) { /* sparse exterior bands for context */
+            const double t = std::fmod(it * 0.06, 1.0);
+            pts.push_back(Point{wx(u), 0.0f, wz(v)});
+            cols.push_back(0.15f + 0.25f * (float)t);
+            cols.push_back(0.10f + 0.20f * (float)t);
+            cols.push_back(0.25f + 0.15f * (float)t);
+          }
+        }
+      }
+      if (p1) p1->value = pin;
+      sync_param_values(app);
+    }
+
+    /* force fixed-step during the sweep (restore after) */
+    const Integrator saved_integrator = app.integrator;
+    if (app.mode == SystemMode::ODE &&
+        (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45))
+      app.integrator = Integrator::RK4;
+    const double p1_old = p1->value;
+    const double p2_old = p2 ? p2->value : 0.0;
+
+    const int xslices = std::max(60, app.bridge_bif_slices);
+    const int zslices = p2 ? std::max(1, app.bridge_p2_slices) : 1;
+    const int discard = (app.mode == SystemMode::Map) ? 600 : 1500;
+    const int keep = std::max(20, app.bridge_bif_keep);
+
+    /* estimate the observable's vertical range for a sane height scale */
+    double obs_lo = 1e300, obs_hi = -1e300;
+    char err[256] = {0};
+    /* points pushed so far are the FLOOR (y=0); the diagram points come next.
+     * Only the diagram points get height-rescaled/recolored below. */
+    const size_t floor_count = pts.size();
+
+    for (int zi = 0; zi < zslices; ++zi) {
+      /* When there's no 2nd parameter we draw ONE diagram; place it at the
+       * floor's center line (v=0.5) so it visibly rises out of the fractal
+       * floor, mirroring how the logistic cascade sits on the Mandelbrot
+       * real axis. With a 2nd parameter we stack diagrams across z. */
+      const double v = (zslices > 1) ? (double)zi / (zslices - 1) : 0.5;
+      if (p2) { p2->value = app.bridge_p2_min + v * (app.bridge_p2_max - app.bridge_p2_min); }
+      for (int xi = 0; xi < xslices; ++xi) {
+        const double u = (double)xi / (xslices - 1);
+        p1->value = app.bif_start + u * (app.bif_end - app.bif_start);
+        sync_param_values(app); /* IR reads param_values, not ->value */
+        State s = app.start; resize_state(s, dim);
+        bool bad = false;
+        for (int k = 0; k < discard; ++k) {
+          State o{};
+          if (!step_state(app, s, &o, err, sizeof(err))) { bad = true; break; }
+          s = o;
+        }
+        if (bad) continue;
+        /* Sampling differs by system kind, exactly like the 2-D bifurcation
+         * view: for a MAP every iterate is a diagram point; for an ODE we take
+         * a Poincare-style section — the LOCAL MAXIMA of the observable — via
+         * a 3-sample window, otherwise an ODE just smears into a band. */
+        if (app.mode == SystemMode::Map) {
+          for (int k = 0; k < keep; ++k) {
+            State o{};
+            if (!step_state(app, s, &o, err, sizeof(err))) break;
+            s = o;
+            const double val = state_at(s, obs_idx);
+            if (!std::isfinite(val)) break;
+            if (val < obs_lo) obs_lo = val;
+            if (val > obs_hi) obs_hi = val;
+            pts.push_back(Point{wx(u), (float)val, wz(v)});
+            cols.push_back(0); cols.push_back(0); cols.push_back(0); /* recolored below */
+          }
+        } else {
+          double w0 = 0, w1 = 0, w2 = 0; int filled = 0;
+          for (int k = 0; k < keep; ++k) {
+            State o{};
+            if (!step_state(app, s, &o, err, sizeof(err))) break;
+            s = o;
+            const double val = state_at(s, obs_idx);
+            if (!std::isfinite(val)) break;
+            w0 = w1; w1 = w2; w2 = val; if (filled < 3) ++filled;
+            if (filled == 3 && w1 > w0 && w1 >= w2) { /* local maximum */
+              if (w1 < obs_lo) obs_lo = w1;
+              if (w1 > obs_hi) obs_hi = w1;
+              pts.push_back(Point{wx(u), (float)w1, wz(v)});
+              cols.push_back(0); cols.push_back(0); cols.push_back(0); /* recolored below */
+            }
+          }
+        }
+      }
+    }
+    p1->value = p1_old; if (p2) p2->value = p2_old; sync_param_values(app);
+    app.integrator = saved_integrator;
+
+    /* rescale heights into a pleasing band and recolor by normalized height —
+     * for the DIAGRAM points only (indices >= floor_count); the floor keeps
+     * its y=0 and its blue/exterior coloring. */
+    const double span = (obs_hi > obs_lo) ? (obs_hi - obs_lo) : 1.0;
+    for (size_t i = floor_count; i < pts.size(); ++i) {
+      const double tnorm = (pts[i].y - obs_lo) / span; /* 0..1 */
+      pts[i].y = (float)(tnorm * app.bridge_height);
+      const float t = (float)tnorm;
+      cols[i * 3 + 0] = 0.2f + 0.8f * t;
+      cols[i * 3 + 1] = 0.7f + 0.3f * t;
+      cols[i * 3 + 2] = 0.9f - 0.6f * t;
+    }
+
+    app.bridge_point_count = (int)pts.size();
+    if (pts.empty()) { app.bridge_built = true; return; }
+    if (app.bridge_vao == 0) glGenVertexArrays(1, &app.bridge_vao);
+    if (app.bridge_vbo == 0) glGenBuffers(1, &app.bridge_vbo);
+    if (app.bridge_cbo == 0) glGenBuffers(1, &app.bridge_cbo);
+    glBindVertexArray(app.bridge_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, app.bridge_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(pts.size() * sizeof(Point)), pts.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Point), (void *)0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, app.bridge_cbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(cols.size() * sizeof(float)), cols.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+    app.bridge_built = true;
+    return;
+  }
+
   /* world mapping helpers */
   const double re_lo = -2.2, re_hi = 0.7;
   const double im_lo = -1.2, im_hi = 1.2;
@@ -5527,10 +5828,32 @@ void render_bridge_scene(AppState &app) {
   }
 
   ImDrawList *draw = ImGui::GetBackgroundDrawList();
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235),
-                "3D bridge — Mandelbrot set (flat) + logistic bifurcation (rising along the real axis)");
-  draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
-                "they line up because z^2+c and the logistic map are conjugate.  drag: rotate   wheel: zoom");
+  if (app.bridge_mode == AppState::BridgeMode::CurrentSystem) {
+    char hud[384];
+    const char *obs = (app.bif_observable[0] != '\0') ? app.bif_observable : "x";
+    if (app.bridge_param2[0] != '\0')
+      std::snprintf(hud, sizeof(hud),
+                    "3D bridge (current system) — x: %s in [%.3g, %.3g],  height: %s,  z: %s in [%.3g, %.3g]  |  %d pts",
+                    app.bif_param, app.bif_start, app.bif_end, obs,
+                    app.bridge_param2, app.bridge_p2_min, app.bridge_p2_max, app.bridge_point_count);
+    else
+      std::snprintf(hud, sizeof(hud),
+                    "3D bridge (current system) — x: %s in [%.3g, %.3g],  height: %s  (set a 2nd param for a stacked surface)  |  %d pts",
+                    app.bif_param, app.bif_start, app.bif_end, obs, app.bridge_point_count);
+    draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+    draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
+                  app.mode == SystemMode::Map
+                    ? "the escape-set floor (this map's parameter space) with its bifurcation cascade rising out of it.  drag: rotate   wheel: zoom"
+                    : "this system's bifurcation diagram lifted into 3D (ODEs have no escape floor).  drag: rotate   wheel: zoom");
+    if (app.bridge_point_count == 0)
+      draw->AddText(ImVec2(14, 52), IM_COL32(255, 210, 120, 240),
+                    "no points — check the x param name/range and observable in the Setup tab, then Rebuild bridge.");
+  } else {
+    draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235),
+                  "3D bridge (logistic/Mandelbrot) — Mandelbrot set (flat) + logistic bifurcation (rising along the real axis)");
+    draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
+                  "they line up because z^2+c and the logistic map are conjugate.  switch to 'current system' mode for other systems.  drag: rotate   wheel: zoom");
+  }
 }
 
 /* PHASE B+: high-quality bifurcation view.
@@ -6449,6 +6772,7 @@ void find_fixed_point(AppState &app) {
    * for the spectrum and the saddle/Hopf/fold flags. */
   app.fixed_general_ready = false;
   app.cas_eig_ready = false; /* invalidate any cached CAS spectrum */
+  app.hopf_l1_ready = false; /* invalidate cached Hopf classification */
   if (!app.fixed_jacobian.empty()) {
     app.fixed_general =
         dynsys::analysis::classify_equilibrium(app.fixed_jacobian, n);
@@ -7399,6 +7723,16 @@ void draw_gui(AppState &app) {
   ImGui::Begin("controls", nullptr, side_flags);
 
   ImGui::Text("FPS: %d | mode: %s | integrator: %s | dim: %zu", app.fps, mode_name(app.mode), integrator_name(app.integrator), app.state_names.size());
+  ImGui::Checkbox("auto performance governor", &app.perf_governor_enabled);
+  if (app.perf_governor_enabled) {
+    ImGui::SameLine();
+    if (app.perf_throttle_active)
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                         "throttling %.0f%% (%.0f ms/frame) — easing load to stay responsive",
+                         app.perf_throttle * 100.0, app.perf_frame_ms);
+    else
+      ImGui::TextColored(ImVec4(0.5f, 0.85f, 0.6f, 1.0f), "headroom OK (%.0f ms/frame)", app.perf_frame_ms);
+  }
   std::string state_line = "t " + std::to_string(app.current.t);
   for (size_t i = 0; i < app.state_names.size(); ++i) {
     char buf[96];
@@ -7497,13 +7831,24 @@ void draw_gui(AppState &app) {
 
   /* PHASE C: fractal controls (shown when the fractal view is active). */
   if (app.active_view == AppState::ActiveView::Fractal &&
-      app.mode == SystemMode::Map && app.state_names.size() >= 2) {
+      app.mode == SystemMode::Map &&
+      (!app.params.empty() || app.state_names.size() >= 2)) {
+    /* State-space (Julia) needs 2 state variables. For a 1-D map only
+     * parameter-space is meaningful, so force it and disable the toggle. */
+    const bool can_state_space = (app.state_names.size() >= 2);
+    if (!can_state_space) app.fractal_mode = AppState::FractalMode::ParameterSpace;
     if (ImGui::CollapsingHeader("Fractal", ImGuiTreeNodeFlags_DefaultOpen)) {
       int mode = (int)app.fractal_mode;
       const char *modes[] = {"parameter space (Mandelbrot-type)", "state space (Julia-type)"};
+      if (!can_state_space) ImGui::BeginDisabled();
       if (ImGui::Combo("mode", &mode, modes, 2)) {
         app.fractal_mode = (AppState::FractalMode)mode;
         app.fractal_dirty = true;
+      }
+      if (!can_state_space) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("State-space (Julia) needs 2 state variables; this 1-D map only has parameter-space.");
       }
       ImGui::TextWrapped("Mandelbrot = which parameter values keep the start orbit bounded. "
                          "Julia = which initial points stay bounded for fixed parameters. "
@@ -7519,6 +7864,9 @@ void draw_gui(AppState &app) {
             if (ImGui::Selectable(app.params[i].name.c_str(), i == app.fractal_param_cy_index)) { app.fractal_param_cy_index = i; app.fractal_dirty = true; }
           ImGui::EndCombo();
         }
+        if (app.params.size() >= 2 && app.fractal_param_cx_index == app.fractal_param_cy_index)
+          ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                             "both axes are the same parameter — the image collapses to a diagonal; pick two different parameters.");
       }
       if (ImGui::SliderInt("max iterations", &app.fractal_max_iter, 20, 2000)) app.fractal_dirty = true;
       if (ImGui::InputDouble("escape radius", &app.fractal_escape_r, 0.5, 1.0, "%.3g")) app.fractal_dirty = true;
@@ -7537,15 +7885,60 @@ void draw_gui(AppState &app) {
   /* PHASE C+: controls for the 3D bridge scene. */
   if (app.active_view == AppState::ActiveView::Scene3DBridge) {
     if (ImGui::CollapsingHeader("3D bridge", ImGuiTreeNodeFlags_DefaultOpen)) {
-      ImGui::TextWrapped("The Mandelbrot set (flat) with the logistic bifurcation diagram "
-                         "rising along its real axis. They align because z^2+c and the "
-                         "logistic map are conjugate.");
       bool changed = false;
-      changed |= ImGui::Checkbox("show Mandelbrot", &app.bridge_show_mandelbrot);
+      /* Classic mode is only meaningful for the quadratic family (a 1-D map);
+       * for anything else, force and lock CurrentSystem mode so the view
+       * always reflects the loaded system rather than a fixed logistic cascade. */
+      const bool classic_ok = (app.mode == SystemMode::Map && effective_dimension(app) == 1);
+      if (!classic_ok && app.bridge_mode == AppState::BridgeMode::Classic) {
+        app.bridge_mode = AppState::BridgeMode::CurrentSystem;
+        app.bridge_built = false;
+      }
+      int mode = (app.bridge_mode == AppState::BridgeMode::Classic) ? 0 : 1;
+      ImGui::TextUnformatted("mode:");
       ImGui::SameLine();
-      changed |= ImGui::Checkbox("show bifurcation", &app.bridge_show_bifurcation);
-      changed |= ImGui::SliderInt("Mandelbrot resolution", &app.bridge_mandel_res, 120, 700);
-      changed |= ImGui::SliderInt("bifurcation slices", &app.bridge_bif_slices, 100, 1500);
+      if (!classic_ok) ImGui::BeginDisabled();
+      if (ImGui::RadioButton("logistic/Mandelbrot", mode == 0)) { mode = 0; changed = true; }
+      if (!classic_ok) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Classic mode needs a 1-D map (the quadratic family). "
+                            "Load the logistic map to use it.");
+      }
+      ImGui::SameLine();
+      if (ImGui::RadioButton("current system", mode == 1)) { mode = 1; changed = true; }
+      app.bridge_mode = (mode == 0 && classic_ok) ? AppState::BridgeMode::Classic
+                                                  : AppState::BridgeMode::CurrentSystem;
+
+      if (app.bridge_mode == AppState::BridgeMode::Classic) {
+        ImGui::TextWrapped("The Mandelbrot set (flat) with the logistic bifurcation diagram "
+                           "rising along its real axis. They align because z^2+c and the "
+                           "logistic map are conjugate. (This exact correspondence is special "
+                           "to the quadratic family.)");
+        changed |= ImGui::Checkbox("show Mandelbrot", &app.bridge_show_mandelbrot);
+        ImGui::SameLine();
+        changed |= ImGui::Checkbox("show bifurcation", &app.bridge_show_bifurcation);
+        changed |= ImGui::SliderInt("Mandelbrot resolution", &app.bridge_mandel_res, 120, 700);
+      } else {
+        ImGui::TextWrapped("Lifts THIS system's bifurcation diagram into 3D: the primary "
+                           "parameter along x, the observable's value as height, and an "
+                           "optional second parameter stacked along z. Works for any system.");
+        /* primary parameter + range come from the bifurcation view's settings */
+        ImGui::InputText("x param (primary)", app.bif_param, sizeof(app.bif_param));
+        changed |= ImGui::InputDouble("x min", &app.bif_start, 0.0, 0.0, "%.4g");
+        changed |= ImGui::InputDouble("x max", &app.bif_end, 0.0, 0.0, "%.4g");
+        ImGui::InputText("observable", app.bif_observable, sizeof(app.bif_observable));
+        ImGui::Separator();
+        ImGui::InputText("z param (optional 2nd)", app.bridge_param2, sizeof(app.bridge_param2));
+        if (app.bridge_param2[0] != '\0') {
+          changed |= ImGui::InputDouble("z min", &app.bridge_p2_min, 0.0, 0.0, "%.4g");
+          changed |= ImGui::InputDouble("z max", &app.bridge_p2_max, 0.0, 0.0, "%.4g");
+          changed |= ImGui::SliderInt("z slices (stacked diagrams)", &app.bridge_p2_slices, 1, 80);
+        } else {
+          ImGui::TextDisabled("(leave z param empty for a single diagram lifted to 3D)");
+        }
+      }
+      changed |= ImGui::SliderInt("bifurcation slices", &app.bridge_bif_slices, 60, 1500);
       changed |= ImGui::SliderInt("attractor points/slice", &app.bridge_bif_keep, 20, 400);
       changed |= ImGui::SliderFloat("bifurcation height", &app.bridge_height, 5.0f, 40.0f, "%.1f");
       if (ImGui::Button("Rebuild bridge") || changed) app.bridge_built = false;
@@ -7584,6 +7977,9 @@ void draw_gui(AppState &app) {
           if (ImGui::Selectable(app.params[i].name.c_str(), i == app.scan_py_index)) { app.scan_py_index = i; app.scan_view_init = false; }
         ImGui::EndCombo();
       }
+      if (app.scan_px_index == app.scan_py_index)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "x and y are the same parameter — pick two different parameters for a 2-D scan.");
       ImGui::InputDouble("x min", &app.scan_xmin, 0.0, 0.0, "%.4g"); ImGui::SameLine();
       ImGui::InputDouble("x max", &app.scan_xmax, 0.0, 0.0, "%.4g");
       ImGui::InputDouble("y min", &app.scan_ymin, 0.0, 0.0, "%.4g"); ImGui::SameLine();
@@ -7799,17 +8195,27 @@ void draw_gui(AppState &app) {
   }
 
   if (ImGui::CollapsingHeader("Simulation")) {
-    int integrator_idx = static_cast<int>(app.integrator);
-    const char *integrators[] = {"Euler", "RK2 midpoint", "Heun (RK2)", "RK4",
-                                 "RK 3/8", "RKF45 (adaptive)", "Dormand-Prince (adaptive)"};
-    if (ImGui::Combo("integrator", &integrator_idx, integrators, 7)) app.integrator = static_cast<Integrator>(integrator_idx);
-    const bool adaptive = (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45);
-    ImGui::InputDouble(adaptive ? "dt (output step)" : "dt", &app.dt, 0.001, 0.01, "%.8f");
-    if (adaptive) {
-      ImGui::InputDouble("tolerance", &app.adaptive_tol, 1e-7, 1e-6, "%.1e");
-      ImGui::InputDouble("min substep", &app.adaptive_dt_min, 1e-7, 1e-6, "%.1e"); ImGui::SameLine();
-      ImGui::InputDouble("max substep", &app.adaptive_dt_max, 1e-3, 1e-2, "%.1e");
-      ImGui::TextDisabled("adaptive: subdivides each dt to meet the tolerance (last substep %.2e)", app.last_adaptive_dt);
+    /* Integrator and dt only apply to ODEs. Maps iterate discretely (no step
+     * size), and IFS uses the chaos game — so those controls are hidden for
+     * them and a short note explains why, rather than offering meaningless
+     * choices. */
+    if (app.mode == SystemMode::ODE) {
+      int integrator_idx = static_cast<int>(app.integrator);
+      const char *integrators[] = {"Euler", "RK2 midpoint", "Heun (RK2)", "RK4",
+                                   "RK 3/8", "RKF45 (adaptive)", "Dormand-Prince (adaptive)"};
+      if (ImGui::Combo("integrator", &integrator_idx, integrators, 7)) app.integrator = static_cast<Integrator>(integrator_idx);
+      const bool adaptive = (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45);
+      ImGui::InputDouble(adaptive ? "dt (output step)" : "dt", &app.dt, 0.001, 0.01, "%.8f");
+      if (adaptive) {
+        ImGui::InputDouble("tolerance", &app.adaptive_tol, 1e-7, 1e-6, "%.1e");
+        ImGui::InputDouble("min substep", &app.adaptive_dt_min, 1e-7, 1e-6, "%.1e"); ImGui::SameLine();
+        ImGui::InputDouble("max substep", &app.adaptive_dt_max, 1e-3, 1e-2, "%.1e");
+        ImGui::TextDisabled("adaptive: subdivides each dt to meet the tolerance (last substep %.2e)", app.last_adaptive_dt);
+      }
+    } else if (app.mode == SystemMode::Map) {
+      ImGui::TextDisabled("Maps iterate discretely — no integrator or step size.");
+    } else {
+      ImGui::TextDisabled("IFS uses the chaos game — no integrator or step size.");
     }
     ImGui::SliderInt("steps/frame", &app.steps_per_frame, 1, 2000);
     resize_state(app.start, app.state_names.size());
@@ -7831,6 +8237,18 @@ void draw_gui(AppState &app) {
   ImGui::EndTabItem(); } /* Setup */
   if (ImGui::BeginTabItem("Analysis")) {
 
+  if (app.mode == SystemMode::IFS) {
+    /* The Lyapunov-spectrum / equilibria / limit-cycle / Poincare tools are
+     * for flows and iterated maps; an IFS is a set of contractions explored by
+     * the chaos game and characterized by its fractal dimension instead. Show
+     * that rather than buttons that would produce meaningless results. */
+    ImGui::TextWrapped("This is an IFS (iterated function system). The flow/map analysis tools "
+                       "(Lyapunov spectrum, equilibria, limit cycles, Poincare sections) don't "
+                       "apply to an IFS.");
+    ImGui::TextWrapped("An IFS is characterized by its attractor's fractal dimension. Use the "
+                       "Fractal/IFS view and the box-counting dimension there. Edit the maps and "
+                       "weights in the Setup tab's \"IFS maps\" panel.");
+  } else {
   if (ImGui::CollapsingHeader("Analysis", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Checkbox("estimate largest Lyapunov exponent", &app.lyapunov_enabled);
     ImGui::InputDouble("Lyapunov epsilon", &app.lyapunov_epsilon, 1e-6, 1e-5, "%.1e");
@@ -7936,6 +8354,79 @@ void draw_gui(AppState &app) {
         if (app.fixed_general.fold_candidate)
           ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                              "fold candidate (real eigenvalue near zero)");
+
+        /* Normal-form classification of the Hopf point: the first Lyapunov
+         * coefficient (the MatCont quantity). Offered whenever an equilibrium
+         * is in hand — it self-checks for a pure-imaginary pair and reports if
+         * this isn't actually a Hopf point. */
+        if (app.fixed_ready) {
+          if (ImGui::Button("Classify Hopf (first Lyapunov coeff)")) {
+            AppState::Param *bp = app.params.empty() ? nullptr : find_param(app, app.cont_param);
+            if (bp == nullptr && !app.params.empty()) bp = &app.params[0];
+            if (bp != nullptr) {
+              dynsys::analysis::Model model = build_model(app, bp);
+              std::vector<double> xeq(app.state_names.size());
+              for (size_t i = 0; i < xeq.size(); ++i) xeq[i] = state_at(app.fixed_point, i);
+              std::string e;
+              app.hopf_l1_ready = dynsys::analysis::hopf_first_lyapunov(
+                  model, xeq, bp->value, &app.hopf_l1, &app.hopf_omega, &e);
+              app.hopf_l1_msg = app.hopf_l1_ready ? "ok" : e;
+            } else {
+              app.hopf_l1_ready = false;
+              app.hopf_l1_msg = "no parameter to evaluate the vector field";
+            }
+          }
+          if (app.hopf_l1_ready) {
+            const char *verdict = app.hopf_l1 < 0
+                ? "SUPERcritical Hopf (l1<0): a stable limit cycle is born"
+                : (app.hopf_l1 > 0
+                     ? "SUBcritical Hopf (l1>0): an unstable cycle; hard loss of stability"
+                     : "degenerate (l1~0): Bautin / generalized-Hopf codim-2 point");
+            ImGui::TextColored(app.hopf_l1 < 0 ? ImVec4(0.5f,1.0f,0.6f,1.0f)
+                                               : ImVec4(1.0f,0.7f,0.4f,1.0f),
+                               "first Lyapunov coeff l1 = %.4g  (omega = %.4g)", app.hopf_l1, app.hopf_omega);
+            ImGui::TextWrapped("%s", verdict);
+          } else if (!app.hopf_l1_msg.empty() && app.hopf_l1_msg != "ok") {
+            ImGui::TextDisabled("Hopf classification: %s", app.hopf_l1_msg.c_str());
+          }
+
+          /* Fold (limit point) normal-form coefficient — the LP counterpart of
+           * the Hopf l1, also a MatCont quantity. a != 0 => genuine quadratic
+           * fold; a ~ 0 => cusp (codim-2). Self-checks for a near-zero
+           * eigenvalue and says when the point isn't actually a fold. */
+          if (ImGui::Button("Classify fold (normal-form coeff a)")) {
+            AppState::Param *bp = app.params.empty() ? nullptr : find_param(app, app.cont_param);
+            if (bp == nullptr && !app.params.empty()) bp = &app.params[0];
+            if (bp != nullptr) {
+              dynsys::analysis::Model model = build_model(app, bp);
+              std::vector<double> xeq(app.state_names.size());
+              for (size_t i = 0; i < xeq.size(); ++i) xeq[i] = state_at(app.fixed_point, i);
+              std::string e;
+              app.fold_a_ready = dynsys::analysis::fold_normal_form(
+                  model, xeq, bp->value, &app.fold_a, &app.fold_lambda0, &e);
+              app.fold_a_msg = app.fold_a_ready ? "ok" : e;
+            } else {
+              app.fold_a_ready = false;
+              app.fold_a_msg = "no parameter to evaluate the vector field";
+            }
+          }
+          if (app.fold_a_ready) {
+            const bool at_fold = app.fold_lambda0 >= 0 && app.fold_lambda0 < 1e-2;
+            const char *verdict = (std::fabs(app.fold_a) < 1e-3)
+                ? "a ~ 0: degenerate fold -> CUSP (codim-2)"
+                : "a != 0: non-degenerate quadratic fold (saddle-node)";
+            ImGui::TextColored(std::fabs(app.fold_a) < 1e-3 ? ImVec4(1.0f,0.7f,0.4f,1.0f)
+                                                            : ImVec4(0.5f,0.85f,1.0f,1.0f),
+                               "fold coefficient a = %.4g   (|smallest eigenvalue| = %.2e)",
+                               app.fold_a, app.fold_lambda0);
+            ImGui::TextWrapped("%s", verdict);
+            if (!at_fold)
+              ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                 "note: no eigenvalue is near zero here, so this equilibrium isn't at a fold — the coefficient is only meaningful AT a fold point.");
+          } else if (!app.fold_a_msg.empty() && app.fold_a_msg != "ok") {
+            ImGui::TextDisabled("fold classification: %s", app.fold_a_msg.c_str());
+          }
+        }
       }
 
       /* PHASE E: exact, certificate-backed eigenvalues from the Sangaku CAS.
@@ -8149,6 +8640,7 @@ void draw_gui(AppState &app) {
     }
   }
 
+  } /* else (non-IFS Analysis) */
   ImGui::EndTabItem(); } /* Analysis */
   if (ImGui::BeginTabItem("Data & view")) {
 
@@ -8360,6 +8852,37 @@ int run_headless(int argc, char **argv) {
   return EXIT_SUCCESS;
 }
 
+/* Adaptive performance governor. Called once per frame with the raw frame time
+ * in milliseconds. Smooths it, then nudges app.perf_throttle toward 1 when
+ * frames are too slow and toward 0 when there's headroom. The throttle is a
+ * hysteretic ramp (not a hard switch) so the picture doesn't oscillate. The
+ * heavy compute paths (fractal/IFS/integration substeps) read perf_throttle to
+ * scale their budgets, and steps_per_frame is reduced directly here. This is
+ * what keeps the program from spiraling into an unresponsive state on a very
+ * heavy fractal or a huge step count. */
+void update_perf_governor(AppState &app, double raw_frame_ms) {
+  if (!app.perf_governor_enabled) {
+    app.perf_throttle = 0.0;
+    app.perf_throttle_active = false;
+    return;
+  }
+  /* exponential smoothing so a single hitch doesn't jerk the throttle */
+  const double alpha = 0.15;
+  if (!std::isfinite(raw_frame_ms) || raw_frame_ms <= 0.0) raw_frame_ms = app.perf_frame_ms;
+  raw_frame_ms = std::min(raw_frame_ms, 1000.0); /* clamp pathological spikes */
+  app.perf_frame_ms = (1.0 - alpha) * app.perf_frame_ms + alpha * raw_frame_ms;
+
+  /* budgets: comfortable below ~22 ms (~45 fps), distressed above ~40 ms
+   * (~25 fps). Ramp the throttle within that band. */
+  const double good_ms = 22.0, bad_ms = 40.0;
+  if (app.perf_frame_ms > bad_ms) {
+    app.perf_throttle = std::min(1.0, app.perf_throttle + 0.08);
+  } else if (app.perf_frame_ms < good_ms) {
+    app.perf_throttle = std::max(0.0, app.perf_throttle - 0.04);
+  }
+  app.perf_throttle_active = (app.perf_throttle > 0.02);
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--headless") == 0) {
     return run_headless(argc, argv);
@@ -8386,11 +8909,25 @@ int main(int argc, char **argv) {
   update_projection(app);
   double last_fps_time = glfwGetTime();
   int frame_count = 0;
+  double prev_frame_time = glfwGetTime();
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
     process_keyboard(app, window);
+    /* measure the previous frame's wall time and update the governor BEFORE
+     * doing this frame's heavy work, so the throttle reflects recent load. */
+    const double frame_start = glfwGetTime();
+    update_perf_governor(app, (frame_start - prev_frame_time) * 1000.0);
+    prev_frame_time = frame_start;
     if (!app.paused && app.mode != SystemMode::IFS) {
-      for (int i = 0; i < app.steps_per_frame; ++i) {
+      /* throttle integration substeps: at full throttle do ~15% of the
+       * requested steps (min 1). Keeps trajectory cost bounded when the
+       * frame budget is blown. */
+      int eff_steps = app.steps_per_frame;
+      if (app.perf_throttle > 0.02) {
+        eff_steps = (int)std::ceil(app.steps_per_frame * (1.0 - 0.85 * app.perf_throttle));
+        if (eff_steps < 1) eff_steps = 1;
+      }
+      for (int i = 0; i < eff_steps; ++i) {
         if (!calculate_next_point(app)) break;
       }
     }
