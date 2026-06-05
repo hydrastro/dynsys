@@ -14,9 +14,23 @@
       url = "https://downloads.sourceforge.net/project/glew/glew/2.2.0/glew-2.2.0.tgz";
       flake = false;
     };
+    # Phase E (exact symbolic analysis): the Sangaku proof-carrying CAS and the
+    # Lizard interpreter it runs on. The dynsys cas_bridge shells out to the
+    # `lizard` binary with Sangaku on the module path for exact eigenvalues,
+    # equilibria, and certified derivatives. Lizard's own flake pulls its C
+    # dependencies (ds + gmp), so we don't re-declare them here.
+    lizard = {
+      url = "github:hydrastro/lizard";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    sangaku = {
+      url = "github:hydrastro/sangaku";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.lizard.follows = "lizard";
+    };
   };
 
-  outputs = { nixpkgs, imgui, glew-src, ... }:
+  outputs = { nixpkgs, imgui, glew-src, lizard, sangaku, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -32,6 +46,11 @@
             config.allowUnsupportedSystem = true;
           };
           lib = pkgs.lib;
+          # Phase E CAS bridge: the Lizard interpreter binary and the Sangaku
+          # library source. lizardBin/bin/lizard runs Sangaku Lisp; sangakuSrc
+          # is the library root (so SANGAKU_ROOT points the launcher at it).
+          lizardBin = lizard.packages.${system}.default or lizard.defaultPackage.${system};
+          sangakuSrc = sangaku;
           winPkgs = pkgsAllowUnsupported.pkgsCross.mingwW64;
           winTarget = winPkgs.stdenv.hostPlatform.config;
           # Force GLFW to be built as a static MinGW library so the final
@@ -58,6 +77,7 @@
               gdb
               gnumake
               pkg-config
+              lizardBin
             ];
 
             buildInputs = with pkgs; [
@@ -75,16 +95,25 @@
             CC = "clang";
             CXX = "clang++";
             IMGUI_DIR = "${imgui}";
+            # Phase E: where the cas_bridge finds the CAS. LIZARD is the
+            # interpreter binary; SANGAKU_ROOT is the library the launcher
+            # feeds (prelude + script). The bridge degrades gracefully to the
+            # numeric path if these are unset / the binary is absent.
+            LIZARD = "${lizardBin}/bin/lizard";
+            SANGAKU_ROOT = "${sangakuSrc}";
 
             shellHook = ''
               export CC=clang
               export CXX=clang++
+              export LIZARD=${lib.escapeShellArg "${lizardBin}/bin/lizard"}
+              export SANGAKU_ROOT=${lib.escapeShellArg "${sangakuSrc}"}
               echo "dynsys Dear ImGui native dev shell"
               echo "  build: make"
               echo "  run:   make run"
               echo "  clean: make clean"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  GLEW_DIR=$GLEW_DIR"
+              echo "  LIZARD=$LIZARD  (Phase E CAS bridge)"
             '';
           };
 

@@ -37,6 +37,7 @@ extern "C" {
 
 #include "analysis.h"
 #include "expr_ir_ad.h"
+#include "cas_bridge.h"
 
 #define PNG_WRITER_IMPLEMENTATION
 #include "png_writer.h"
@@ -569,8 +570,7 @@ struct AppState {
   bool fixed_ready = false;
   State fixed_point{};
   double fixed_residual = 0.0;
-  std::vector<double> fixed_jacobian;
-  std::string fixed_classification;
+  std::vector<double> fixed_jacobian;  std::string fixed_classification;
   std::vector<std::pair<double, double>> fixed_eigenvalues;
   std::vector<PhaseTrajectory> separatrix_curves;
   int separatrix_steps = 2500;
@@ -581,6 +581,13 @@ struct AppState {
    * panel; this richer classification works in any dimension. */
   dynsys::analysis::Classification fixed_general{};
   bool fixed_general_ready = false;
+  /* PHASE E: cached exact eigenvalue report from the Sangaku CAS for the
+   * located equilibrium (computed on demand via the button, not every frame).
+   * cas_eig_requested guards recomputation; cas_eig_exact records whether the
+   * Jacobian rationalized exactly (so an approximate result is labelled). */
+  dynsys::cas::EigenReport cas_eig{};
+  bool cas_eig_ready = false;
+  bool cas_eig_exact = false;
   char cont_param[64] = "rho";
   double cont_p_min = -10.0;
   double cont_p_max = 110.0;
@@ -6441,6 +6448,7 @@ void find_fixed_point(AppState &app) {
    * Works in any dimension and supersedes the 2D-only trace/det path
    * for the spectrum and the saddle/Hopf/fold flags. */
   app.fixed_general_ready = false;
+  app.cas_eig_ready = false; /* invalidate any cached CAS spectrum */
   if (!app.fixed_jacobian.empty()) {
     app.fixed_general =
         dynsys::analysis::classify_equilibrium(app.fixed_jacobian, n);
@@ -7649,7 +7657,7 @@ void draw_gui(AppState &app) {
     const bool has_param_coef = !app.ifs_maps_editable;
     if (has_param_coef)
       ImGui::TextColored(ImVec4(0.95f,0.8f,0.4f,1.0f),
-                         "coefficients shown in orange are parameter-driven (adjust them in Parameters); the rest are editable here");
+                         "orange coefficients are parameter-driven; drag one to take manual control (it becomes a fixed value)");
 
     struct CoefSpec { const char *label; float lo, hi; };
     const CoefSpec specs[7] = {
@@ -7663,47 +7671,44 @@ void draw_gui(AppState &app) {
       ImGui::SeparatorText((std::string("map ") + std::to_string(mi + 1)).c_str());
       bool changed = false;
       for (int k = 0; k < 7; ++k) {
-        /* a coefficient is editable iff its expression is a literal number */
-        const bool coef_editable = (mi < app.ifs_coef_literal.size())
-                                   ? app.ifs_coef_literal[mi][(size_t)k] : true;
+        /* every coefficient is draggable. If it's currently parameter-driven
+         * (not literal), colour it orange; dragging it converts that slot to
+         * a fixed literal so it stops being overwritten by the expression. */
+        const bool param_driven = (mi < app.ifs_coef_literal.size())
+                                   ? !app.ifs_coef_literal[mi][(size_t)k] : false;
         float lo = specs[k].lo, hi = specs[k].hi;
         if ((float)*coef[k] < lo) lo = (float)*coef[k];
         if ((float)*coef[k] > hi) hi = (float)*coef[k];
         float v = (float)*coef[k];
         ImGui::SetNextItemWidth(150);
-        if (!coef_editable) {
-          /* parameter-driven: disabled slider that tracks the live value,
-           * labelled in orange so it's clear why it can't be dragged here */
-          ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240,180,90,255));
-          ImGui::BeginDisabled();
-          ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f");
-          ImGui::EndDisabled();
-          ImGui::PopStyleColor();
-        } else {
-          if (ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f")) { *coef[k] = (double)v; changed = true; }
+        if (param_driven) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240,180,90,255));
+        if (ImGui::SliderFloat(specs[k].label, &v, lo, hi, "%.4f")) {
+          *coef[k] = (double)v;
+          changed = true;
+          if (param_driven && mi < app.ifs_coef_literal.size())
+            app.ifs_coef_literal[mi][(size_t)k] = true; /* take manual control */
         }
+        if (param_driven) ImGui::PopStyleColor();
         if (k % 2 == 0 && k < 6) ImGui::SameLine();
       }
       if (changed) app.ifs_dirty = true;
       ImGui::PopID();
     }
 
-    if (app.ifs_maps_editable) {
-      ImGui::Separator();
-      if (ImGui::SmallButton("+ add map")) {
-        app.ifs_maps.push_back(dynsys::analysis::AffineMap{0.5,0,0,0.5,0,0,0.0});
-        app.ifs_coef_literal.push_back({true,true,true,true,true,true,true});
-        app.ifs_dirty = true;
-      }
-      ImGui::SameLine();
-      if (ImGui::SmallButton("- remove last") && app.ifs_maps.size() > 1) {
-        app.ifs_maps.pop_back();
-        if (!app.ifs_coef_literal.empty()) app.ifs_coef_literal.pop_back();
-        app.ifs_dirty = true;
-      }
-      ImGui::SameLine();
-      ImGui::TextDisabled("(slider edits drive the attractor live)");
+    ImGui::Separator();
+    if (ImGui::SmallButton("+ add map")) {
+      app.ifs_maps.push_back(dynsys::analysis::AffineMap{0.5,0,0,0.5,0,0,0.0});
+      app.ifs_coef_literal.push_back({true,true,true,true,true,true,true});
+      app.ifs_dirty = true;
     }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("- remove last") && app.ifs_maps.size() > 1) {
+      app.ifs_maps.pop_back();
+      if (!app.ifs_coef_literal.empty()) app.ifs_coef_literal.pop_back();
+      app.ifs_dirty = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(slider edits drive the attractor live)");
   }
 
   if (ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -7931,6 +7936,60 @@ void draw_gui(AppState &app) {
         if (app.fixed_general.fold_candidate)
           ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                              "fold candidate (real eigenvalue near zero)");
+      }
+
+      /* PHASE E: exact, certificate-backed eigenvalues from the Sangaku CAS.
+       * Only offered when the CAS is reachable; degrades silently otherwise so
+       * the numeric spectrum above always stands on its own. */
+      if (dynsys::cas::is_available() && !app.fixed_jacobian.empty()) {
+        ImGui::Separator();
+        if (ImGui::Button("Certified eigenvalues (CAS)")) {
+          const int n = (int)app.state_names.size();
+          if ((int)app.fixed_jacobian.size() == n * n) {
+            bool exact = false;
+            app.cas_eig = dynsys::cas::eigen_report_from_doubles(
+                app.fixed_jacobian.data(), n, &exact);
+            app.cas_eig_exact = exact;
+            app.cas_eig_ready = true;
+          }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(exact spectrum + stability via Sangaku)");
+
+        if (app.cas_eig_ready) {
+          const auto &R = app.cas_eig;
+          if (!R.ok) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
+                               "CAS: %s", R.message.c_str());
+          } else {
+            if (!app.cas_eig_exact)
+              ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+                                 "approximate: Jacobian not exactly rational "
+                                 "(showing nearest rational system)");
+            else
+              ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1.0f),
+                                 "exact (rational Jacobian) -- kernel-checked");
+            /* exact eigenvalue strings */
+            for (const auto &s : R.eigen_strings)
+              ImGui::TextWrapped("  lambda: %s", s.c_str());
+            /* certified stability verdict from exact Routh-Hurwitz */
+            const char *verdict =
+                R.stable ? "STABLE (all eigenvalues in the left half-plane)"
+                         : (R.n_imag > 0
+                                ? "MARGINAL (eigenvalues on the imaginary axis)"
+                                : "UNSTABLE (an eigenvalue in the right half-plane)");
+            ImVec4 col = R.stable ? ImVec4(0.5f, 1.0f, 0.6f, 1.0f)
+                       : (R.n_imag > 0 ? ImVec4(0.5f, 0.8f, 1.0f, 1.0f)
+                                       : ImVec4(1.0f, 0.6f, 0.5f, 1.0f));
+            ImGui::TextColored(col, "%s", verdict);
+            ImGui::Text("Re<0: %d   Re>0: %d   Re=0: %d",
+                        R.n_lhp, R.n_rhp, R.n_imag);
+            if (R.n_imag == 2 && R.n_rhp == 0)
+              ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
+                                 "exact Hopf point: a pair sits precisely on the "
+                                 "imaginary axis (Re = 0 exactly)");
+          }
+        }
       }
       ImGui::InputDouble("separatrix epsilon", &app.separatrix_epsilon, 1e-5, 1e-4, "%.1e");
       ImGui::SliderInt("separatrix steps", &app.separatrix_steps, 100, 20000);

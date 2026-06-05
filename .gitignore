@@ -1,0 +1,44 @@
+# ---- dynsys build output ----
+# Everything the Makefile emits lives under the build root (and the
+# out-of-tree windows build root). `make clean` removes these; `make
+# distclean` also removes the runtime artifacts below.
+/build/
+/build-*/
+# nix: `nix build` drops a ./result symlink
+/result
+/result-*
+
+# ---- compiled objects / libraries (in case of in-tree builds) ----
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.d
+
+# ---- runtime artifacts dynsys writes into the working directory ----
+# Save-PNG screenshots: dynsys_YYYYMMDD_HHMMSS.png
+dynsys_[0-9]*.png
+# default trajectory / Poincare CSV export
+dynsys_export.csv
+# scratch image formats sometimes produced while testing
+*.ppm
+
+# ---- editor / IDE / OS noise ----
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+.DS_Store
+Thumbs.db
+
+# ---- direnv / nix shell ----
+.direnv/
+.envrc.local

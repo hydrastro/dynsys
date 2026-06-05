@@ -1,37 +1,49 @@
-# dynsys — IFS coefficient sliders are now editable (per-coefficient)
+# dynsys — Phase E slice 1b: certified eigenvalues in the equilibrium readout
+#           + a Sangaku CAS module that fills real gaps
 
-Unzip at repo root, then `make clean && make && make run`. Green
-"dynsys NEW-UI <date>" label = you're on this build.
+Unzip at repo root, `make clean && make && make run`. With Nix, `nix develop`
+provides the Lizard interpreter + Sangaku so the CAS features light up.
 
-## The fix
+## 1. Certified eigenvalues wired into the fixed-point panel (slice 1b)
+After "Find fixed point", when the CAS is reachable, a new button
+**"Certified eigenvalues (CAS)"** appears in the Analysis tab. It:
+- takes the Jacobian dynsys already computed at the equilibrium
+  (app.fixed_jacobian, doubles),
+- rationalizes each entry (continued fractions; flags whether every entry is
+  exactly rational),
+- runs Sangaku via Lizard and shows the EXACT eigenvalues, an exact
+  Routh-Hurwitz stability verdict (stable / unstable / marginal), the
+  Re<0 / Re>0 / Re=0 counts, and — when a pair sits precisely on the
+  imaginary axis — an "exact Hopf point (Re = 0 exactly)" note.
+The numeric spectrum above it is untouched and always stands alone; the CAS
+section is purely additive and silently absent when LIZARD/SANGAKU_ROOT
+aren't set. If the Jacobian isn't exactly rational, the result is clearly
+labelled "approximate (nearest rational system)".
 
-I had disabled ALL the coefficient sliders for any IFS that had a parameter
-or a non-constant coefficient — too blunt. Now editability is decided
-**per coefficient**:
+New in src/cas_bridge.h: `rationalize()` (double -> exact rational with a
+tolerance + denominator bound) and `eigen_report_from_doubles()` (the
+UI entry point). Verified live: Lorenz origin -> -8/3 and (-11±sqrt1201)/2,
+1 RHP (saddle-type); Van der Pol origin -> (1±i sqrt3)/2, unstable; stable
+nodes/focis classified correctly.
 
-- A coefficient that's a plain constant (e.g. the fern's 0.85, -0.04, 1.6)
-  gets a **live, editable slider** — drag it and the attractor updates.
-- A coefficient that's a parameter expression (e.g. the spiral's
-  `s*cos(theta)`) is shown as a **disabled slider in orange** that tracks
-  its live value — you change those via the parameter sliders.
+## 2. Sangaku CAS module (shipped separately as sangaku_dynsys_contrib.zip)
+I audited Sangaku and implemented the biggest dynamical-systems gaps as a new
+library module cas/dynsys.lisp (with a golden test + example 392). It adds
+multivariate partial derivatives, the Jacobian of a polynomial vector field,
+exact eigenvalues at an equilibrium, divergence, gradient, and Hessian — none
+of which existed in Sangaku before. Verified on Lorenz (exact Jacobian,
+eigenvalues, and the constant divergence -41/3). This means the WHOLE chain —
+polynomial field -> exact symbolic Jacobian -> exact eigenvalues — can run
+inside the certified CAS, not just dynsys-assembled matrices.
 
-So a constant coefficient is editable **even when the system also has
-parameters elsewhere**. A fully-constant IFS (fern, Sierpinski, dragon) is
-now entirely editable, including the negative coefficients.
-
-## A bug I caught before shipping
-
-Negative literals like `-0.04` parse as `0 - 0.04` (a subtraction node), not
-a bare number — so my first "is it a literal?" check wrongly flagged them
-non-editable, which would have made the fern read-only. Fixed by testing the
-real criterion: a coefficient is editable iff it references **no parameter**
-(checked by walking the expression for any variable). Locked with a test
-(`make test-ifslit`): fern coefficients incl. negatives = editable; the
-spiral's `s*cos(theta)` = parameter-driven, its `e,f,p` = editable.
-
-Editing one constant coefficient of a parametrized IFS keeps that edit while
-the parameter-driven coefficients keep tracking their parameters.
+## 3. What's still missing in Sangaku
+See docs/SANGAKU_GAPS.md: the remaining candidates (transcendental
+multivariate certified derivatives, packaged eigenvectors, an in-CAS
+half-plane/Hurwitz decision, a turnkey exact-equilibria wrapper, and the
+certified-decimal realizer) with effort/value notes, plus the deliberate
+non-gaps (FP linear algebra / numeric ODE — dynsys's job, not Sangaku's).
 
 ## Verification
 - All 4 C++ TUs compile with ZERO warnings (-O2 -Wall -Wextra).
-- make test: 25 checks/suites pass (added **test-ifslit**).
+- make test: 25 groups + graceful CAS skip (26 with the CAS present); the new
+  UI path is covered by the cas bridge tests (from-doubles cases).

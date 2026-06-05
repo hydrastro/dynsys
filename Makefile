@@ -209,6 +209,7 @@ LCSWEEP_TEST_TARGET := $(BUILD_DIR)/lcsweep_smoke$(EXEEXT)
 IFSMODEL_TEST_TARGET := $(BUILD_DIR)/ifsmodel_smoke$(EXEEXT)
 IFSPARAM_TEST_TARGET := $(BUILD_DIR)/ifsparam_smoke$(EXEEXT)
 IFSLIT_TEST_TARGET := $(BUILD_DIR)/ifslit_smoke$(EXEEXT)
+CAS_TEST_TARGET := $(BUILD_DIR)/cas_bridge_smoke$(EXEEXT)
 
 IMGUI_CORE_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp
 IMGUI_BACKEND_SRCS := imgui_impl_glfw.cpp imgui_impl_opengl3.cpp
@@ -313,7 +314,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -493,7 +494,15 @@ clean:
 	$(RMDIR) $(BUILD_ROOT)
 
 distclean: clean
+	@# nix build symlink
 	$(RM) result
+	@# windows build root (if built out-of-tree separately)
+	$(RMDIR) $(WIN_BUILD_DIR)
+	@# runtime artifacts dynsys writes into the working tree:
+	@#   - timestamped screenshots dynsys_YYYYMMDD_HHMMSS.png (Save PNG)
+	@#   - the default trajectory/Poincare export (dynsys_export.csv)
+	$(RM) dynsys_export.csv
+	$(RM) dynsys_[0-9]*.png
 
 format:
 	clang-format -i $(SRC_DIR)/*.cpp $(SRC_DIR)/*.h test/*.cpp
@@ -595,4 +604,11 @@ $(TEST_OBJ_DIR)/test/ifslit_smoke.o: test/ifslit_smoke.cpp
 $(IFSLIT_TEST_TARGET): $(IFSLIT_OBJS)
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) -o $@ $(IFSLIT_OBJS) -lm
+
+test-cas: $(CAS_TEST_TARGET)
+	./$(CAS_TEST_TARGET)
+
+$(CAS_TEST_TARGET): test/cas_bridge_smoke.cpp $(SRC_DIR)/cas_bridge.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) test/cas_bridge_smoke.cpp -o $@
 
