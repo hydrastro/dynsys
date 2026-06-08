@@ -22,10 +22,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <unistd.h>
 #include <deque>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <memory>
 
 extern "C" {
 #include "arena.h"
@@ -309,6 +313,7 @@ struct AppState {
   float zoom = 1.0f;
   float scene_scale = 0.05f;
   float camera_distance = 50.0f;
+  bool bridge_cam_init = false;   /* set a geometry-fitting camera on first bridge frame */
   bool orthographic_3d = false;
   bool show_axes = true;
   bool show_center_cross = true;
@@ -324,6 +329,10 @@ struct AppState {
   float phase_x_max = 20.0f;
   float phase_y_min = -20.0f;
   float phase_y_max = 20.0f;
+  /* "home" phase window from the preset's view2d (or a default), so a Reset
+   * View button can always return to a sane framing. */
+  bool home_view_set = false;
+  float home_x_min = -10.0f, home_x_max = 10.0f, home_y_min = -10.0f, home_y_max = 10.0f;
   /* PHASE0/6: smoothed auto-bounds. The raw data extent is recomputed
    * each frame, but the displayed window eases toward it and only grows
    * (or shrinks slowly when the data has shrunk for a while), so a
@@ -356,6 +365,8 @@ struct AppState {
   int window_height = 820;
   std::string screenshot_msg;     /* transient "saved <path>" toast */
   int screenshot_msg_timer = 0;
+  bool capture_request = false;   /* set by Save PNG; serviced post-render */
+  bool capturing_clean = false;   /* true during the extra panel-free capture frame */
 
   GLuint vbo = 0;
   GLuint vao = 0;
@@ -387,6 +398,9 @@ struct AppState {
   ActiveView active_view = ActiveView::Phase2D;
   bool show_side_panel = true;
   float window_toolbar_h = 32.0f;
+  /* on-screen rect of the controls panel (window pixels), for cropping the
+   * panel out of a saved PNG so only the plotted system is captured. */
+  float panel_x0 = 0, panel_y0 = 0, panel_x1 = 0, panel_y1 = 0;
 
   std::vector<Point> points;
   std::vector<float> colors;
@@ -492,10 +506,16 @@ struct AppState {
    *   - Julia      = same map, fixed c, sweeping the initial point
    *   - logistic bifurcation = the real-axis analog of the Mandelbrot set
    */
-  enum class FractalMode { ParameterSpace /*Mandelbrot-like*/, StateSpace /*Julia-like*/ };
+  enum class FractalMode { ParameterSpace /*Mandelbrot-like*/, StateSpace /*Julia-like*/, Buddhabrot /*trajectory density*/ };
   FractalMode fractal_mode = FractalMode::ParameterSpace;
   double fractal_xmin = -2.5, fractal_xmax = 1.0;   /* view window (re) */
   double fractal_ymin = -1.5, fractal_ymax = 1.5;   /* view window (im) */
+  /* Buddhabrot accumulation (trajectory-density rendering) */
+  std::vector<uint32_t> buddha_accum;
+  int buddha_w = 0, buddha_h = 0;
+  uint32_t buddha_max = 1u;
+  long buddha_samples = 0;
+  uint32_t buddha_rng = 22695477u;
   int fractal_max_iter = 200;
   double fractal_escape_r = 4.0;
   bool fractal_smooth = true;
@@ -517,9 +537,10 @@ struct AppState {
   GLuint bridge_vbo = 0, bridge_cbo = 0, bridge_vao = 0;
   int bridge_point_count = 0;
   bool bridge_built = false;
-  int bridge_mandel_res = 360;   /* c-plane sampling resolution */
-  int bridge_bif_slices = 600;   /* bifurcation parameter slices */
-  int bridge_bif_keep = 120;     /* attractor points kept per slice */
+  int bridge_mandel_res = 420;   /* c-plane sampling resolution */
+  int bridge_bif_slices = 900;   /* bifurcation parameter slices (denser curtain) */
+  int bridge_bif_keep = 200;     /* attractor points kept per slice */
+  bool bridge_color_by_period = true; /* color bulbs/cascade by cycle period */
   float bridge_height = 18.0f;   /* vertical scale of the bifurcation */
   bool bridge_show_mandelbrot = true;
   bool bridge_show_bifurcation = true;
@@ -530,8 +551,15 @@ struct AppState {
    * sweeping bif_param along x, the attractor value as height (y), and a SECOND
    * parameter (bridge_param2) along z, so any system's bifurcation structure
    * can be explored as a 3D surface of stacked diagrams. */
-  enum class BridgeMode { Classic, CurrentSystem };
-  BridgeMode bridge_mode = BridgeMode::Classic;
+  enum class BridgeMode { Classic, CurrentSystem, ProjectionSolid };
+  BridgeMode bridge_mode = BridgeMode::ProjectionSolid;
+  /* Which polynomial family the projection-solid iterates: z^2+c (the classic
+   * Mandelbrot / logistic pairing) or z^3+c (the cubic Mandelbrot / cubic-map
+   * pairing). Both give one object whose footprint is that family's
+   * connectedness set and whose real-axis silhouette is its bifurcation
+   * cascade -- because the real map is the real restriction of the complex one. */
+  enum class BridgeFamily { Quadratic, Cubic, Sine };
+  BridgeFamily bridge_family = BridgeFamily::Quadratic;
   char bridge_param2[64] = "";     /* second swept parameter (z axis) */
   double bridge_p2_min = 0.0, bridge_p2_max = 1.0;
   int bridge_p2_slices = 24;       /* number of stacked diagrams along z */
@@ -581,12 +609,13 @@ struct AppState {
   int scan_tex_w = 0, scan_tex_h = 0;
   bool scan_dirty = true;
   int scan_settle = 0;
+  int scan_prog_level = 0;        /* progressive downscale (0 = done/idle), like basins */
   int scan_px_index = 0;     /* parameter on the horizontal axis */
   int scan_py_index = 1;     /* parameter on the vertical axis */
   double scan_xmin = 0, scan_xmax = 4;   /* param-x range */
   double scan_ymin = 0, scan_ymax = 4;   /* param-y range */
-  int scan_transient = 500;
-  int scan_iterations = 500;
+  int scan_transient = 200;
+  int scan_iterations = 200;
   bool scan_view_init = false;
   double scan_lyap_min = 0, scan_lyap_max = 0; /* observed range, for the legend */
 
@@ -613,6 +642,30 @@ struct AppState {
   bool fold_a_ready = false;
   double fold_a = 0.0, fold_lambda0 = 0.0;
   std::string fold_a_msg;
+  /* Exact equilibria via the CAS (solve-poly / Groebner). */
+  bool cas_equi_ready = false;
+  bool cas_equi_is_poly = false;
+  std::vector<std::string> cas_equi_lines;
+  std::string cas_equi_msg;
+  /* Two-parameter continuation of a fold or Hopf curve in a (p,q) plane. */
+  dynsys::analysis::TwoParamCurve twopar_curve{};
+  bool twopar_ready = false;
+  char twopar_p2[64] = "";       /* the second parameter name (q axis) */
+  std::string twopar_msg;
+  /* Collocation-based periodic-orbit continuation (the BVP solver: finds the
+   * cycle AND its period exactly, follows unstable cycles and folds of cycles,
+   * unlike the simulate-and-measure lcc_* sweep). */
+  dynsys::analysis::CycleBranch cyc_branch{};
+  bool cyc_ready = false;
+  std::string cyc_msg;
+  /* Two-parameter fold-of-cycles (LPC) curve in the (cont_param, twopar_p2) plane. */
+  dynsys::analysis::LPCCurve lpc_curve_data{};
+  bool lpc_ready = false;
+  std::string lpc_msg;
+  /* Collocation periodic-orbit continuation (period/amplitude vs parameter). */
+  dynsys::analysis::CycleBranch cycle_branch{};
+  bool cycle_ready = false;
+  std::string cycle_msg;
   /* PHASE E: cached exact eigenvalue report from the Sangaku CAS for the
    * located equilibrium (computed on demand via the button, not every frame).
    * cas_eig_requested guards recomputation; cas_eig_exact records whether the
@@ -629,7 +682,20 @@ struct AppState {
   bool cont_detect_fold = true;
   bool cont_detect_hopf = true;
   dynsys::analysis::Branch cont_branch{};
+  /* A second branch produced by branch switching at a branch point, drawn
+   * alongside the primary branch. */
+  dynsys::analysis::Branch cont_switched_branch{};
+  bool cont_switched_ready = false;
   bool cont_ready = false;
+
+  /* Homoclinic-orbit solve (truncated BVP to a saddle). Stored for drawing in
+   * the Continuation view and reporting the half-time / amplitude. */
+  dynsys::analysis::HomoclinicResult homoclinic{};
+  bool homoclinic_ready = false;
+  std::string homoclinic_msg;
+  /* two-parameter homoclinic locus (codim-1 curve in (cont_param, twopar_q)) */
+  dynsys::analysis::HomoclinicCurve homoclinic_curve{};
+  bool homoclinic_curve_ready = false;
 
   /* PHASE6-UI: auto-scanned fixed points for the phase plane (pplane
    * style). Recomputed when the view/params change, not every frame. */
@@ -674,6 +740,17 @@ const char *kFragmentShaderSrc =
     "{\n"
     "    frag_color = vec4(our_color, 1.0);\n"
     "}\n";
+
+/* Mouse-wheel deltas vary wildly by device, and on a slow frame (e.g. while a
+ * basin or param-scan is recomputing) ImGui can hand us a large ACCUMULATED
+ * io.MouseWheel for one gesture. Feeding that into pow(0.8, wheel) yields an
+ * enormous one-shot zoom -- the "scrolled a little, zoomed out a lot" bug.
+ * Clamp every wheel notch to a small predictable step so zoom is gradual. */
+static inline double clamped_wheel(double w) {
+  if (w > 1.0) w = 1.0;
+  if (w < -1.0) w = -1.0;
+  return w;
+}
 
 void set_vec3(vec3 v, float x, float y, float z) {
   v[0] = x;
@@ -801,7 +878,7 @@ bool parse_state_name_list(const std::string &text, std::vector<std::string> *ou
       *error = "invalid state-variable name: '" + name + "'";
       return false;
     }
-    if (name == "t" || name == "pi" || name == "e" || is_builtin_function_name(name)) {
+    if (name == "t" || is_builtin_function_name(name)) {
       *error = "reserved state-variable name: '" + name + "'";
       return false;
     }
@@ -933,7 +1010,11 @@ int next_index_for_name(const std::vector<std::string> &state_names, const std::
 }
 
 bool is_reserved_value_name(const std::string &name) {
-  return name == "t" || name == "pi" || name == "e";
+  /* Only `t` (time) is structurally reserved. `pi` and `e` are math constants
+   * that a user symbol may shadow (the evaluator checks params/definitions
+   * before falling back to the constants), so they are allowed as parameter
+   * or state names — useful since `e` is a common attractor parameter. */
+  return name == "t";
 }
 
 bool is_state_value_name(const std::vector<std::string> &state_names, const std::string &name) {
@@ -1174,9 +1255,11 @@ bool eval_ast(EvalContext &ctx, const node_t *ast, double *out, char *err,
       }
     }
     if (std::strcmp(name, "t") == 0) { *out = ctx.state.t; return true; }
-    if (std::strcmp(name, "pi") == 0) { *out = M_PI; return true; }
-    if (std::strcmp(name, "e") == 0) { *out = M_E; return true; }
 
+    /* User-declared parameters and definitions take precedence over the math
+     * constants pi and e, so a system may legitimately name a parameter `e`
+     * (a common attractor parameter) without colliding with Euler's number.
+     * `t` above stays reserved (it's the structural time variable). */
     const AppState::Param *param = find_param(ctx.app, name);
     if (param != nullptr) {
       *out = param->value;
@@ -1192,6 +1275,11 @@ bool eval_ast(EvalContext &ctx, const node_t *ast, double *out, char *err,
       }
       return eval_user_definition(ctx, def_index, out, err, err_cap);
     }
+
+    /* fall back to the math constants only if no user param/definition shadowed
+     * them — so `pi`/`e` keep working in systems that don't redefine them. */
+    if (std::strcmp(name, "pi") == 0) { *out = M_PI; return true; }
+    if (std::strcmp(name, "e") == 0) { *out = M_E; return true; }
 
     set_error(err, err_cap, "unknown variable: %s", name);
     return false;
@@ -1600,6 +1688,9 @@ std::string extract_param_expr_and_range(const std::string &rhs_raw,
   return trim_copy(rhs.substr(0, expr_end));
 }
 
+int effective_dimension(const AppState &app);
+int bridge_family_for_system(const AppState &app);
+
 bool compile_system(AppState &app, const char *system_text, std::string *error) {
   /* PHASE0: remember the pre-compile state signature so we can decide,
    * after a successful compile, what analysis to keep vs. invalidate.
@@ -1833,7 +1924,14 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
         return false;
       }
       const std::string name = trim_copy(rest.substr(0, eq));
-      if (!is_identifier(name) || is_reserved_value_name(name) || is_state_value_name(next_state_names, name) || is_builtin_function_name(name)) {
+      if (is_reserved_value_name(name)) {
+        *error = "line " + std::to_string(line_no + 1) + ": '" + name +
+                 "' is a reserved constant (e = 2.71828..., pi = 3.14159..., t = time), "
+                 "so it can't be a parameter name. Rename it, e.g. '" + name + name + "'.";
+        arena_destroy(&next_arena);
+        return false;
+      }
+      if (!is_identifier(name) || is_state_value_name(next_state_names, name) || is_builtin_function_name(name)) {
         *error = "line " + std::to_string(line_no + 1) + ": invalid parameter name '" + name + "'";
         arena_destroy(&next_arena);
         return false;
@@ -2416,6 +2514,17 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
     app.phase_y_min = static_cast<float>(next_view2d[2]);
     app.phase_y_max = static_cast<float>(next_view2d[3]);
     app.phase_bounds_valid = false;
+    app.home_x_min = app.phase_x_min; app.home_x_max = app.phase_x_max;
+    app.home_y_min = app.phase_y_min; app.home_y_max = app.phase_y_max;
+    app.home_view_set = true;
+  } else {
+    /* No explicit view2d: remember a sane default home window centered on the
+     * start state so Reset View still has somewhere good to go. */
+    const double cx = (!app.start.v.empty() && std::isfinite(app.start.v[0])) ? app.start.v[0] : 0.0;
+    const double cy = (app.start.v.size() > 1 && std::isfinite(app.start.v[1])) ? app.start.v[1] : 0.0;
+    app.home_x_min = (float)(cx - 4.0); app.home_x_max = (float)(cx + 4.0);
+    app.home_y_min = (float)(cy - 4.0); app.home_y_max = (float)(cy + 4.0);
+    app.home_view_set = true;
   }
 
   /* PHASE0: equation-tied analysis is always stale after a recompile —
@@ -2480,14 +2589,33 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   app.bifurcation_points.clear();
   app.bifurcation_lyapunov.clear();
   app.bifurcation_period.clear();
-  app.bridge_built = false;
+  app.bridge_built = false; app.bridge_cam_init = false;
   app.bridge_point_count = 0;
+  /* Tie the projection-solid bridge to the loaded system: pick the family it
+   * actually supports (quadratic / cubic / sine), or fall back to the
+   * "current system" mode when this system has no valid unified bridge (e.g.
+   * Henon, an ODE flow). This is what makes the family match the loaded system
+   * instead of always showing Mandelbrot/logistic. */
+  {
+    const int fam = bridge_family_for_system(app);
+    if (fam == 0) app.bridge_family = AppState::BridgeFamily::Quadratic;
+    else if (fam == 1) app.bridge_family = AppState::BridgeFamily::Cubic;
+    else if (fam == 2) app.bridge_family = AppState::BridgeFamily::Sine;
+    if (fam < 0 && app.bridge_mode == AppState::BridgeMode::ProjectionSolid)
+      app.bridge_mode = AppState::BridgeMode::CurrentSystem; /* no bridge -> lift loaded system */
+    else if (fam >= 0)
+      app.bridge_mode = AppState::BridgeMode::ProjectionSolid;
+  }
   app.fractal_dirty = true;
   app.basin_dirty = true;
   app.scan_view_init = false;
   app.cas_eig_ready = false;   /* stale certified spectrum from the previous system */
   app.hopf_l1_ready = false;   /* stale Hopf classification */
   app.fold_a_ready = false;    /* stale fold classification */
+  app.cont_switched_ready = false; /* stale switched branch */
+  app.cas_equi_ready = false;      /* stale exact equilibria */
+  app.cyc_ready = false;           /* stale collocation cycle branch */
+  app.lpc_ready = false;           /* stale fold-of-cycles curve */
   return true;
 }
 
@@ -2519,7 +2647,7 @@ const SystemPreset kPresets[] = {
     {"Lorenz83", "Continuous 3D", "# Lorenz83 system\nmode = ode\nintegrator = rk4\nparam a = 0.95 [0,2]\nparam b = 7.91 [0,12]\nparam f = 4.83 [0,8]\nparam g = 4.66 [0,8]\ndx = 0 - a * x - pow(y, 2) - pow(z, 2) + a * f\ndy = 0 - y + x * y - b * x * z + g\ndz = 0 - z + b * x * y + x * z\n", {0.1,0.1,0.1,0}, 0.005, 4, Integrator::RK4,1.0f,0,0,0},
     {"Halvorsen", "Continuous 3D", "# Halvorsen attractor\nmode = ode\nintegrator = rk4\nparam a = 1.89 [0,4]\ndx = 0 - a * x - 4 * y - 4 * z - pow(y, 2)\ndy = 0 - a * y - 4 * z - 4 * x - pow(z, 2)\ndz = 0 - a * z - 4 * x - 4 * y - pow(x, 2)\n", {0.1,0,0,0}, 0.005, 4, Integrator::RK4,1.0f,0,0,0},
     {"Rabinovich-Fabrikant", "Continuous 3D", "# Rabinovich-Fabrikant system\nmode = ode\nintegrator = rk4\nparam alpha = 0.14 [0,1]\nparam gamma = 0.10 [0,1]\ndx = y * (z - 1 + pow(x, 2)) + gamma * x\ndy = x * (3 * z + 1 - pow(x, 2)) + gamma * y\ndz = 0 - 2 * z * (alpha + x * y)\n", {0.1,0.1,0.1,0}, 0.002, 8, Integrator::RK4,1.0f,0,0,0},
-    {"Three-Scroll Unified", "Continuous 3D", "# Three-Scroll Unified Chaotic System\nmode = ode\nintegrator = rk4\nparam a = 32.48 [0,60]\nparam b = 45.84 [0,70]\nparam c = 1.18 [0,5]\nparam d = 0.13 [0,1]\nparam e = 0.57 [0,2]\nparam f = 14.7 [0,30]\ndx = a * (y - x) + d * x * z\ndy = b * x - x * z + f * y\ndz = c * z + x * y - e * pow(x, 2)\n", {0.1,0.1,0.1,0}, 0.0005, 16, Integrator::RK4,1.0f,0,0,0},
+    {"Three-Scroll Unified", "Continuous 3D", "# Three-Scroll Unified Chaotic System (param 'ee'; bare 'e' is the constant)\nmode = ode\nintegrator = rk4\nparam a = 32.48 [0,60]\nparam b = 45.84 [0,70]\nparam c = 1.18 [0,5]\nparam d = 0.13 [0,1]\nparam ee = 0.57 [0,2]\nparam f = 14.7 [0,30]\ndx = a * (y - x) + d * x * z\ndy = b * x - x * z + f * y\ndz = c * z + x * y - ee * pow(x, 2)\n", {0.1,0.1,0.1,0}, 0.0005, 16, Integrator::RK4,1.0f,0,0,0},
     {"Sprott", "Continuous 3D", "# Sprott system\nmode = ode\nintegrator = rk4\nparam a = 2.07 [0,4]\nparam b = 1.79 [0,4]\ndx = y + a * x * y + x * z\ndy = 1 - b * pow(x, 2) + y * z\ndz = x - pow(x, 2) - pow(y, 2)\n", {0.1,0.1,0.1,0}, 0.002, 8, Integrator::RK4,1.0f,0,0,0},
     {"Four-Wing", "Continuous 3D", "# Four-Wing attractor\nmode = ode\nintegrator = rk4\nparam a = 0.2 [0,2]\nparam b = 0.01 [0,1]\nparam c = 0 - 0.4 [-2,1]\ndx = a * x + y * z\ndy = b * x + c * y - x * z\ndz = 0 - z - x * y\n", {0.1,0.1,0.1,0}, 0.005, 4, Integrator::RK4,1.0f,0,0,0},
     {"Chua's circuit", "Continuous 3D", R"dyn(# Chua's circuit (double-scroll). f is the piecewise-linear diode,
@@ -2550,6 +2678,27 @@ initial y = 0
 dx = y
 dy = mu * (1 - x*x) * y - x
 )dyn", {2.0,0.0,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
+    {"Quasiperiodic torus (2 frequencies)", "Phase-plane examples", R"dyn(# A trajectory on a 2-TORUS built from two independent oscillators at
+# frequencies w1 and w2. Each (cos,sin) pair traces a circle; together they
+# live on a torus. View this in the 3D SCENE (plot3d embeds it as a donut):
+# when w2/w1 is IRRATIONAL the orbit never closes and densely fills the torus
+# surface (quasiperiodic). Set w2 to a rational multiple of w1 (try w2 = 2) and
+# it closes into a single knotted loop (periodic). The simplest attractor that
+# is neither a point nor a plain cycle. State stays bounded (it's two circles).
+state u, v
+mode = ode
+integrator = rk4
+param w1 = 1.0 [0,3]
+param w2 = 1.6180339887 [0,3]
+# u is the angle on the big circle, v the angle on the tube; embed as a torus:
+plot3d = (2 + 0.8*cos(v)) * cos(u), (2 + 0.8*cos(v)) * sin(u), 0.8*sin(v)
+view2d = -3.2, 3.2, -3.2, 3.2
+observe big_angle = u
+initial u = 0
+initial v = 0
+du = w1
+dv = w2
+)dyn", {0.0,0.0,0.0,0}, 0.01, 4, Integrator::RK4,1.0f,0,0,0},
     {"Lotka-Volterra", "Phase-plane examples", R"dyn(# Lotka-Volterra predator-prey system
 state prey, predator
 mode = ode
@@ -2637,11 +2786,11 @@ param r = 1.0 [0,3]
 param K = 10 [1,30]
 param a = 1.0 [0,5]
 param h = 2.0 [0,5]
-param e = 0.5 [0,2]
+param ee = 0.5 [0,2]
 param m = 0.3 [0,2]
 view2d = 0, 12, 0, 4
 dx = r * x * (1 - x / K) - a * x * y / (1 + a * h * x)
-dy = e * a * x * y / (1 + a * h * x) - m * y
+dy = ee * a * x * y / (1 + a * h * x) - m * y
 )dyn", {5.0,1.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
     {"Simple pendulum (undamped)", "Phase-plane examples", R"dyn(# Undamped pendulum: nested closed orbits + separatrix
 state theta, omega
@@ -2651,20 +2800,22 @@ view2d = -6.5, 6.5, -3, 3
 dtheta = omega
 domega = 0 - sin(theta)
 )dyn", {0.5,0.0,0.0,0}, 0.02, 4, Integrator::RK4,1.0f,0,0,0},
-    {"Henon map", "Discrete maps", "# Hénon map\nmode = map\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nx_next = 1 - a * x * x + y\ny_next = b * x\nz_next = z\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Henon map", "Discrete maps", "# Hénon map\nmode = map\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nview2d = -2.0, 2.0, -1.6, 1.6\nx_next = 1 - a * x * x + y\ny_next = b * x\nz_next = z\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Lozi map", "Discrete maps", "# Lozi map (piecewise-linear Henon cousin; chaotic)\nstate x, y\nmode = map\nparam a = 1.7 [0,2]\nparam b = 0.5 [0,1]\nview2d = -2, 2, -1, 1\nx_next = 1 - a * abs(x) + y\ny_next = b * x\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Ikeda map", "Discrete maps", "# Ikeda map (laser cavity; spiral chaotic attractor)\nstate x, y\nmode = map\nparam u = 0.918 [0,1]\nview2d = -0.5, 2, -2.5, 1\nx_next = 1 + u * (x * cos(0.4 - 6 / (1 + x*x + y*y)) - y * sin(0.4 - 6 / (1 + x*x + y*y)))\ny_next = u * (x * sin(0.4 - 6 / (1 + x*x + y*y)) + y * cos(0.4 - 6 / (1 + x*x + y*y)))\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Logistic map", "Discrete maps", "# Logistic map x_{n+1} = r x (1-x)  (genuine 1D map)\n# The classic period-doubling route to chaos.\nstate x\nmode = map\nparam r = 3.9 [0,4]\nview2d = 0, 1, 0, 1\nx_next = r * x * (1 - x)\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Logistic: period-3 window (=> chaos)", "Discrete maps", "# Logistic map in the PERIOD-3 WINDOW (r = 3.83).\n# Sharkovskii / Li-Yorke theorem: 'period three implies chaos' -- once a\n# continuous 1-D map has a period-3 orbit, it has periodic orbits of EVERY\n# period and an uncountable chaotic (scrambled) set. Here at r=3.83 the\n# attractor is a clean period-3 cycle (look at the bifurcation diagram: a\n# white band of 3 points inside the chaotic region). Nudge r down to ~3.8284\n# to watch period-3 itself appear by a tangent (saddle-node) bifurcation, and\n# just below it the period-3 cycle period-doubles (3->6->12) into chaos.\nstate x\nmode = map\nparam r = 3.83 [3.7, 3.9]\nview2d = 0, 1, 0, 1\nx_next = r * x * (1 - x)\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Tent map", "Discrete maps", "# Tent map: x_next = mu * min(x, 1-x)\n# 1D map; chaotic for mu near 2, x stays in [0,1].\nstate x\nmode = map\nparam mu = 1.9 [0,2]\nview2d = 0, 1, 0, 1\nx_next = mu * min(x, 1 - x)\nobserve x_value = x\n", {0.35,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Sine map", "Discrete maps", "# Sine map x_{n+1} = r sin(pi x)  (1D, period-doubling like logistic)\nstate x\nmode = map\nparam r = 0.9 [0,1]\nview2d = 0, 1, 0, 1\nx_next = r * sin(3.141592653589793 * x)\nobserve x_value = x\n", {0.4,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Gauss / mouse map", "Discrete maps", "# Gauss (mouse) map x_{n+1} = exp(-alpha x^2) + beta  (1D)\nstate x\nmode = map\nparam alpha = 6.2 [1,10]\nparam beta = 0 - 0.5 [-1,1]\nview2d = -1, 1.5, -1, 1.5\nx_next = exp(0 - alpha * x * x) + beta\nobserve x_value = x\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Cubic map", "Discrete maps", "# Cubic map x_{n+1} = a x - x^3  (1D, symmetric period-doubling)\nstate x\nmode = map\nparam a = 2.8 [0,3]\nview2d = -2, 2, -2, 2\nx_next = a * x - x*x*x\nobserve x_value = x\n", {0.2,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Gingerbreadman map", "Discrete maps", "# Gingerbreadman map (piecewise-linear, chaotic)\nstate x, y\nmode = map\nview2d = -8, 8, -8, 8\nx_next = 1 - y + abs(x)\ny_next = x\n", {0.5,3.7,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Standard (Chirikov) map", "Discrete maps", "# Chirikov standard map on the cylinder\nstate theta, p\nmode = map\nparam K = 0.97 [0,5]\nview2d = 0, 6.2832, -3.1416, 3.1416\np_next = p + K * sin(theta)\ntheta_next = theta + p + K * sin(theta)\n", {3.0,0.1,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
-    {"Ikeda map", "Discrete maps", "# Ikeda map\nmode = map\nparam u = 0.918 [0,1]\ntheta = 0.4 - 6 / (1 + x*x + y*y)\nx_next = 1 + u * (x * cos(theta) - y * sin(theta))\ny_next = u * (x * sin(theta) + y * cos(theta))\nz_next = z\n", {0.1,0.1,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
-    {"Tinkerbell map", "Discrete maps", "# Tinkerbell map\nmode = map\nparam a = 0.9 [0,2]\nparam b = 0 - 0.6013 [-2,2]\nparam c = 2.0 [0,4]\nparam d = 0.5 [0,2]\nx_next = x*x - y*y + a*x + b*y\ny_next = 2*x*y + c*x + d*y\nz_next = z\n", {0.1,0.1,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Tinkerbell map", "Discrete maps", "# Tinkerbell map\nstate x, y\nmode = map\nparam a = 0.9 [0,2]\nparam b = 0 - 0.6013 [-2,2]\nparam c = 2.0 [0,4]\nparam d = 0.5 [0,2]\nview2d = -1.5, 0.5, -1.8, 0.6\nx_next = x*x - y*y + a*x + b*y\ny_next = 2*x*y + c*x + d*y\n", {-0.72,-0.64,0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Newton fractal (z^3 - 1)", "Fractals", "# Newton's method for z^3 = 1, as a 2D map.\n# Three roots -> three basins with fractal boundaries.\n# Switch to the 'basins' view after loading.\nstate x, y\nmode = map\nview2d = -2, 2, -2, 2\n# z^2 = a + i b\nx_next = x - ( ( (x*(x*x-y*y) - y*(2*x*y)) - 1 )*(3*(x*x-y*y)) + ( x*(2*x*y) + y*(x*x-y*y) )*(3*(2*x*y)) ) / ( 9*((x*x-y*y)*(x*x-y*y) + (2*x*y)*(2*x*y)) )\ny_next = y - ( ( x*(2*x*y) + y*(x*x-y*y) )*(3*(x*x-y*y)) - ( (x*(x*x-y*y) - y*(2*x*y)) - 1 )*(3*(2*x*y)) ) / ( 9*((x*x-y*y)*(x*x-y*y) + (2*x*y)*(2*x*y)) )\n", {0.5,0.5,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Complex quadratic (Mandelbrot/Julia)", "Fractals", "# z -> z^2 + c  (x+iy)^2 + (cx+i cy)\n# Fractal view: parameter space = Mandelbrot, state space = Julia.\nstate x, y\nmode = map\nparam cx = 0 [-2,2]\nparam cy = 0 [-2,2]\nview2d = -2, 2, -2, 2\nx_next = x*x - y*y + cx\ny_next = 2*x*y + cy\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Burning Ship fractal", "Fractals", "# Burning Ship: z -> (|Re z| + i|Im z|)^2 + c.\n# The absolute values break the symmetry and produce the famous 'ship'\n# silhouette with masts/antenna. Open the Fractal view (parameter space).\nstate x, y\nmode = map\nparam cx = 0 [-2.2, 1.2]\nparam cy = 0 [-2, 1]\nview2d = -2.2, 1.2, -2, 1\nx_next = abs(x)*abs(x) - abs(y)*abs(y) + cx\ny_next = 2*abs(x)*abs(y) + cy\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
+    {"Multibrot (z^4 + c)", "Fractals", "# Multibrot of degree 4: z -> z^4 + c. Higher powers add lobes to the\n# Mandelbrot set (degree d gives d-1 fold symmetry). Open the Fractal view.\n# z^4 = (x^2-y^2)^2 - (2xy)^2  +  i * 2(x^2-y^2)(2xy)\nstate x, y\nmode = map\nparam cx = 0 [-1.6, 1.6]\nparam cy = 0 [-1.6, 1.6]\nview2d = -1.6, 1.6, -1.6, 1.6\nx_next = (x*x - y*y)*(x*x - y*y) - (2*x*y)*(2*x*y) + cx\ny_next = 2*(x*x - y*y)*(2*x*y) + cy\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"Henon map 2D", "N-dimensional examples", "# Hénon map as a true 2D state\nstate x, y\nmode = map\nview2d = -1.5, 1.5, -0.5, 0.5\nparam a = 1.4 [0,2]\nparam b = 0.3 [0,1]\nplot3d = x, y, 0\nx_next = 1 - a * x * x + y\ny_next = b * x\nobserve radius = sqrt(x*x + y*y)\n", {0.1,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
     {"4D coupled oscillator demo", "N-dimensional examples", "# Four-dimensional demo system\nstate x, y, z, w\nmode = ode\nintegrator = rk4\nparam a = 0.1 [0,1]\nplot3d = x, y, w\nobserve r4 = sqrt(x*x + y*y + z*z + w*w)\nsection = w\nsection_direction = positive\nsection_plot = x, z\ninitial x = 0.1\ninitial y = 0\ninitial z = 0\ninitial w = 0.2\ndx = y\ndy = 0 - x - a*y + z\ndz = w\ndw = 0 - z - a*w + x\n", {0.1,0.0,0.0,0}, 0.01, 3, Integrator::RK4,1.0f,0,0,0},
     {"Barnsley fern (IFS)", "Fractals", "# Barnsley fern — an iterated function system.\n# Four affine maps a,b,c,d,e,f with selection probability p.\n# Opens in the IFS view; the chaos game draws the attractor.\nmode = ifs\nifs_map = 0, 0, 0, 0.16, 0, 0, 0.01\nifs_map = 0.85, 0.04, -0.04, 0.85, 0, 1.6, 0.85\nifs_map = 0.2, -0.26, 0.23, 0.22, 0, 1.6, 0.07\nifs_map = -0.15, 0.28, 0.26, 0.24, 0, 0.44, 0.07\n", {0.0,0.0,0.0,0}, 1.0, 1, Integrator::RK4,1.0f,0,0,0},
@@ -2702,7 +2853,7 @@ void set_lorenz(AppState &app) {
 bool compile_system(AppState &app, const char *system_text, std::string *error);
 void run_bifurcation(AppState &app);
 void reset_simulation(AppState &app);
-void load_logistic_bifurcation_demo(AppState &app) {
+[[maybe_unused]] void load_logistic_bifurcation_demo(AppState &app) {
   int idx = -1;
   for (int i = 0; i < kPresetCount; ++i)
     if (std::string(kPresets[i].name) == "Logistic map") { idx = i; break; }
@@ -2848,6 +2999,9 @@ bool step_ode_state(AppState &app, const State &in, State *out, char *err, size_
 void run_bifurcation(AppState &app); /* PHASE B+: used by the in-view control strip */
 void run_continuation(AppState &app); /* PHASE D: equilibrium branch tracer */
 void run_lc_continuation(AppState &app); /* PHASE D step 2: limit-cycle sweep */
+void run_homoclinic(AppState &app); /* homoclinic-orbit BVP */
+void run_homoclinic_curve(AppState &app); /* 2-param homoclinic locus */
+void run_cycle_collocation(AppState &app); /* collocation + arclength + Floquet */
 
 void add_phase_trajectory(AppState &app, const State &seed, const char *label_prefix = "orbit") {
   if (static_cast<int>(app.phase_trajectories.size()) >= app.phase_max_extra_trajectories) {
@@ -3219,7 +3373,7 @@ void scroll_callback(GLFWwindow *window, double xoffset, double yoffset) {
   (void)xoffset;
   auto *app = static_cast<AppState *>(glfwGetWindowUserPointer(window));
   if (app == nullptr || ImGui::GetIO().WantCaptureMouse) return;
-  app->zoom *= static_cast<float>(std::pow(1.1, yoffset));
+  app->zoom *= static_cast<float>(std::pow(1.1, std::max(-1.0, std::min(1.0, yoffset))));
   app->zoom = std::max(0.05f, std::min(app->zoom, 100.0f));
   update_projection(*app);
 }
@@ -3283,6 +3437,59 @@ bool system_is_3d(const AppState &app) {
   return effective_dimension(app) >= 3 && app.state_names.size() >= 3;
 }
 
+/* Which projection-solid bridge family (if any) the CURRENTLY LOADED system
+ * supports. The unified bridge is honest only when the loaded map is the real
+ * restriction of an iterated complex polynomial (or c*sin z): then one complex
+ * iteration produces a single object whose footprint is that family's
+ * connectedness set and whose real-axis silhouette is its bifurcation diagram.
+ *   - logistic / quadratic / complex-quadratic  -> Quadratic (z^2+c)
+ *   - cubic map                                 -> Cubic (z^3+c)
+ *   - sine map                                  -> Sine (c*sin z)
+ *   - everything else (Henon, Lozi, Ikeda, tent, Gauss, gingerbread, standard,
+ *     all ODE flows, phase-plane systems)       -> -1 (NO valid bridge)
+ * Detection is by the loaded equations' signatures. */
+int bridge_family_for_system(const AppState &app) {
+  const char *s = app.system_input;
+  const int dim = effective_dimension(app);
+  const size_t nstate = app.state_names.size();
+
+  /* The complex-quadratic (Mandelbrot) system specifically: x_next = x^2-y^2+cx,
+   * y_next = 2xy + cy and NOTHING else. Other 2-D maps share the quadratic core
+   * but add linear state coupling -- Tinkerbell's "+ a*x + b*y", etc. Those are
+   * NOT the Mandelbrot system and have no unified bridge, so require the
+   * quadratic signatures AND the absence of extra linear state terms. */
+  if (app.mode == SystemMode::Map && nstate >= 2 &&
+      std::strstr(s, "x*x - y*y") && std::strstr(s, "2*x*y")) {
+    /* Linear state coupling like Tinkerbell's "+ a*x + b*y" / "+ c*x + d*y"
+     * marks a DIFFERENT 2-D map, not the Mandelbrot system. Look specifically
+     * for a parameter letter multiplying x or y (a..d * x|y). The Mandelbrot
+     * system only adds a bare parameter (cx, cy), never <param>*x. */
+    const bool has_linear_coupling =
+        std::strstr(s, "a*x") || std::strstr(s, "b*x") || std::strstr(s, "c*x") || std::strstr(s, "d*x") ||
+        std::strstr(s, "a*y") || std::strstr(s, "b*y") || std::strstr(s, "c*y") || std::strstr(s, "d*y") ||
+        std::strstr(s, "k*x") || std::strstr(s, "k*y");
+    if (!has_linear_coupling)
+      return 0; /* Quadratic (complex-quadratic / Mandelbrot) */
+  }
+
+  /* 1-D unimodal map families. These MUST be genuinely one-dimensional: a 2-D
+   * map that happens to contain sin( or x*x*x (Henon, Lozi, Ikeda, Tinkerbell,
+   * the standard map, ...) is NOT one of these and has no unified bridge. */
+  if (app.mode == SystemMode::Map && dim == 1 && nstate >= 1) {
+    /* logistic and its exact rescalings -> quadratic family */
+    if (std::strstr(s, "x * (1 - x)") || std::strstr(s, "x*(1 - x)") ||
+        std::strstr(s, "x * (1-x)")  || std::strstr(s, "x*(1-x)"))
+      return 0;
+    /* cubic map  x_next = a*x - x^3 */
+    if (std::strstr(s, "x - x*x*x") || std::strstr(s, "x*x*x"))
+      return 1;
+    /* sine map  x_next = r*sin(pi*x)  (1-D only) */
+    if (std::strstr(s, "sin("))
+      return 2;
+  }
+  return -1; /* no valid unified bridge for this system */
+}
+
 /* PHASE-A: which full-area views make sense for the current system.
  *   1D line/cobweb : exactly 1 effective dimension
  *   2D phase       : >= 2 effective dimensions
@@ -3299,7 +3506,7 @@ const char *view_requirement(AppState::ActiveView v) {
     case AppState::ActiveView::Scene3D:     return "3-D systems (three state variables)";
     case AppState::ActiveView::Bifurcation: return "a system with at least one parameter";
     case AppState::ActiveView::Fractal:     return "a map: a parameter (parameter-space) or 2 state vars (state-space Julia)";
-    case AppState::ActiveView::Scene3DBridge: return "a 1-D map (classic mode) or any system with a parameter (current-system mode)";
+    case AppState::ActiveView::Scene3DBridge: return "one 3D object whose two shadows are a fractal set and a bifurcation diagram (z^2+c / z^3+c), or the loaded system lifted into 3D";
     case AppState::ActiveView::Basins:      return "2+ state variables (and ideally several attractors)";
     case AppState::ActiveView::ParamScan2D: return "at least two parameters";
     case AppState::ActiveView::Continuation: return "an ODE with a parameter (equilibrium tracing)";
@@ -3330,12 +3537,11 @@ bool view_valid(const AppState &app, AppState::ActiveView v) {
       return app.mode == SystemMode::Map &&
              (!app.params.empty() || app.state_names.size() >= 2);
     case AppState::ActiveView::Scene3DBridge:
-      /* Classic logistic/Mandelbrot mode needs a 1-D map (the quadratic
-       * family). The CurrentSystem mode lifts ANY system's bifurcation diagram
-       * into 3D, so it's valid for any system that has at least one parameter
-       * to sweep and at least one state variable to observe. */
-      return (app.mode == SystemMode::Map && effective_dimension(app) == 1) ||
-             (!app.params.empty() && !app.state_names.empty());
+      /* Always available: the projection-solid and side-by-side modes are
+       * self-contained (they compute z^2+c / z^3+c from scratch and don't need
+       * the loaded system), and the current-system mode lifts whatever system
+       * is loaded. So the 3D bridge is reachable from anywhere. */
+      return true;
     case AppState::ActiveView::Basins:      return app.state_names.size() >= 2;
     case AppState::ActiveView::ParamScan2D: return app.params.size() >= 2;
     case AppState::ActiveView::Continuation: return app.mode == SystemMode::ODE && !app.params.empty();
@@ -3465,7 +3671,7 @@ void render_scene_background(AppState &app) {
       app.angle_x += io.MouseDelta.y * 0.4f;
     }
     if (io.MouseWheel != 0.0f) {
-      app.zoom *= std::pow(1.15f, io.MouseWheel);
+      app.zoom *= std::pow(1.15f, (float)clamped_wheel(io.MouseWheel));
       app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
       update_projection(app);
     }
@@ -3593,9 +3799,15 @@ void set_manual_phase_bounds(AppState &app, const PlotBounds &b_in) {
   app.phase_y_max = static_cast<float>(b.ymax);
 }
 
+void pan_phase_bounds(AppState &app, PlotBounds b, double dx, double dy) {
+  b.xmin += dx; b.xmax += dx;
+  b.ymin += dy; b.ymax += dy;
+  set_manual_phase_bounds(app, b);
+}
+
 void zoom_phase_bounds(AppState &app, PlotBounds b, const Point2 &anchor_in, double factor) {
   /* Guard against a non-finite anchor (which could come from a prior bad
-   * frame) — fall back to the view center so zoom can always recover. */
+   * frame) -- fall back to the view center so zoom can always recover. */
   Point2 anchor = anchor_in;
   if (!std::isfinite(anchor.x) || !std::isfinite(anchor.y)) {
     anchor.x = 0.5 * (b.xmin + b.xmax);
@@ -3618,10 +3830,49 @@ void zoom_phase_bounds(AppState &app, PlotBounds b, const Point2 &anchor_in, dou
   set_manual_phase_bounds(app, b);
 }
 
-void pan_phase_bounds(AppState &app, PlotBounds b, double dx, double dy) {
-  b.xmin += dx; b.xmax += dx;
-  b.ymin += dy; b.ymax += dy;
-  set_manual_phase_bounds(app, b);
+/* Reset the zoom/pan of whatever view is active back to a sane framing. The
+ * 2D plot views (phase, basins) return to the preset's "home" window; the
+ * fractal returns to the full Mandelbrot/Julia view; the 3D views reset the
+ * camera. This is the reliable escape hatch from any runaway zoom/pan. */
+void reset_current_view(AppState &app) {
+  switch (app.active_view) {
+    case AppState::ActiveView::Phase2D:
+    case AppState::ActiveView::Basins:
+      if (app.home_view_set) {
+        PlotBounds h{app.home_x_min, app.home_x_max, app.home_y_min, app.home_y_max};
+        set_manual_phase_bounds(app, h);
+      } else {
+        app.phase_auto_bounds = true; /* fall back to auto-fit */
+      }
+      app.phase_bounds_valid = false;
+      app.basin_dirty = true;
+      break;
+    case AppState::ActiveView::Fractal:
+      if (app.params.empty()) {
+        /* state-space fractal (e.g. Newton): the plane is initial (x,y); use a
+         * symmetric window around the origin rather than the Mandelbrot box. */
+        app.fractal_xmin = -2.0; app.fractal_xmax = 2.0;
+        app.fractal_ymin = -2.0; app.fractal_ymax = 2.0;
+      } else {
+        app.fractal_xmin = -2.5; app.fractal_xmax = 1.0;
+        app.fractal_ymin = -1.5; app.fractal_ymax = 1.5;
+      }
+      app.fractal_dirty = true;
+      break;
+    case AppState::ActiveView::Scene3D:
+    case AppState::ActiveView::Scene3DBridge:
+      app.angle_x = 22.0f; app.angle_y = -37.0f; app.zoom = 1.0f;
+      update_projection(app);
+      break;
+    case AppState::ActiveView::ParamScan2D:
+      app.scan_view_init = false; app.scan_dirty = true;
+      break;
+    default:
+      /* line/bifurcation/continuation/limit-cycle views refit themselves */
+      app.phase_auto_bounds = true; app.phase_bounds_valid = false;
+      app.bif_view_valid = false; app.cont_view_valid = false;
+      break;
+  }
 }
 
 uint32_t fade_color(uint32_t color, int alpha) {
@@ -4233,7 +4484,7 @@ void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
     if (io.MouseWheel != 0.0f) {
       /* wheel up -> zoom in (shrink span). 0.8 per notch is responsive
        * without being twitchy. */
-      const double factor = std::pow(0.8, static_cast<double>(io.MouseWheel));
+      const double factor = std::pow(0.8, clamped_wheel(static_cast<double>(io.MouseWheel)));
       zoom_phase_bounds(app, bounds, mouse_data, factor);
     }
     /* PHASE6-UI: keyboard zoom for the phase plane, about the view
@@ -4327,8 +4578,14 @@ void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
     draw_auto_fixed_points(app, draw, bounds, p0, w, h);
   else
     draw_fixed_point_marker(app, draw, bounds, p0, w, h, ix, iy);
-  const Point2 cp = plot_to_screen(bounds, p0, w, h, state_at(app.current, ix), state_at(app.current, iy));
-  draw->AddCircleFilled(ImVec2(static_cast<float>(cp.x), static_cast<float>(cp.y)), 4.0f, IM_COL32(255, 255, 255, 255));
+  {
+    const double cx = state_at(app.current, ix), cy = state_at(app.current, iy);
+    if (std::isfinite(cx) && std::isfinite(cy)) {
+      const Point2 cp = plot_to_screen(bounds, p0, w, h, cx, cy);
+      if (std::isfinite(cp.x) && std::isfinite(cp.y))
+        draw->AddCircleFilled(ImVec2(static_cast<float>(cp.x), static_cast<float>(cp.y)), 4.0f, IM_COL32(255, 255, 255, 255));
+    }
+  }
 
   if (hovered) {
     char coord[160];
@@ -4431,7 +4688,7 @@ void render_line1d_background(AppState &app) {
       restart_main_from_state(app, seed);
     }
     if (io.MouseWheel != 0.0f)
-      zoom_phase_bounds(app, b, mouse_data, std::pow(0.8, (double)io.MouseWheel));
+      zoom_phase_bounds(app, b, mouse_data, std::pow(0.8, clamped_wheel((double)io.MouseWheel)));
     const Point2 c{0.5 * (b.xmin + b.xmax), 0.5 * (b.ymin + b.ymax)};
     if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
       zoom_phase_bounds(app, b, c, 0.83);
@@ -4586,7 +4843,7 @@ void render_phase_background(AppState &app) {
       pan_phase_bounds(app, bounds, dx, dy);
     }
     if (io.MouseWheel != 0.0f)
-      zoom_phase_bounds(app, bounds, mouse_data, std::pow(0.8, static_cast<double>(io.MouseWheel)));
+      zoom_phase_bounds(app, bounds, mouse_data, std::pow(0.8, clamped_wheel(static_cast<double>(io.MouseWheel))));
     const Point2 center{0.5 * (bounds.xmin + bounds.xmax), 0.5 * (bounds.ymin + bounds.ymax)};
     if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
       zoom_phase_bounds(app, bounds, center, 0.83);
@@ -4682,8 +4939,12 @@ void render_phase_background(AppState &app) {
   if (app.phase_auto_fixed_points) draw_auto_fixed_points(app, draw, bounds, p0, w, h);
   else draw_fixed_point_marker(app, draw, bounds, p0, w, h, ix, iy);
 
-  const Point2 cp = plot_to_screen(bounds, p0, w, h, state_at(app.current, ix), state_at(app.current, iy));
-  draw->AddCircleFilled(ImVec2((float)cp.x, (float)cp.y), 4.0f, IM_COL32(255, 255, 255, 255));
+  const double cx = state_at(app.current, ix), cy = state_at(app.current, iy);
+  if (std::isfinite(cx) && std::isfinite(cy)) {
+    const Point2 cp = plot_to_screen(bounds, p0, w, h, cx, cy);
+    if (std::isfinite(cp.x) && std::isfinite(cp.y))
+      draw->AddCircleFilled(ImVec2((float)cp.x, (float)cp.y), 4.0f, IM_COL32(255, 255, 255, 255));
+  }
 
   if (over_plot) {
     char coord[160];
@@ -4721,6 +4982,181 @@ ImU32 fractal_palette(double t) {
   return IM_COL32(r, g, b, 255);
 }
 
+/* Buddhabrot: instead of colouring each c by its escape time, we accumulate the
+ * TRAJECTORIES of escaping points into a density histogram. Points that escape
+ * leave a ghostly trace of where their orbit wandered; summed over many samples
+ * this produces the famous Buddha-like figure. This is meaningful for the
+ * complex-quadratic map z->z^2+c (state-space orbit in the (Re,Im) plane); for
+ * other systems we fall back to the normal escape-time fractal.
+ *
+ * We render progressively: each call adds another batch of random samples to a
+ * persistent accumulation buffer (app.buddha_accum) and re-maps it to colour,
+ * so the image converges and sharpens the longer you watch. */
+void compute_buddhabrot(AppState &app, int W, int H, std::vector<uint32_t> &out, bool reset) {
+  if (W < 2) W = 2;
+  if (H < 2) H = 2;
+  const size_t npix = (size_t)W * H;
+  out.assign(npix, 0xff000000u);
+  const size_t n = app.state_names.size();
+  if (n < 2 || app.mode != SystemMode::Map) return;
+
+  if (reset || app.buddha_accum.size() != npix ||
+      app.buddha_w != W || app.buddha_h != H) {
+    app.buddha_accum.assign(npix, 0u);
+    app.buddha_samples = 0;
+    app.buddha_w = W; app.buddha_h = H;
+    app.buddha_max = 1u;
+  }
+
+  const double x0 = app.fractal_xmin, x1 = app.fractal_xmax;
+  const double y0 = app.fractal_ymin, y1 = app.fractal_ymax;
+  const double R2 = app.fractal_escape_r * app.fractal_escape_r;
+  const int maxit = std::max(20, app.fractal_max_iter);
+
+  State cur = make_state_like(n, 0.0), nx = make_state_like(n, 0.0);
+  std::vector<double> saved = app.param_values;
+  char err[128] = {0};
+
+  /* a deterministic-ish RNG so the image is reproducible per session */
+  uint32_t &rng = app.buddha_rng;
+  auto urand = [&]() { rng = rng * 1664525u + 1013904223u; return (double)(rng >> 8) * (1.0 / 16777216.0); };
+
+  /* trajectory buffer to record visited (re,im) before knowing if it escapes */
+  static std::vector<std::pair<float,float>> traj;
+  traj.clear();
+
+  /* sample budget per call: enough to make progress, capped to stay responsive */
+  const int batch = 20000;
+  /* sample c over a slightly padded box so orbits that wander in from outside
+   * the view are represented too. */
+  const double sx0 = -2.2, sx1 = 0.8, sy0 = -1.4, sy1 = 1.4;
+  for (int sIdx = 0; sIdx < batch; ++sIdx) {
+    const double cre = sx0 + (sx1 - sx0) * urand();
+    const double cim = sy0 + (sy1 - sy0) * urand();
+    /* iterate z=0 under z^2+c, recording the orbit; if it escapes, splat it */
+    set_state_at(cur, 0, 0.0); set_state_at(cur, 1, 0.0);
+    for (size_t i = 2; i < n; ++i) set_state_at(cur, i, 0.0);
+    /* the complex-quadratic preset reads c from the FIRST two params (cx,cy) */
+    if (app.param_values.size() >= 1) app.param_values[0] = cre;
+    if (app.param_values.size() >= 2) app.param_values[1] = cim;
+    traj.clear();
+    bool escaped = false;
+    for (int it = 0; it < maxit; ++it) {
+      if (!step_map_state(app, cur, &nx, err, sizeof(err))) { escaped = false; break; }
+      const double xx = state_at(nx, 0), yy = state_at(nx, 1);
+      traj.emplace_back((float)xx, (float)yy);
+      if (!std::isfinite(xx) || xx * xx + yy * yy > R2) { escaped = true; break; }
+      std::swap(cur.v, nx.v); cur.t = nx.t;
+    }
+    if (escaped) {
+      for (const auto &pt : traj) {
+        if (pt.first < x0 || pt.first > x1 || pt.second < y0 || pt.second > y1) continue;
+        const int px = (int)((pt.first - x0) / (x1 - x0) * (W - 1) + 0.5);
+        const int py = (int)((pt.second - y0) / (y1 - y0) * (H - 1) + 0.5);
+        if (px < 0 || px >= W || py < 0 || py >= H) continue;
+        uint32_t &cell = app.buddha_accum[(size_t)py * W + px];
+        cell++;
+        if (cell > app.buddha_max) app.buddha_max = cell;
+      }
+    }
+  }
+  app.buddha_samples += batch;
+  app.param_values = saved; sync_param_values(app);
+
+  /* map accumulated density -> colour. Use a robust high-percentile as the
+   * white point (a few hot pixels shouldn't wash everything out) and a steep
+   * curve so the structure glows on a DARK background rather than a bright haze
+   * swamping it. */
+  uint32_t hi = 1;
+  {
+    /* find ~99.5th percentile of nonzero counts as the white point */
+    std::vector<uint32_t> nz;
+    nz.reserve(npix / 4);
+    for (size_t i = 0; i < npix; ++i) if (app.buddha_accum[i]) nz.push_back(app.buddha_accum[i]);
+    if (!nz.empty()) {
+      size_t k = (size_t)(nz.size() * 0.995);
+      if (k >= nz.size()) k = nz.size() - 1;
+      std::nth_element(nz.begin(), nz.begin() + k, nz.end());
+      hi = std::max<uint32_t>(1, nz[k]);
+    }
+  }
+  const double inv_hi = 1.0 / (double)hi;
+  for (size_t i = 0; i < npix; ++i) {
+    const uint32_t d = app.buddha_accum[i];
+    double t = (double)d * inv_hi;       /* 0..1 (clamped) against the white point */
+    if (t > 1.0) t = 1.0;
+    t = std::pow(t, 0.45);               /* lift faint filaments */
+    const uint8_t v = (uint8_t)(t * 255.0);
+    const uint8_t r = v;                 /* warm parchment */
+    const uint8_t g = (uint8_t)(v * 0.82);
+    const uint8_t b = (uint8_t)(v * 0.55);
+    out[i] = 0xff000000u | r | ((uint32_t)g << 8) | ((uint32_t)b << 16);
+  }
+}
+
+/* Thread-safe stepper for parallel grid sweeps (basins). Owns its OWN eval
+ * scratch so multiple instances can run concurrently without touching the
+ * shared app.eval_scratch / app.scratch_k* buffers. Evaluates the IR programs
+ * directly (the AST fallback path is not thread-safe, so callers must check
+ * app.use_ast_fallback is false before using this). Replicates exactly the two
+ * integrators the basin sweep uses: a single map iteration, or one RK4 step. */
+struct ThreadStepper {
+  const AppState *app;
+  dynsys::ir::Scratch scratch;
+  std::vector<double> params;
+  size_t dim = 0;
+  bool is_map = false;
+  double dt = 0.01;
+
+  void init(const AppState &a) {
+    app = &a;
+    dim = a.state_names.size();
+    is_map = (a.mode == SystemMode::Map);
+    dt = a.dt;
+    params = a.param_values;
+    dynsys::ir::scratch_init(&scratch, a.definition_programs.size());
+  }
+  bool eval_prog(const dynsys::ir::Program &prog, const double *state, double t, double *out) {
+    dynsys::ir::scratch_reset_eval(&scratch);
+    dynsys::ir::RunContext rc;
+    rc.state = state; rc.n_state = dim; rc.t = t;
+    rc.params = params.data(); rc.n_params = params.size();
+    rc.defs = app->definition_programs.data(); rc.n_defs = app->definition_programs.size();
+    char e[8]; return dynsys::ir::run(prog, rc, scratch, out, e, sizeof(e));
+  }
+  /* override one parameter in this thread's PRIVATE snapshot (param-space
+   * fractal: each thread sweeps its own rows with its own param values). */
+  void set_param(int idx, double v) { if (idx >= 0 && (size_t)idx < params.size()) params[(size_t)idx] = v; }
+  /* one map iteration: x_next[i] = prog_i(x) */
+  bool map_step(const double *x, double *xn) {
+    if (app->next_equation_programs.size() != dim) return false;
+    for (size_t i = 0; i < dim; ++i)
+      if (!eval_prog(app->next_equation_programs[i], x, 0.0, &xn[i])) return false;
+    return true;
+  }
+  /* RHS f(x) into k */
+  bool rhs(const double *x, double *k) {
+    if (app->equation_programs.size() != dim) return false;
+    for (size_t i = 0; i < dim; ++i)
+      if (!eval_prog(app->equation_programs[i], x, 0.0, &k[i])) return false;
+    return true;
+  }
+  /* one RK4 step of size dt */
+  bool rk4_step(const double *x, double *xn) {
+    std::vector<double> k1(dim), k2(dim), k3(dim), k4(dim), tmp(dim);
+    if (!rhs(x, k1.data())) return false;
+    for (size_t i = 0; i < dim; ++i) tmp[i] = x[i] + 0.5 * dt * k1[i];
+    if (!rhs(tmp.data(), k2.data())) return false;
+    for (size_t i = 0; i < dim; ++i) tmp[i] = x[i] + 0.5 * dt * k2[i];
+    if (!rhs(tmp.data(), k3.data())) return false;
+    for (size_t i = 0; i < dim; ++i) tmp[i] = x[i] + dt * k3[i];
+    if (!rhs(tmp.data(), k4.data())) return false;
+    for (size_t i = 0; i < dim; ++i)
+      xn[i] = x[i] + dt * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]) / 6.0;
+    return true;
+  }
+};
+
 void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &out, int step = 1) {
   if (W < 2) W = 2;
   if (H < 2) H = 2;
@@ -4743,68 +5179,95 @@ void compute_fractal_image(AppState &app, int W, int H, std::vector<uint32_t> &o
   const double x0 = app.fractal_xmin, x1 = app.fractal_xmax;
   const double y0 = app.fractal_ymin, y1 = app.fractal_ymax;
 
-  const bool param_mode = (app.fractal_mode == AppState::FractalMode::ParameterSpace);
+  bool param_mode = (app.fractal_mode == AppState::FractalMode::ParameterSpace);
+  /* Parameter-space mode needs at least one parameter to vary. A map with no
+   * params (e.g. the Newton fractal) must use state-space: the plane is the
+   * initial (x,y). Otherwise we'd vary nothing and get a meaningless image. */
+  if (param_mode && app.params.empty()) param_mode = false;
   const int cxi = std::max(0, std::min(app.fractal_param_cx_index, (int)app.params.size() - 1));
   const int cyi = std::max(0, std::min(app.fractal_param_cy_index, (int)app.params.size() - 1));
 
-  /* Save params we will temporarily override (param mode). */
+  /* Save params we will temporarily override (param mode, serial path only). */
   std::vector<double> saved = app.param_values;
 
-  /* Reused scratch states (avoid per-pixel heap allocation). */
-  State s = make_state_like(n, 0.0);
-  State cur = make_state_like(n, 0.0);
-  State nx = make_state_like(n, 0.0);
-
-  char err[128] = {0};
-  for (int py = 0; py < H; py += step) {
+  /* Per-pixel escape/convergence work for one row py, using a stepper `st` that
+   * owns private eval scratch + a private parameter snapshot (so multiple
+   * threads can run disjoint rows safely). Mirrors the serial logic exactly. */
+  auto do_row = [&](ThreadStepper &st, int py) {
     const double b_im = y0 + (y1 - y0) * (double)py / (H - 1);
+    std::vector<double> sx(n), cur(n), nx(n);
     for (int px = 0; px < W; px += step) {
       const double a_re = x0 + (x1 - x0) * (double)px / (W - 1);
-
+      for (size_t i = 0; i < n; ++i) sx[i] = state_at(app.start, i);
       if (param_mode) {
-        /* plane = (param cx, param cy); initial state = system start */
-        for (size_t i = 0; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
-        if ((size_t)cxi < app.param_values.size()) app.param_values[(size_t)cxi] = a_re;
-        if ((size_t)cyi < app.param_values.size()) app.param_values[(size_t)cyi] = b_im;
+        st.set_param(cxi, a_re);
+        st.set_param(cyi, b_im);
       } else {
-        /* plane = initial (x, y); params fixed at current values. For a 1-D
-         * map there's no second state, so state-space mode isn't meaningful
-         * (the view forces parameter-space for 1-D); guard the write anyway. */
-        if (px == 0 && py == 0) app.param_values = saved;
-        set_state_at(s, 0, a_re);
-        if (n > 1) set_state_at(s, 1, b_im);
-        for (size_t i = 2; i < n; ++i) set_state_at(s, i, state_at(app.start, i));
+        sx[0] = a_re; if (n > 1) sx[1] = b_im;
       }
-
-      int it = 0;
-      double r2 = 0.0;
-      for (size_t i = 0; i < n; ++i) set_state_at(cur, i, state_at(s, i));
+      int it = 0; double r2 = 0.0;
+      for (size_t i = 0; i < n; ++i) cur[i] = sx[i];
+      bool escaped = false, converged = false; double conv_x = 0.0, conv_y = 0.0;
+      const bool allow_converge = app.params.empty();
       for (; it < maxit; ++it) {
-        if (!step_map_state(app, cur, &nx, err, sizeof(err))) { it = maxit; break; }
-        const double xx = state_at(nx, 0);
-        const double yy = (n > 1) ? state_at(nx, 1) : 0.0; /* 1-D map: |x| only */
+        if (!st.map_step(cur.data(), nx.data())) { it = maxit; break; }
+        const double xx = nx[0], yy = (n > 1) ? nx[1] : 0.0;
         r2 = xx * xx + yy * yy;
-        if (!std::isfinite(r2) || r2 > R2) { ++it; break; }
-        std::swap(cur.v, nx.v); cur.t = nx.t;
-      }
-
-      uint32_t color = 0xff101014u; /* "in the set" */
-      if (it < maxit && r2 > R2) {
-        double mu = it;
-        if (app.fractal_smooth && r2 > 1.0) {
-          /* continuous (smooth) iteration count */
-          mu = it + 1.0 - std::log(std::log(std::sqrt(r2))) / std::log(2.0);
+        if (!std::isfinite(r2) || r2 > R2) { ++it; escaped = true; break; }
+        if (allow_converge) {
+          const double dx = xx - cur[0], dy = (n > 1) ? yy - cur[1] : 0.0;
+          if (dx * dx + dy * dy < 1e-20) { converged = true; conv_x = xx; conv_y = yy; ++it; break; }
         }
+        std::swap(cur, nx);
+      }
+      uint32_t color = 0xff101014u;
+      if (escaped && it < maxit && r2 > R2) {
+        double mu = it;
+        if (app.fractal_smooth && r2 > 1.0) mu = it + 1.0 - std::log(std::log(std::sqrt(r2))) / std::log(2.0);
         const double t = std::fmod(mu * 0.04, 1.0);
         color = fractal_palette(t < 0 ? t + 1.0 : t);
+      } else if (converged) {
+        double ang = std::atan2(conv_y, conv_x) / (2.0 * 3.14159265358979) + 0.5;
+        const double shade = 1.0 - 0.6 * std::min(1.0, (double)it / 40.0);
+        uint32_t base = fractal_palette(std::fmod(ang, 1.0));
+        const uint8_t r = (uint8_t)(((base >> 0) & 0xff) * shade);
+        const uint8_t g = (uint8_t)(((base >> 8) & 0xff) * shade);
+        const uint8_t b = (uint8_t)(((base >> 16) & 0xff) * shade);
+        color = 0xff000000u | r | ((uint32_t)g << 8) | ((uint32_t)b << 16);
       }
-      /* fill the step x step block so a coarse pass covers the whole image */
       for (int by = py; by < py + step && by < H; ++by)
         for (int bx = px; bx < px + step && bx < W; ++bx)
           out[(size_t)by * W + bx] = color;
     }
+  };
+
+  /* Use the PARALLEL path when the thread-safe IR evaluator is active (each
+   * thread gets a private ThreadStepper); else the serial fallback. Identical
+   * pixels either way. */
+  std::vector<int> rows;
+  for (int py = 0; py < H; py += step) rows.push_back(py);
+  const bool can_parallel = !app.use_ast_fallback &&
+                            std::thread::hardware_concurrency() > 1 && (int)rows.size() >= 8;
+  if (can_parallel) {
+    unsigned hw = std::thread::hardware_concurrency();
+    unsigned nth = std::min<unsigned>(hw, (unsigned)rows.size());
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+      ThreadStepper st; st.init(app);
+      for (;;) {
+        size_t k = next.fetch_add(1, std::memory_order_relaxed);
+        if (k >= rows.size()) break;
+        do_row(st, rows[k]);
+      }
+    };
+    std::vector<std::thread> pool; pool.reserve(nth);
+    for (unsigned t = 0; t < nth; ++t) pool.emplace_back(worker);
+    for (auto &th : pool) th.join();
+  } else {
+    ThreadStepper st; st.init(app);
+    for (int py : rows) do_row(st, py);
   }
-  app.param_values = saved; /* restore */
+  app.param_values = saved; /* restore (untouched on the parallel path) */
   sync_param_values(app);
 }
 
@@ -4824,6 +5287,18 @@ void render_fractal_background(AppState &app) {
   /* init view once from the configured window */
   if (!app.fractal_view_init) {
     app.fractal_view_init = true;
+    if (app.params.empty()) {
+      /* No-parameter maps (Newton) are state-space fractals; default to a
+       * symmetric window around the origin so the basins are framed. */
+      app.fractal_mode = AppState::FractalMode::StateSpace;
+      app.fractal_xmin = -2.0; app.fractal_xmax = 2.0;
+      app.fractal_ymin = -2.0; app.fractal_ymax = 2.0;
+    } else if (app.home_view_set) {
+      /* Use the preset's view2d window so fractals like Burning Ship / Multibrot
+       * open framed on their actual structure rather than the Mandelbrot box. */
+      app.fractal_xmin = app.home_x_min; app.fractal_xmax = app.home_x_max;
+      app.fractal_ymin = app.home_y_min; app.fractal_ymax = app.home_y_max;
+    }
     app.fractal_dirty = true;
   }
 
@@ -4834,7 +5309,7 @@ void render_fractal_background(AppState &app) {
     auto invy = [&](float pyf){ return app.fractal_ymin + (double)pyf / h * (app.fractal_ymax - app.fractal_ymin); };
     if (io.MouseWheel != 0.0f) {
       const double mx = invx(io.MousePos.x), my = invy(io.MousePos.y);
-      const double f = std::pow(0.8, (double)io.MouseWheel);
+      const double f = std::pow(0.8, clamped_wheel((double)io.MouseWheel));
       app.fractal_xmin = mx + (app.fractal_xmin - mx) * f;
       app.fractal_xmax = mx + (app.fractal_xmax - mx) * f;
       app.fractal_ymin = my + (app.fractal_ymin - my) * f;
@@ -4862,6 +5337,34 @@ void render_fractal_background(AppState &app) {
   const int CW = std::min(app.window_width, 900);
   const int CH = std::min(app.window_height, 700);
   const bool force = (app.fractal_tex == 0 || app.fractal_tex_w != CW || app.fractal_tex_h != CH);
+
+  if (app.fractal_mode == AppState::FractalMode::Buddhabrot) {
+    /* Buddhabrot accumulates over frames: reset when the view changed, then add
+     * a batch of samples each frame so the figure sharpens as you watch. */
+    const bool reset = force || app.fractal_dirty;
+    app.fractal_dirty = false;
+    std::vector<uint32_t> img;
+    compute_buddhabrot(app, CW, CH, img, reset);
+    if (app.fractal_tex == 0) glGenTextures(1, &app.fractal_tex);
+    glBindTexture(GL_TEXTURE_2D, app.fractal_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    app.fractal_tex_w = CW; app.fractal_tex_h = CH;
+    if (app.fractal_tex != 0)
+      draw->AddImage((ImTextureID)(uintptr_t)app.fractal_tex, ImVec2(0, 0), ImVec2(w, h));
+    char bhud[256];
+    std::snprintf(bhud, sizeof(bhud),
+                  "Buddhabrot (trajectory density of escaping orbits)  |  %ld samples  |  re [%.3g, %.3g]  im [%.3g, %.3g]",
+                  app.buddha_samples, app.fractal_xmin, app.fractal_xmax, app.fractal_ymin, app.fractal_ymax);
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), bhud);
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 26.0f), IM_COL32(170, 170, 180, 220),
+                  "accumulates as you watch (longer = sharper).  drag: pan   wheel: zoom");
+    return;
+  }
+
   if (app.fractal_dirty) { app.fractal_settle = 5; app.fractal_dirty = false; }
   bool start_progress = force;
   if (app.fractal_settle > 0) { if (--app.fractal_settle == 0) start_progress = true; }
@@ -4892,7 +5395,7 @@ void render_fractal_background(AppState &app) {
   char hud[256];
   std::snprintf(hud, sizeof(hud), "Fractal — %s   |  re [%.4g, %.4g]  im [%.4g, %.4g]  iters %d",
                 mode, app.fractal_xmin, app.fractal_xmax, app.fractal_ymin, app.fractal_ymax, app.fractal_max_iter);
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
   if (!io.WantCaptureMouse)
     draw->AddText(ImVec2(14, h - 24), IM_COL32(150, 150, 160, 200),
                   "drag: pan   wheel: zoom   (set mode/params/iterations in the Setup tab)");
@@ -5075,7 +5578,7 @@ void render_ifs_background(AppState &app) {
                   ifs_name.c_str(), app.ifs_iterations, app.ifs_box_dim);
   else
     std::snprintf(hud, sizeof(hud), "IFS chaos game — %s   |  %ld points", ifs_name.c_str(), app.ifs_iterations);
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
   draw->AddText(ImVec2(14, h - 24), IM_COL32(150, 150, 160, 200),
                 use_model ? "IFS attractor (mode = ifs) — rendered via the chaos game"
                           : "IFS attractor — load a 'mode = ifs' model (e.g. the Barnsley fern preset)");
@@ -5091,8 +5594,17 @@ void render_ifs_background(AppState &app) {
  * via step_state) and maps (one iteration).
  * ============================================================ */
 ImU32 basin_color(int label, int nlabels, float speed, bool shade) {
-  if (label == -1) return IM_COL32(8, 8, 12, 255);     /* diverged to infinity */
-  if (label == -2) return IM_COL32(64, 64, 72, 255);   /* did not settle (chaotic attractor) */
+  if (label == -1) return IM_COL32(8, 8, 12, 255);     /* diverged to infinity (near-black) */
+  if (label == -2) {
+    /* Bounded but did not settle to a fixed point — i.e. a chaotic (or
+     * long-period) attractor, as in the Henon map. Colour it a clear teal so
+     * the bounded basin stands out sharply against the near-black escape set,
+     * shaded by how quickly it was confirmed bounded. Previously this was a
+     * flat dark grey almost indistinguishable from "escaped", which made such
+     * basins look uniformly blank. */
+    float br = shade ? (0.45f + 0.55f * std::max(0.0f, std::min(1.0f, speed))) : 1.0f;
+    return IM_COL32((int)(40 * br), (int)(150 * br), (int)(165 * br), 255);
+  }
   /* distinct hues around the wheel */
   const double h = nlabels > 0 ? (double)label / std::max(1, nlabels) : 0.0;
   const double H = h * 6.0;
@@ -5110,6 +5622,7 @@ ImU32 basin_color(int label, int nlabels, float speed, bool shade) {
   float br = shade ? (0.35f + 0.65f * std::max(0.0f, std::min(1.0f, speed))) : 1.0f;
   return IM_COL32((int)(r * 255 * br), (int)(g * 255 * br), (int)(b * 255 * br), 255);
 }
+
 
 void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out, int step = 1) {
   if (W < 2) W = 2;
@@ -5163,11 +5676,47 @@ void compute_basin_image(AppState &app, int W, int H, std::vector<uint32_t> &out
   dynsys::analysis::BasinOptions opt;
   opt.xmin = b.xmin; opt.xmax = b.xmax; opt.ymin = b.ymin; opt.ymax = b.ymax;
   opt.width = cw; opt.height = ch;            /* compute on the reduced grid */
-  opt.max_steps = std::max(50, app.basin_steps);
+  /* Per-cell iteration budget. Maps settle or escape FAST (a Henon point is
+   * clearly bounded-or-divergent within a couple hundred iterations), so the
+   * 1500-step default — fine for slowly-settling ODE flows — would do ~half a
+   * billion map evaluations on the full grid and freeze the view. Cap maps
+   * much lower. */
+  opt.max_steps = (app.mode == SystemMode::Map)
+                      ? std::min(std::max(50, app.basin_steps), 250)
+                      : std::max(50, app.basin_steps);
   opt.cluster_tol = app.basin_cluster_tol;
   opt.settle_tol = (app.mode == SystemMode::Map) ? 1e-6 : 1e-5;
 
-  dynsys::analysis::BasinResult R = dynsys::analysis::compute_basins(advance, opt);
+  /* Use the PARALLEL basin solver when the (thread-safe) IR eval path is in
+   * use: each worker thread gets its own ThreadStepper (private eval scratch),
+   * giving a big speedup on multi-core machines with identical results. Fall
+   * back to the serial path when the AST-fallback evaluator is active (it is
+   * not thread-safe). The grid coordinates baked into the stepper's advance
+   * match compute_basins' own (x0,y0) mapping exactly. */
+  dynsys::analysis::BasinResult R;
+  const bool can_parallel = !app.use_ast_fallback &&
+                            std::thread::hardware_concurrency() > 1 && ch >= 8;
+  if (can_parallel) {
+    const bool is_map = (app.mode == SystemMode::Map);
+    auto make_advance = [&app, n, ix, iy, is_map](int /*tid*/) {
+      auto stepper = std::make_shared<ThreadStepper>();
+      stepper->init(app);
+      std::vector<double> s(n), sn(n);
+      for (size_t i = 0; i < n; ++i) s[i] = state_at(app.start, i);
+      return [stepper, n, ix, iy, is_map, s, sn](double x, double y, double *nx, double *ny) mutable -> bool {
+        for (size_t i = 0; i < n; ++i) s[i] = state_at(stepper->app->start, i);
+        s[ix] = x; s[iy] = y;
+        bool ok = is_map ? stepper->map_step(s.data(), sn.data())
+                         : stepper->rk4_step(s.data(), sn.data());
+        if (!ok) return false;
+        *nx = sn[ix]; *ny = sn[iy];
+        return true;
+      };
+    };
+    R = dynsys::analysis::compute_basins_mt(make_advance, opt);
+  } else {
+    R = dynsys::analysis::compute_basins(advance, opt);
+  }
   app.integrator = saved_integrator; /* restore the user's choice */
   app.basin_attractor_count = (int)R.attractors.size();
   app.basin_n_converged = R.n_converged;
@@ -5210,30 +5759,67 @@ void render_basin_background(AppState &app) {
   app.phase_y_index = std::max(0, std::min(app.phase_y_index, (int)nstate - 1));
   const size_t ix = (size_t)app.phase_x_index, iy = (size_t)app.phase_y_index;
   PlotBounds b = sanitize_bounds(current_phase_bounds(app, ix, iy));
+  /* Safety clamp for basins: if we're auto-fitting (e.g. after a stray
+   * double-click) the fit can be dragged enormously wide by diverging seed
+   * orbits in a map basin. Cap the window to a few times the home window so the
+   * basin can never "zoom way out" to a useless scale. */
+  if (app.phase_auto_bounds && app.home_view_set) {
+    const double homw = (double)app.home_x_max - app.home_x_min;
+    const double homh = (double)app.home_y_max - app.home_y_min;
+    const double cx = 0.5 * (b.xmin + b.xmax), cy = 0.5 * (b.ymin + b.ymax);
+    double bw = b.xmax - b.xmin, bh = b.ymax - b.ymin;
+    const double maxw = homw * 6.0, maxh = homh * 6.0;
+    bool clamped = false;
+    if (bw > maxw) { b.xmin = cx - maxw * 0.5; b.xmax = cx + maxw * 0.5; clamped = true; }
+    if (bh > maxh) { b.ymin = cy - maxh * 0.5; b.ymax = cy + maxh * 0.5; clamped = true; }
+    if (clamped) { set_manual_phase_bounds(app, b); b = sanitize_bounds(b); }
+  }
   ImGuiIO &io = ImGui::GetIO();
   if (!io.WantCaptureMouse) {
     const ImVec2 p0(0, 0);
     const Point2 m = screen_to_plot(b, p0, w, h, io.MousePos);
-    if (io.MouseWheel != 0.0f) { zoom_phase_bounds(app, b, m, std::pow(0.8, (double)io.MouseWheel)); app.basin_dirty = true; }
+    if (io.MouseWheel != 0.0f) { zoom_phase_bounds(app, b, m, std::pow(0.8, clamped_wheel((double)io.MouseWheel))); app.basin_dirty = true; }
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-      const double ddx = (double)io.MouseDelta.x / w * (b.xmax - b.xmin);
-      const double ddy = (double)io.MouseDelta.y / h * (b.ymax - b.ymin);
+      /* clamp the per-frame delta: a spurious large jump (e.g. focus regained,
+       * or the very first drag frame reporting accumulated motion) must not be
+       * able to fling the view across the plane. Cap at a quarter window. */
+      float mdx = io.MouseDelta.x, mdy = io.MouseDelta.y;
+      mdx = std::max(-w * 0.25f, std::min(mdx, w * 0.25f));
+      mdy = std::max(-h * 0.25f, std::min(mdy, h * 0.25f));
+      const double ddx = (double)mdx / w * (b.xmax - b.xmin);
+      const double ddy = (double)mdy / h * (b.ymax - b.ymin);
       pan_phase_bounds(app, b, -ddx, ddy);
       app.basin_dirty = true;
     }
-    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { app.phase_bounds_valid = false; app.basin_dirty = true; }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+      /* Reset the basin view to the preset's home window (the framing it loaded
+       * with), NOT an auto-fit. Auto-fitting a basin is dangerous: a map basin
+       * contains diverging seed orbits, so fitting to the data would zoom the
+       * view enormously far out -- the "double-click / stray click zooms me way
+       * out" bug. The home window is always sane. */
+      if (app.home_view_set) {
+        PlotBounds hb{app.home_x_min, app.home_x_max, app.home_y_min, app.home_y_max};
+        set_manual_phase_bounds(app, hb);
+      } else {
+        app.phase_auto_bounds = true; /* only if we have no home to go to */
+      }
+      app.basin_dirty = true;
+    }
   }
 
-  const int CW = std::min(app.window_width, 700);
-  const int CH = std::min(app.window_height, 560);
+  /* ODE basins integrate a trajectory PER CELL, far costlier than a map's
+   * single step, so cap their grid lower; maps can afford the full grid. */
+  const bool basin_is_ode = (app.mode == SystemMode::ODE);
+  const int CW = std::min(app.window_width, basin_is_ode ? 380 : 480);
+  const int CH = std::min(app.window_height, basin_is_ode ? 300 : 384);
   const bool bforce = (app.basin_tex == 0 || app.basin_tex_w != CW || app.basin_tex_h != CH);
   if (app.basin_dirty) { app.basin_settle = 6; app.basin_dirty = false; }
   bool start_progress = bforce;
   if (app.basin_settle > 0) { if (--app.basin_settle == 0) start_progress = true; }
-  /* begin a coarse->fine pass: 8 -> 4 -> 2 -> 1. Under the performance
-   * governor's throttle, stop refining early (a coarser final level) so a
-   * heavy basin can't lock the UI. */
-  if (start_progress) app.basin_prog_level = 8;
+  /* begin a coarse->fine pass: 16 -> 8 -> 4 -> 2 -> 1 (the coarse first frame
+   * appears almost instantly). Under the performance governor's throttle, stop
+   * refining early (a coarser final level) so a heavy basin can't lock the UI. */
+  if (start_progress) app.basin_prog_level = 16;
   if (app.basin_prog_level > 0) {
     int step = app.basin_prog_level;
     std::vector<uint32_t> img;
@@ -5261,7 +5847,7 @@ void render_basin_background(AppState &app) {
                 app.basin_attractor_count, app.state_names[ix].c_str(), app.state_names[iy].c_str(),
                 app.basin_n_converged, app.basin_n_diverged, app.basin_n_nonconvergent,
                 app.basin_prog_level > 1 ? "   [refining…]" : "");
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
 
   /* If almost nothing converged, the system likely has a single chaotic
    * attractor (e.g. Lorenz) — basins aren't meaningful there. Say so and
@@ -5302,9 +5888,10 @@ ImU32 scan_color(double lyap, double lo, double hi) {
   return IM_COL32(r, g, b, 255);
 }
 
-void compute_scan_image(AppState &app, int W, int H, std::vector<uint32_t> &out) {
+void compute_scan_image(AppState &app, int W, int H, std::vector<uint32_t> &out, int step = 1) {
   if (W < 2) W = 2;
   if (H < 2) H = 2;
+  if (step < 1) step = 1;
   out.assign((size_t)W * H, 0xff000000u);
   const size_t dim = app.state_names.size();
   if (dim == 0 || app.params.size() < 2) return;
@@ -5326,9 +5913,9 @@ void compute_scan_image(AppState &app, int W, int H, std::vector<uint32_t> &out)
   double lo = 1e300, hi = -1e300;
   char err[128] = {0};
 
-  for (int j = 0; j < H; ++j) {
+  for (int j = 0; j < H; j += step) {
     const double py = app.scan_ymin + (app.scan_ymax - app.scan_ymin) * (double)j / (H - 1);
-    for (int i = 0; i < W; ++i) {
+    for (int i = 0; i < W; i += step) {
       const double px = app.scan_xmin + (app.scan_xmax - app.scan_xmin) * (double)i / (W - 1);
       if ((size_t)pxi < app.param_values.size()) app.param_values[(size_t)pxi] = px;
       if ((size_t)pyi < app.param_values.size()) app.param_values[(size_t)pyi] = py;
@@ -5368,7 +5955,10 @@ void compute_scan_image(AppState &app, int W, int H, std::vector<uint32_t> &out)
         val = ly_sum / (ly_n * (dt_factor > 0 ? dt_factor : 1.0));
         if (std::isfinite(val)) { lo = std::min(lo, val); hi = std::max(hi, val); }
       }
-      ly[(size_t)j * W + i] = (float)val;
+      /* fill the whole step x step block with this sample (progressive) */
+      for (int jj = j; jj < std::min(j + step, H); ++jj)
+        for (int ii = i; ii < std::min(i + step, W); ++ii)
+          ly[(size_t)jj * W + ii] = (float)val;
     }
   }
   app.param_values = saved_params; sync_param_values(app);
@@ -5407,7 +5997,7 @@ void render_scan_background(AppState &app) {
     auto invy = [&](float pyf){ return app.scan_ymin + (double)(h - pyf) / h * (app.scan_ymax - app.scan_ymin); };
     if (io.MouseWheel != 0.0f) {
       const double mx = invx(io.MousePos.x), my = invy(io.MousePos.y);
-      const double f = std::pow(0.8, (double)io.MouseWheel);
+      const double f = std::pow(0.8, clamped_wheel((double)io.MouseWheel));
       app.scan_xmin = mx + (app.scan_xmin - mx) * f; app.scan_xmax = mx + (app.scan_xmax - mx) * f;
       app.scan_ymin = my + (app.scan_ymin - my) * f; app.scan_ymax = my + (app.scan_ymax - my) * f;
       app.scan_dirty = true;
@@ -5422,16 +6012,20 @@ void render_scan_background(AppState &app) {
     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { app.scan_view_init = false; app.scan_dirty = true; }
   }
 
-  /* scans are expensive — keep the grid modest and debounce recompute */
-  const int CW = std::min(app.window_width, 480);
-  const int CH = std::min(app.window_height, 380);
+  /* scans are expensive (each cell integrates a trajectory), so render
+   * PROGRESSIVELY: a coarse pass fills the screen immediately, then it refines
+   * over the next frames. This is what keeps ODE scans from freezing the UI. */
+  const int CW = std::min(app.window_width, 400);
+  const int CH = std::min(app.window_height, 320);
   const bool sforce = (app.scan_tex == 0 || app.scan_tex_w != CW || app.scan_tex_h != CH);
-  if (app.scan_dirty) { app.scan_settle = 8; app.scan_dirty = false; }
-  bool scompute = sforce;
-  if (app.scan_settle > 0) { if (--app.scan_settle == 0) scompute = true; }
-  if (scompute) {
+  if (app.scan_dirty) { app.scan_settle = 6; app.scan_dirty = false; }
+  bool sstart = sforce;
+  if (app.scan_settle > 0) { if (--app.scan_settle == 0) sstart = true; }
+  if (sstart) app.scan_prog_level = 16;          /* (re)start the coarse->fine ladder */
+  if (app.scan_prog_level > 0) {
+    const int step = app.scan_prog_level;
     std::vector<uint32_t> img;
-    compute_scan_image(app, CW, CH, img);
+    compute_scan_image(app, CW, CH, img, step);
     if (app.scan_tex == 0) glGenTextures(1, &app.scan_tex);
     glBindTexture(GL_TEXTURE_2D, app.scan_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CW, CH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
@@ -5440,7 +6034,8 @@ void render_scan_background(AppState &app) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     app.scan_tex_w = CW; app.scan_tex_h = CH;
-    app.scan_dirty = false;
+    /* next, finer level: 16 -> 8 -> 4 -> 2 -> 1 -> 0 (done) */
+    app.scan_prog_level = (step > 1) ? step / 2 : 0;
   }
   if (app.scan_tex != 0)
     draw->AddImage((ImTextureID)(uintptr_t)app.scan_tex, ImVec2(0, 0), ImVec2(w, h));
@@ -5453,9 +6048,19 @@ void render_scan_background(AppState &app) {
                 app.params[pxi].name.c_str(), app.scan_xmin, app.scan_xmax,
                 app.params[pyi].name.c_str(), app.scan_ymin, app.scan_ymax,
                 app.scan_lyap_min, app.scan_lyap_max);
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
-  draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 26.0f), IM_COL32(170, 170, 180, 220),
                 "blue/dark = periodic (shrimps);  warm/bright = chaotic.  drag: pan  wheel: zoom");
+  /* For the complex-quadratic system the two parameters ARE Re(c), Im(c), so
+   * the Lyapunov scan of the c-plane genuinely reproduces the Mandelbrot set
+   * (bounded orbits = negative exponent). Say so, since it understandably
+   * looks just like the fractal view. */
+  if (app.state_names.size() >= 2 &&
+      (std::strstr(app.system_input, "x*x - y*y") != nullptr ||
+       std::strstr(app.system_input, "z^2 + c") != nullptr)) {
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 44.0f), IM_COL32(150, 175, 150, 220),
+                  "(this is the c-plane: the Lyapunov scan here IS the Mandelbrot set -- bounded = periodic = dark)");
+  }
 }
 
 /* ============================================================
@@ -5492,6 +6097,48 @@ inline int mandel_escape(double cre, double cim, int maxit, double R2) {
     if (x * x + y * y > R2) { ++it; break; }
   }
   return it;
+}
+
+/* For a point c INSIDE the Mandelbrot set (bounded orbit), detect the period
+ * of the attracting cycle: settle the orbit, then find the smallest p such
+ * that z_{n+p} ~ z_n. Returns 0 if it escapes, or the detected period (capped
+ * at maxp; 0/uncertain -> returns maxp+1 meaning "high/chaotic"). This is what
+ * makes the cascade<->bulb correspondence visible: period-2 window under the
+ * period-2 bulb, period-3 under the period-3 bulb, and so on. */
+inline int mandel_period(double cre, double cim, int settle, int maxp, double R2) {
+  double x = 0, y = 0;
+  for (int k = 0; k < settle; ++k) {
+    const double nx = x * x - y * y + cre, ny = 2 * x * y + cim;
+    x = nx; y = ny;
+    if (x * x + y * y > R2) return 0; /* escaped */
+  }
+  const double rx = x, ry = y;            /* reference point on the cycle */
+  for (int p = 1; p <= maxp; ++p) {
+    const double nx = x * x - y * y + cre, ny = 2 * x * y + cim;
+    x = nx; y = ny;
+    if (x * x + y * y > R2) return 0;
+    const double dx = x - rx, dy = y - ry;
+    if (dx * dx + dy * dy < 1e-12) return p;
+  }
+  return maxp + 1; /* long/!detected period within budget */
+}
+
+/* a distinct hue per period, so bulbs of different period read at a glance.
+ * Writes r,g,b in [0,1]. period 1 (main cardioid) = warm; 2,3,4,... cycle hues. */
+inline void period_color(int period, float *r, float *g, float *b) {
+  if (period <= 0) { *r = 0.05f; *g = 0.06f; *b = 0.12f; return; } /* exterior */
+  static const float pal[8][3] = {
+    {0.95f, 0.75f, 0.25f}, /* 1  amber  */
+    {0.30f, 0.70f, 1.00f}, /* 2  blue   */
+    {0.45f, 0.90f, 0.45f}, /* 3  green  */
+    {1.00f, 0.45f, 0.55f}, /* 4  rose   */
+    {0.75f, 0.55f, 1.00f}, /* 5  violet */
+    {1.00f, 0.65f, 0.30f}, /* 6  orange */
+    {0.40f, 0.85f, 0.85f}, /* 7  teal   */
+    {0.85f, 0.85f, 0.40f}, /* 8+ olive  */
+  };
+  const int idx = (period >= 1 && period <= 8) ? period - 1 : 7;
+  *r = pal[idx][0]; *g = pal[idx][1]; *b = pal[idx][2];
 }
 }  // namespace bridge_detail
 
@@ -5637,19 +6284,41 @@ void build_bridge_geometry(AppState &app) {
             cols.push_back(0); cols.push_back(0); cols.push_back(0); /* recolored below */
           }
         } else {
-          double w0 = 0, w1 = 0, w2 = 0; int filled = 0;
-          for (int k = 0; k < keep; ++k) {
+          /* ODE: prefer local maxima of the observable (a Poincare-style
+           * section), but COLLECT enough trajectory to find them — short
+           * windows on slow oscillators yield no maxima and a black slice.
+           * If a slice still finds too few maxima, fall back to raw subsampled
+           * values so the slice is never empty. */
+          const int odekeep = std::max(keep, 1200);
+          std::vector<double> raw; raw.reserve((size_t)odekeep);
+          double w0 = 0, w1 = 0, w2 = 0; int filled = 0; int maxima = 0;
+          for (int k = 0; k < odekeep; ++k) {
             State o{};
             if (!step_state(app, s, &o, err, sizeof(err))) break;
             s = o;
             const double val = state_at(s, obs_idx);
             if (!std::isfinite(val)) break;
+            raw.push_back(val);
             w0 = w1; w1 = w2; w2 = val; if (filled < 3) ++filled;
             if (filled == 3 && w1 > w0 && w1 >= w2) { /* local maximum */
               if (w1 < obs_lo) obs_lo = w1;
               if (w1 > obs_hi) obs_hi = w1;
               pts.push_back(Point{wx(u), (float)w1, wz(v)});
               cols.push_back(0); cols.push_back(0); cols.push_back(0); /* recolored below */
+              ++maxima;
+            }
+          }
+          /* fallback: an equilibrium or slow drift produced (almost) no maxima
+           * — subsample the raw trajectory so the slice still shows something. */
+          if (maxima < 3 && raw.size() >= 8) {
+            const int want = std::min((int)raw.size(), std::max(20, keep));
+            const int stride = std::max(1, (int)raw.size() / want);
+            for (size_t k = 0; k < raw.size(); k += (size_t)stride) {
+              const double val = raw[k];
+              if (val < obs_lo) obs_lo = val;
+              if (val > obs_hi) obs_hi = val;
+              pts.push_back(Point{wx(u), (float)val, wz(v)});
+              cols.push_back(0); cols.push_back(0); cols.push_back(0);
             }
           }
         }
@@ -5690,6 +6359,162 @@ void build_bridge_geometry(AppState &app) {
     return;
   }
 
+  /* =====================================================================
+   * PROJECTION-SOLID bridge.
+   *
+   * A SINGLE 3D point cloud whose two perpendicular 2D shadows are exactly
+   * the Mandelbrot set and the logistic bifurcation diagram.
+   *
+   *   X = c          the real/parameter axis, shared by both images
+   *                  (logistic r maps in by the conjugacy c = r/2 - r^2/4)
+   *   Z = im         imaginary part  -> the X-Z shadow is the Mandelbrot set
+   *   Y = x          attractor value -> the X-Y shadow is the bifurcation diagram
+   *
+   * For each slice at fixed c the cross-section is the Cartesian product
+   *     (Mandelbrot imaginary membership in Z)  x  (logistic attractor fiber in Y).
+   * Projecting that product onto X-Z collapses Y and recovers the set; onto
+   * X-Y collapses Z and recovers the cascade. So the one solid casts both
+   * pictures, and you rotate it freely to see how they belong to each other.
+   * ===================================================================== */
+  if (app.bridge_mode == AppState::BridgeMode::ProjectionSolid) {
+    /* The unified construction (after thejoggeli/mandelbrot-logistic):
+     * iterate z -> z^2 + c over the WHOLE complex plane, X = Re(c), Z = Im(c).
+     * For each c IN the Mandelbrot set, take the orbit's periodic tail and plot
+     * every value it visits as a point at height  Y = -Re(z) * scale.
+     * This is ONE object from ONE computation:
+     *   - its shadow on X-Z (look down Y) is the Mandelbrot set (only in-set
+     *     points exist), and
+     *   - its shadow on X-Y (look down Z) is the bifurcation diagram: along the
+     *     real axis z^2+c is conjugate to the logistic map, so the orbit tail
+     *     traces the period-doubling cascade, and the off-axis orbits fill the
+     *     body that connects the set to the cascade.
+     * The Mandelbrot set and the logistic bifurcation are literally two
+     * projections of the same 3-D structure. */
+    const bool cubic = (app.bridge_family == AppState::BridgeFamily::Cubic);
+    const bool sine  = (app.bridge_family == AppState::BridgeFamily::Sine);
+    /* Box framing per family: quadratic set sits around c_re in [-2,0.25];
+     * cubic is disc-shaped about the origin (|c|<~1.5); the sine family
+     * c*sin(z) has its interesting parameter range along positive real c with
+     * a tall imaginary extent. */
+    const double pos_x = sine ? 1.9 : (cubic ? 0.0 : -1.0); /* center of the c-plane box */
+    const double pos_z = 0.0;
+    const double box_x = sine ? 3.6 : (cubic ? 3.2 : 4.0);
+    const double box_z = sine ? 5.0 : (cubic ? 3.2 : 2.0);
+    const double scale_y = sine ? 0.5 : (2.0 / 3.0);
+    /* world scale: map the c-box to ~50 world units (matches camera) */
+    const double WSCALE = sine ? 11.0 : (cubic ? 16.0 : 13.0);
+    auto W = [&](double v) { return (float)(v * WSCALE); };
+
+    const int density = std::max(60, app.bridge_mandel_res / 4); /* voxels per unit */
+    int nx = (int)(density * box_x); if (nx % 2 == 0) ++nx;
+    int nz = (int)(density * box_z); if (nz % 2 == 0) ++nz;
+    const double step_x = box_x / nx, step_z = box_z / nz;
+    const double off_x = pos_x - step_x * (nx - 1) * 0.5;
+    const double off_z = pos_z - step_z * (nz - 1) * 0.5;
+
+    const int max_iter = 4096;
+    /* The sine family is chaotic over much of its range and its bounded orbits
+     * run long, which would emit millions of points. Cap its tail length hard
+     * and subsample below so the cloud stays comparable to the polynomial
+     * families (~a few hundred k points). */
+    const int max_tail = sine ? std::min(96, std::max(48, app.bridge_bif_keep))
+                              : std::min(max_iter, std::max(64, app.bridge_bif_keep * 3));
+    const int emit_stride = sine ? 3 : 1;   /* keep every Nth voxel-orbit point */
+    /* Boundedness test. Quadratic/cubic: |z|>R diverges (escape radius). Sine:
+     * c*sin(z) sends orbits to i*infinity when they escape, so the right test
+     * is on |Im z| growing without bound, not |z|. */
+    const double esc2 = cubic ? 9.0 : 4.0;
+    const double sine_im_bail = 30.0;
+    std::vector<double> zre((size_t)max_iter);
+
+    for (int vx = 0; vx < nx; ++vx) {
+      for (int vz = 0; vz < nz; ++vz) {
+        const double c_re = off_x + vx * step_x;
+        const double c_im = off_z + vz * step_z;
+        /* sine orbits start from z=0.5 (a generic point); polynomial families
+         * start from the critical point z=0. */
+        double z_re = sine ? 0.5 : 0.0, z_im = 0.0;
+        bool in_set = true;
+        int iters = 0;
+        for (int i = 0; i < max_iter; ++i) {
+          const double a = z_re, b = z_im;
+          if (sine) {
+            /* c * sin(z), z=a+bi: sin(a+bi) = sin a cosh b + i cos a sinh b,
+             * then multiply by c = c_re + i c_im. */
+            const double sr = std::sin(a) * std::cosh(b);
+            const double si = std::cos(a) * std::sinh(b);
+            z_re = c_re * sr - c_im * si;
+            z_im = c_re * si + c_im * sr;
+            if (!std::isfinite(z_re) || std::fabs(z_im) > sine_im_bail) { in_set = false; break; }
+          } else if (cubic) {
+            /* z^3 + c, with z = a+bi:  z^3 = (a^3 - 3ab^2) + (3a^2 b - b^3) i */
+            z_re = a * a * a - 3.0 * a * b * b + c_re;
+            z_im = 3.0 * a * a * b - b * b * b + c_im;
+            if (z_re * z_re + z_im * z_im > esc2) { in_set = false; break; }
+          } else {
+            z_re = a * a - b * b + c_re;
+            z_im = 2 * a * b + c_im;
+            if (z_re * z_re + z_im * z_im > esc2) { in_set = false; break; }
+          }
+          zre[(size_t)i] = z_re;
+          iters = i + 1;
+        }
+        if (!in_set || iters < 2) continue;
+
+        /* find the periodic tail: walk back from the last value to the most
+         * recent exact repeat (the cycle), like the reference. Bounded by
+         * max_tail so dense periodic regions stay affordable. */
+        const int end = iters;
+        const int lo = std::max(0, end - max_tail);
+        int start = lo;
+        const double last = zre[(size_t)end - 1];
+        for (int j = end - 2; j >= lo; --j) {
+          if (zre[(size_t)j] == last) { start = j + 1; break; }
+        }
+        int tail = end - start;
+        if (tail < 1) { start = lo; tail = end - start; }
+
+        /* colour: by cycle length (period), brighter for short periods; the
+         * real axis (the logistic cascade) is emphasised slightly. */
+        float pr, pg, pb;
+        if (app.bridge_color_by_period) {
+          int per = tail; if (per < 1) per = 1; if (per > 64) per = 0;
+          bridge_detail::period_color(per, &pr, &pg, &pb);
+        } else {
+          const float g = std::min(1.0f, (float)tail / (float)max_tail);
+          pr = 0.5f + g; pg = g; pb = g;
+        }
+        const float fx = W(c_re), fz = W(c_im);
+        /* dim each point so additive blending accumulates to the right
+         * brightness where many orbit points overlap (rather than clipping). */
+        const float dim = 0.32f;
+        for (int j = start; j < end; j += emit_stride) {
+          const float fy = (float)(-zre[(size_t)j] * scale_y) * (float)WSCALE;
+          pts.push_back(Point{fx, fy, fz});
+          cols.push_back(pr * dim); cols.push_back(pg * dim); cols.push_back(pb * dim);
+        }
+      }
+    }
+
+    app.bridge_point_count = (int)pts.size();
+    if (pts.empty()) { app.bridge_built = true; return; }
+    if (app.bridge_vao == 0) glGenVertexArrays(1, &app.bridge_vao);
+    if (app.bridge_vbo == 0) glGenBuffers(1, &app.bridge_vbo);
+    if (app.bridge_cbo == 0) glGenBuffers(1, &app.bridge_cbo);
+    glBindVertexArray(app.bridge_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, app.bridge_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(pts.size() * sizeof(Point)), pts.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Point), (void *)0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, app.bridge_cbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(cols.size() * sizeof(float)), cols.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+    app.bridge_built = true;
+    return;
+  }
+
   /* world mapping helpers */
   const double re_lo = -2.2, re_hi = 0.7;
   const double im_lo = -1.2, im_hi = 1.2;
@@ -5709,10 +6534,21 @@ void build_bridge_geometry(AppState &app) {
         const double re = re_lo + (re_hi - re_lo) * i / (RES - 1);
         const int it = bridge_detail::mandel_escape(re, im, maxit, R2);
         const bool inside = (it >= maxit);
-        /* draw interior solidly (deep blue) and a thin escaped halo */
         if (inside) {
+          /* INTERIOR: color by the period of the attracting cycle, so the
+           * period-n bulbs are visually distinct and line up with the
+           * period-n windows of the cascade rising above the real axis. */
+          float r, g, b;
+          if (app.bridge_color_by_period) {
+            const int per = bridge_detail::mandel_period(re, im, 250, 64, R2);
+            bridge_detail::period_color(per, &r, &g, &b);
+            /* dim slightly so the rising cascade stays the bright foreground */
+            r *= 0.55f; g *= 0.55f; b *= 0.6f;
+          } else {
+            r = 0.10f; g = 0.18f; b = 0.42f;
+          }
           pts.push_back(Point{wx(re), 0.0f, wz(im)});
-          cols.push_back(0.10f); cols.push_back(0.18f); cols.push_back(0.42f);
+          cols.push_back(r); cols.push_back(g); cols.push_back(b);
         } else if (it > 4 && (it % 2 == 0)) {
           /* sparse colored exterior bands for context, near the set only */
           const double t = std::fmod(it * 0.06, 1.0);
@@ -5726,34 +6562,81 @@ void build_bridge_geometry(AppState &app) {
   }
 
   /* ---- logistic bifurcation diagram rising in +y above the real axis ---- *
-   * Map logistic r in [2.6,4.0] onto the Mandelbrot real-axis span where
-   * the matching cascade lives: r=2.6..4.0 corresponds (via conjugacy) to
-   * c roughly in [-0.75, -2.0]. We place the diagram along z=0 (im=0). */
+   * Map logistic r in [1,4] onto the Mandelbrot real-axis span via the
+   * conjugacy c = r/2 - r^2/4: r=1->c=0.25 (the cusp of the cardioid) down to
+   * r=4->c=-2 (the antenna tip). Spanning the FULL real-axis range makes the
+   * cascade's footprint coincide with the Mandelbrot set's real-axis slice, so
+   * the two diagrams share the same c-axis edge and read as one structure. The
+   * diagram lives in the vertical plane z=0 (the real axis), the set in the
+   * horizontal floor — rotate to see each face and their shared spine. */
   if (app.bridge_show_bifurcation) {
     const int slices = std::max(100, app.bridge_bif_slices);
     const int discard = 800;
     const int keep = std::max(20, app.bridge_bif_keep);
-    /* r in [2.6,4]; c(r) = (2r - r^2)/4 is the logistic<->quadratic map's
-     * parameter conjugacy (c = r/2 - r^2/4). This lands the cascade onto
-     * the Mandelbrot needle. */
     auto c_of_r = [](double r) { return r / 2.0 - r * r / 4.0; };
+    /* detect the logistic period at parameter r (post-transient): smallest p
+     * with x_{n+p} ~ x_n. Lets us color the cascade to MATCH the bulb colors
+     * and draw period-keyed droplines, making the correspondence explicit. */
+    auto logistic_period = [](double r, int settle, int maxp) -> int {
+      double x = 0.5;
+      for (int k = 0; k < settle; ++k) x = r * x * (1.0 - x);
+      const double rx = x;
+      for (int p = 1; p <= maxp; ++p) {
+        x = r * x * (1.0 - x);
+        if (std::fabs(x - rx) < 1e-9) return p;
+      }
+      return maxp + 1;
+    };
     for (int s = 0; s < slices; ++s) {
-      const double r = 2.6 + (4.0 - 2.6) * s / (slices - 1);
+      const double r = 1.0 + (4.0 - 1.0) * s / (slices - 1);
       double x = 0.5;
       for (int k = 0; k < discard; ++k) x = r * x * (1.0 - x);
       const double cre = c_of_r(r);
+      const int per = app.bridge_color_by_period ? logistic_period(r, 2000, 64) : 0;
+      float pr = 0.5f, pg = 0.5f, pb = 0.5f;
+      if (app.bridge_color_by_period) bridge_detail::period_color(per > 64 ? 0 : per, &pr, &pg, &pb);
       for (int k = 0; k < keep; ++k) {
         x = r * x * (1.0 - x);
         if (!std::isfinite(x)) break;
-        /* world position: x-axis from the conjugate c, z=0 (real axis),
-         * y = attractor value lifted by bridge_height */
         const float wy = (float)x * app.bridge_height;
         pts.push_back(Point{wx(cre), wy, wz(0.0)});
-        /* color by height: cyan low -> yellow high */
-        const float t = (float)x;
-        cols.push_back(0.2f + 0.8f * t);
-        cols.push_back(0.7f + 0.3f * t);
-        cols.push_back(0.9f - 0.6f * t);
+        if (app.bridge_color_by_period && per <= 8) {
+          /* match the bulb hue, brightened toward the top of the cascade */
+          const float t = (float)x;
+          cols.push_back(std::min(1.0f, pr + 0.25f * t));
+          cols.push_back(std::min(1.0f, pg + 0.15f * t));
+          cols.push_back(std::min(1.0f, pb));
+        } else {
+          const float t = (float)x;
+          cols.push_back(0.2f + 0.8f * t);
+          cols.push_back(0.7f + 0.3f * t);
+          cols.push_back(0.9f - 0.6f * t);
+        }
+      }
+      /* periodic-window droplines: in a low-period window, drop a faint line
+       * from the cascade down to the real-axis floor at the same c, visually
+       * tying the window to the bulb it sits above. */
+      if (app.bridge_color_by_period && per >= 1 && per <= 8 && (s % 3 == 0)) {
+        const int LN = 10;
+        for (int t = 0; t <= LN; ++t) {
+          const float wy = (float)((double)t / LN) * app.bridge_height * 0.5f;
+          pts.push_back(Point{wx(cre), wy, wz(0.0)});
+          cols.push_back(pr * 0.5f); cols.push_back(pg * 0.5f); cols.push_back(pb * 0.5f);
+        }
+      }
+    }
+
+    /* The SHARED SPINE: the real axis c in [-2, 0.25] at y=0, z=0 is the common
+     * edge where the Mandelbrot floor and the vertical bifurcation diagram meet.
+     * Drawing it as a bright line makes the join explicit — as you orbit, this
+     * is the hinge between the set (seen from the side) and the cascade (seen
+     * from the front). */
+    {
+      const int SN = std::max(200, slices);
+      for (int s = 0; s <= SN; ++s) {
+        const double c = -2.0 + (0.25 - (-2.0)) * (double)s / SN;
+        pts.push_back(Point{wx(c), 0.0f, wz(0.0)});
+        cols.push_back(1.0f); cols.push_back(0.92f); cols.push_back(0.55f);
       }
     }
   }
@@ -5783,8 +6666,67 @@ void render_bridge_scene(AppState &app) {
 
   if (!app.bridge_built) build_bridge_geometry(app);
 
-  glEnable(GL_DEPTH_TEST);
-  glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
+  /* Frame the geometry on first entry (or when it was just rebuilt for a new
+   * mode). The point clouds span roughly +/-23 in X, 0..26 in Y, +/-17 in Z,
+   * far larger than the default scene_scale expects, so without this the whole
+   * structure renders as a dot in the corner. A 3/4 view shows both shadow
+   * faces of the projection solid at once. */
+  if (!app.bridge_cam_init) {
+    app.bridge_cam_init = true;
+    const bool proj = (app.bridge_mode == AppState::BridgeMode::ProjectionSolid);
+    const bool classic = (app.bridge_mode == AppState::BridgeMode::Classic);
+    const bool cubic = (app.bridge_family == AppState::BridgeFamily::Cubic);
+    const bool sine  = (app.bridge_family == AppState::BridgeFamily::Sine);
+    /* Projection-solid uses an orthographic camera so that looking down an axis
+     * gives a TRUE 2D projection (the shadows ARE the two images). The other
+     * modes use the normal perspective camera. */
+    app.orthographic_3d = proj;
+    app.zoom = 1.15f;
+    app.camera_distance = 60.0f;
+    app.center_z = 0.0f;
+    app.angle_x = 26.0f;
+    app.angle_y = -48.0f;
+    if (proj) {
+      app.scene_scale = sine ? 1.05f : (cubic ? 0.55f : 0.62f);
+      app.center_x = sine ? -19.0f : (cubic ? 0.0f : 13.0f);
+      app.center_y = sine ? 1.0f : -1.0f;
+    } else if (classic) {
+      /* side-by-side: Mandelbrot floor + vertical cascade, ~±22 world units. */
+      app.scene_scale = 0.42f;
+      app.center_x = 0.0f;
+      app.center_y = -4.0f;
+      app.angle_x = 32.0f;
+      app.angle_y = -46.0f;
+    } else {
+      /* current-system: bifurcation lifted into 3D, normalized geometry. */
+      app.scene_scale = 0.42f;
+      app.center_x = 0.0f;
+      app.center_y = 0.0f;
+      app.angle_x = 24.0f;
+      app.angle_y = -40.0f;
+    }
+    if (const char *ax = std::getenv("DYNSYS_ANGLE_X")) app.angle_x = (float)std::atof(ax);
+    if (const char *ay = std::getenv("DYNSYS_ANGLE_Y")) app.angle_y = (float)std::atof(ay);
+    if (const char *sc = std::getenv("DYNSYS_SCALE"))   app.scene_scale = (float)std::atof(sc);
+    if (const char *cy = std::getenv("DYNSYS_CENTER_Y")) app.center_y = (float)std::atof(cy);
+    if (const char *cx = std::getenv("DYNSYS_CENTER_X")) app.center_x = (float)std::atof(cx);
+    update_projection(app);
+  }
+
+  const bool proj_solid = (app.bridge_mode == AppState::BridgeMode::ProjectionSolid);
+  if (proj_solid) {
+    /* Translucent additive look (as in the reference): overlapping orbit
+     * points accumulate so the dense periodic blobs become see-through and the
+     * real-axis cascade shows through the body. Depth test off so nothing is
+     * hidden; additive blend brightens where many orbits coincide. */
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+  } else {
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+  }
+  glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   glUseProgram(app.shader_program);
 
@@ -5813,7 +6755,10 @@ void render_bridge_scene(AppState &app) {
     glDrawArrays(GL_POINTS, 0, app.bridge_point_count);
     glBindVertexArray(0);
   }
-
+  /* restore default GL state so the additive/no-depth bridge settings don't
+   * leak into other views drawn later in the frame */
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
   /* camera interaction (same scheme as the attractor scene) */
   ImGuiIO &io = ImGui::GetIO();
   if (!io.WantCaptureMouse) {
@@ -5821,38 +6766,75 @@ void render_bridge_scene(AppState &app) {
       app.angle_y += io.MouseDelta.x * 0.4f;
       app.angle_x += io.MouseDelta.y * 0.4f;
     }
+    /* PAN: right- or middle-drag shifts the view center so the structure moves
+     * around the screen. center_x/y are in WORLD units (applied after the model
+     * scale), so to track the cursor 1:1 we convert pixels->world using the
+     * actual on-screen extent: orthographic spans +-hh*aspect horizontally over
+     * the window width; perspective approximates the same at the structure's
+     * depth. Previously this used 0.09/scene_scale, which was ~30x too small in
+     * ortho -- the structure barely budged, so panning looked broken. */
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+        ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+      const float winw = std::max(1.0f, (float)app.window_width);
+      const float winh = std::max(1.0f, (float)app.window_height);
+      float world_per_px_x, world_per_px_y;
+      if (app.orthographic_3d) {
+        const float hh = 30.0f / std::max(app.zoom, 0.001f);
+        world_per_px_x = (2.0f * hh * aspect) / winw;
+        world_per_px_y = (2.0f * hh) / winh;
+      } else {
+        /* perspective: world extent at the camera distance for a 45deg fovy */
+        const float hh = std::tan(glm_rad(22.5f)) * app.camera_distance;
+        world_per_px_x = (2.0f * hh * aspect) / winw;
+        world_per_px_y = (2.0f * hh) / winh;
+      }
+      app.center_x += io.MouseDelta.x * world_per_px_x;
+      app.center_y -= io.MouseDelta.y * world_per_px_y;
+    }
     if (io.MouseWheel != 0.0f) {
-      app.zoom *= std::pow(1.15f, io.MouseWheel);
+      app.zoom *= std::pow(1.15f, (float)clamped_wheel(io.MouseWheel));
       app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
     }
   }
 
   ImDrawList *draw = ImGui::GetBackgroundDrawList();
   if (app.bridge_mode == AppState::BridgeMode::CurrentSystem) {
-    char hud[384];
+    char hud[420];
     const char *obs = (app.bif_observable[0] != '\0') ? app.bif_observable : "x";
     if (app.bridge_param2[0] != '\0')
       std::snprintf(hud, sizeof(hud),
-                    "3D bridge (current system) — x: %s in [%.3g, %.3g],  height: %s,  z: %s in [%.3g, %.3g]  |  %d pts",
+                    "Bifurcation diagram in 3D — x: %s in [%.3g, %.3g],  height: %s,  z: %s in [%.3g, %.3g]  |  %d pts",
                     app.bif_param, app.bif_start, app.bif_end, obs,
                     app.bridge_param2, app.bridge_p2_min, app.bridge_p2_max, app.bridge_point_count);
     else
       std::snprintf(hud, sizeof(hud),
-                    "3D bridge (current system) — x: %s in [%.3g, %.3g],  height: %s  (set a 2nd param for a stacked surface)  |  %d pts",
+                    "Bifurcation diagram in 3D — x: %s in [%.3g, %.3g],  height: %s  (set a 2nd param for a stacked surface)  |  %d pts",
                     app.bif_param, app.bif_start, app.bif_end, obs, app.bridge_point_count);
-    draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
-    draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
-                  app.mode == SystemMode::Map
-                    ? "the escape-set floor (this map's parameter space) with its bifurcation cascade rising out of it.  drag: rotate   wheel: zoom"
-                    : "this system's bifurcation diagram lifted into 3D (ODEs have no escape floor).  drag: rotate   wheel: zoom");
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 26.0f), IM_COL32(170, 170, 180, 220),
+                  "this system has NO unified fractal<->bifurcation bridge (only logistic/cubic/sine/Mandelbrot do), "
+                  "so this lifts its own bifurcation diagram into 3D instead.  drag: rotate   wheel: zoom");
     if (app.bridge_point_count == 0)
       draw->AddText(ImVec2(14, 52), IM_COL32(255, 210, 120, 240),
                     "no points — check the x param name/range and observable in the Setup tab, then Rebuild bridge.");
+  } else if (app.bridge_mode == AppState::BridgeMode::ProjectionSolid) {
+    const bool cubic = (app.bridge_family == AppState::BridgeFamily::Cubic);
+    const bool sine  = (app.bridge_family == AppState::BridgeFamily::Sine);
+    char hud[384];
+    std::snprintf(hud, sizeof(hud),
+                  "3D bridge — ONE structure (iterate %s): footprint = %s, real-axis silhouette = %s  |  %d pts",
+                  sine ? "c*sin(z)" : (cubic ? "z^3+c" : "z^2+c"),
+                  sine ? "sine connectedness set" : (cubic ? "cubic Mandelbrot set" : "Mandelbrot set"),
+                  sine ? "sine-map bifurcation" : (cubic ? "cubic-map bifurcation" : "logistic bifurcation"),
+                  app.bridge_point_count);
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 26.0f), IM_COL32(170, 170, 180, 220),
+                  "look down the Y axis -> the set; down the Z axis -> the bifurcation diagram. self-contained (independent of the loaded system).  left-drag: rotate   right-drag: move   wheel: zoom");
   } else {
-    draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235),
-                  "3D bridge (logistic/Mandelbrot) — Mandelbrot set (flat) + logistic bifurcation (rising along the real axis)");
-    draw->AddText(ImVec2(14, 30), IM_COL32(170, 170, 180, 220),
-                  "they line up because z^2+c and the logistic map are conjugate.  switch to 'current system' mode for other systems.  drag: rotate   wheel: zoom");
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235),
+                  "3D bridge (side-by-side) — the Mandelbrot set is the floor, the logistic bifurcation is the vertical face, joined along the real axis (gold spine)");
+    draw->AddText(ImVec2(14, app.window_toolbar_h + 26.0f), IM_COL32(170, 170, 180, 220),
+                  "ROTATE to read each face: from the side the set, from the front the cascade — they share the c-axis because z^2+c and the logistic map are conjugate.  drag: rotate   wheel: zoom");
   }
 }
 
@@ -6210,18 +7192,33 @@ void render_continuation_background(AppState &app) {
     }
   }
 
-  /* fold (circle) and Hopf (diamond) markers */
+  /* special-point markers: fold (circle), Hopf (diamond), and codim-2 / branch
+   * points (squares, distinctly colored and labelled). */
   for (size_t i = 0; i < app.cont_special.size(); ++i) {
-    if (app.cont_special[i] == 0) continue;
+    const int sp = app.cont_special[i];
+    if (sp == 0) continue;
     const ImVec2 c(sx(app.cont_pp[i]), sy(app.cont_yy[i]));
-    if (app.cont_special[i] == 1) {
-      draw->AddCircle(c, 6.0f, IM_COL32(255, 220, 90, 255), 16, 2.0f);
+    const float r = 6.0f;
+    if (sp == 1) {
+      draw->AddCircle(c, r, IM_COL32(255, 220, 90, 255), 16, 2.0f);
       draw->AddText(ImVec2(c.x + 8, c.y - 6), IM_COL32(255, 220, 90, 255), "Fold (LP)");
-    } else {
-      const float r = 6.0f;
+    } else if (sp == 2) {
       draw->AddQuad(ImVec2(c.x, c.y-r), ImVec2(c.x+r, c.y), ImVec2(c.x, c.y+r), ImVec2(c.x-r, c.y),
                     IM_COL32(120, 200, 255, 255), 2.0f);
       draw->AddText(ImVec2(c.x + 8, c.y - 6), IM_COL32(120, 200, 255, 255), "Hopf (H)");
+    } else {
+      /* codim-2 / branch point: filled square + label */
+      ImU32 col; const char *lab;
+      switch (sp) {
+        case 3: col = IM_COL32(255, 120, 120, 255); lab = "BT (Bogdanov-Takens)"; break;
+        case 4: col = IM_COL32(255, 160, 80, 255);  lab = "CP (cusp)";            break;
+        case 5: col = IM_COL32(180, 140, 255, 255); lab = "GH (gen. Hopf)";       break;
+        case 6: col = IM_COL32(120, 255, 160, 255); lab = "BP (branch point)";    break;
+        default: col = IM_COL32(230,230,230,255);   lab = "special";              break;
+      }
+      draw->AddRectFilled(ImVec2(c.x-r, c.y-r), ImVec2(c.x+r, c.y+r), col);
+      draw->AddRect(ImVec2(c.x-r, c.y-r), ImVec2(c.x+r, c.y+r), IM_COL32(20,20,25,255), 0, 0, 1.5f);
+      draw->AddText(ImVec2(c.x + 8, c.y - 6), col, lab);
     }
   }
 
@@ -6235,7 +7232,7 @@ void render_continuation_background(AppState &app) {
   std::snprintf(hud, sizeof(hud),
                 "Equilibrium continuation — %zu points  |  %d fold, %d Hopf  |  solid green = stable, dashed red = unstable",
                 app.cont_pp.size(), app.cont_n_fold, app.cont_n_hopf);
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
 }
 
 /* ============================================================
@@ -6265,6 +7262,12 @@ void render_lc_continuation_background(AppState &app) {
       if (app.lcc_param[0] == '\0' && !app.params.empty())
         std::snprintf(app.lcc_param, sizeof(app.lcc_param), "%s", app.params[0].name.c_str());
       run_lc_continuation(app);
+      /* Also run the rigorous collocation + pseudo-arclength continuation in the
+       * SAME parameter, so the main view shows the branch that follows folds of
+       * cycles with Floquet stability -- not just the simulate-and-measure sweep
+       * (which only finds stable cycles). */
+      std::snprintf(app.cont_param, sizeof(app.cont_param), "%s", app.lcc_param);
+      run_cycle_collocation(app);
     }
     if (!app.lcc_has_data) {
       draw->AddText(ImVec2(20, 48), IM_COL32(225, 225, 235, 235),
@@ -6283,8 +7286,18 @@ void render_lc_continuation_background(AppState &app) {
 
   double pmin = app.lcc_pp.front(), pmax = app.lcc_pp.back();
   if (pmax <= pmin) pmax = pmin + 1e-9;
-  const double amp_hi = app.lcc_amp_max * 1.08 + 1e-9;
-  const double per_hi = app.lcc_period_max * 1.08 + 1e-9;
+  double amp_hi = app.lcc_amp_max * 1.08 + 1e-9;
+  double per_hi = app.lcc_period_max * 1.08 + 1e-9;
+  /* widen the ranges so the overlaid collocation branch fits on the same axes */
+  const bool have_coll = app.cyc_ready && app.cyc_branch.samples.size() > 1;
+  if (have_coll) {
+    for (const auto &s : app.cyc_branch.samples) {
+      pmin = std::min(pmin, s.p); pmax = std::max(pmax, s.p);
+      amp_hi = std::max(amp_hi, s.amplitude * 1.08);
+      per_hi = std::max(per_hi, s.period * 1.08);
+    }
+    if (pmax <= pmin) pmax = pmin + 1e-9;
+  }
 
   auto sx = [&](double p){ return pad_l + (float)((p - pmin) / (pmax - pmin)) * plot_w; };
   auto sy_amp = [&](double a){ return pad_t + plot_h - (float)((a / amp_hi)) * plot_h; };
@@ -6351,17 +7364,45 @@ void render_lc_continuation_background(AppState &app) {
     }
   }
 
+  /* OVERLAY: the rigorous collocation + pseudo-arclength branch. Drawn as a
+   * brighter amplitude line coloured by Floquet stability (green stable / red
+   * unstable -- the sweep can't show unstable cycles at all), with the period
+   * as a brighter orange, plus LPC / PD / NS markers. This is the branch that
+   * follows folds of cycles. */
+  if (have_coll) {
+    const auto &S = app.cyc_branch.samples;
+    for (size_t i = 1; i < S.size(); ++i) {
+      draw->AddLine(ImVec2(sx(S[i-1].p), sy_per(S[i-1].period)),
+                    ImVec2(sx(S[i].p),   sy_per(S[i].period)),
+                    IM_COL32(255, 200, 110, 200), 1.4f);
+      const ImU32 col = S[i].stable ? IM_COL32(150, 255, 165, 255) : IM_COL32(255, 120, 95, 255);
+      draw->AddLine(ImVec2(sx(S[i-1].p), sy_amp(S[i-1].amplitude)),
+                    ImVec2(sx(S[i].p),   sy_amp(S[i].amplitude)), col, 2.6f);
+    }
+    for (const auto &s : S) {
+      const ImVec2 c(sx(s.p), sy_amp(s.amplitude));
+      if (s.is_fold) { draw->AddCircleFilled(c, 5.0f, IM_COL32(255,210,80,255)); draw->AddText(ImVec2(c.x+6,c.y-6), IM_COL32(255,210,80,255), "LPC"); }
+      if (s.is_pd)   { draw->AddCircleFilled(c, 4.5f, IM_COL32(255,120,200,255)); draw->AddText(ImVec2(c.x+6,c.y+4), IM_COL32(255,120,200,255), "PD"); }
+      if (s.is_ns)   { draw->AddCircleFilled(c, 4.5f, IM_COL32(150,200,255,255)); draw->AddText(ImVec2(c.x+6,c.y+4), IM_COL32(150,200,255,255), "NS"); }
+    }
+  }
+
   /* labels */
   char xlabel[96]; std::snprintf(xlabel, sizeof(xlabel), "parameter %s", app.lcc_param);
   draw->AddText(ImVec2(pad_l + plot_w * 0.5f - 40, pad_t + plot_h + 22), IM_COL32(210,210,220,230), xlabel);
   draw->AddText(ImVec2(8, pad_t - 22), IM_COL32(120,220,150,235), "amplitude");
   draw->AddText(ImVec2(pad_l + plot_w - 28, pad_t - 22), IM_COL32(245,180,90,235), "period");
 
-  char hud[260];
-  std::snprintf(hud, sizeof(hud),
-                "Limit-cycle continuation — %zu slices, %d with a cycle  |  green = amplitude (left), orange = period (right)",
-                app.lcc_pp.size(), n_cycle);
-  draw->AddText(ImVec2(14, 12), IM_COL32(235, 235, 240, 235), hud);
+  char hud[320];
+  if (have_coll)
+    std::snprintf(hud, sizeof(hud),
+                  "Limit-cycle continuation — sweep: %zu slices (%d cyclic, faint dots) + collocation branch (bold: green=stable, red=unstable; LPC/PD/NS marked)%s",
+                  app.lcc_pp.size(), n_cycle, app.cyc_branch.turned ? "  [turned a fold]" : "");
+  else
+    std::snprintf(hud, sizeof(hud),
+                  "Limit-cycle continuation — %zu slices, %d with a cycle  |  green = amplitude (left), orange = period (right)",
+                  app.lcc_pp.size(), n_cycle);
+  draw->AddText(ImVec2(14, app.window_toolbar_h + 8.0f), IM_COL32(235, 235, 240, 235), hud);
 }
 
 void draw_series_plot(AppState &app, const char *title, const char *value_name, ImVec2 size) {
@@ -6926,6 +7967,405 @@ dynsys::analysis::Model build_model(AppState &app, AppState::Param *param) {
   return model;
 }
 
+/* Two-parameter model for fold/Hopf-curve continuation: the vector field as a
+ * function of (x, p, q) where p and q are two chosen parameters. Finite-diff
+ * Jacobians inside two_param_curve do the rest, so we only need the field. */
+dynsys::analysis::Model2 build_model2(AppState &app, AppState::Param *pp, AppState::Param *qp) {
+  dynsys::analysis::Model2 model;
+  model.n = app.state_names.size();
+  model.vector_field = [&app, pp, qp](const double *x, double p, double q,
+                                      double *f_out, std::string *err) -> bool {
+    const size_t n = app.state_names.size();
+    const double sp = pp->value, sq = qp->value;
+    pp->value = p; qp->value = q;
+    sync_param_values(app);
+    State s = make_state_like(n, app.current.t);
+    for (size_t i = 0; i < n; ++i) set_state_at(s, i, x[i]);
+    State deriv{};
+    char buf[256] = {0};
+    const bool ok = eval_rhs(app, s, &deriv, buf, sizeof(buf));
+    pp->value = sp; qp->value = sq;
+    sync_param_values(app);
+    if (!ok) { if (err) *err = buf; return false; }
+    for (size_t i = 0; i < n; ++i) f_out[i] = state_at(deriv, i);
+    return true;
+  };
+  return model;
+}
+
+/* PHASE E: trace a fold or Hopf CURVE in a two-parameter plane. The first
+ * parameter is the continuation parameter (cont_param), the second is
+ * twopar_p2; the start point is the current located fixed point at the current
+ * (p,q). Reuses build_model2 + analysis::two_param_curve. */
+void run_two_param_curve(AppState &app, dynsys::analysis::TwoParamKind kind) {
+  app.twopar_ready = false;
+  if (app.mode != SystemMode::ODE) { app.twopar_msg = "two-parameter curves are for ODE systems"; return; }
+  AppState::Param *pp = find_param(app, app.cont_param);
+  AppState::Param *qp = find_param(app, app.twopar_p2);
+  if (pp == nullptr || qp == nullptr) { app.twopar_msg = "pick two distinct parameters (cont param + 2nd param)"; return; }
+  if (pp == qp) { app.twopar_msg = "the two parameters must be different"; return; }
+  const size_t n = app.state_names.size();
+  if (n == 0) { app.twopar_msg = "no system"; return; }
+
+  std::vector<double> x0(n);
+  for (size_t i = 0; i < n; ++i) x0[i] = app.fixed_ready ? state_at(app.fixed_point, i) : state_at(app.current, i);
+
+  dynsys::analysis::Model2 model = build_model2(app, pp, qp);
+  dynsys::analysis::TwoParamSettings s;
+  if (pp->has_range) { s.p_min = pp->min_value; s.p_max = pp->max_value; }
+  else { s.p_min = pp->value - 5.0; s.p_max = pp->value + 5.0; }
+  if (qp->has_range) { s.q_min = qp->min_value; s.q_max = qp->max_value; }
+  else { s.q_min = qp->value - 5.0; s.q_max = qp->value + 5.0; }
+  s.h0 = 0.05; s.max_points = 800;
+
+  app.twopar_curve = dynsys::analysis::two_param_curve(model, kind, x0, pp->value, qp->value, s);
+  app.twopar_ready = app.twopar_curve.ok;
+  sync_param_values(app);
+  app.twopar_msg = app.twopar_curve.ok
+      ? (std::string(kind == dynsys::analysis::TwoParamKind::Fold ? "fold" : "Hopf") +
+         " curve: " + app.twopar_curve.message)
+      : std::string("two-parameter curve: ") + app.twopar_curve.message;
+  app.analysis_message = app.twopar_msg;
+}
+
+/* Homoclinic-orbit search. Pick a SADDLE (from the auto-scanned planar fixed
+ * points, else correct one from the current state), nudge a point off it along
+ * the unstable eigendirection, integrate forward to trace one excursion that
+ * (for a near-homoclinic system) loops back near the saddle, and hand that as
+ * the seed to analysis::solve_homoclinic (truncated BVP + projection BCs). */
+void run_homoclinic(AppState &app) {
+  app.homoclinic_ready = false;
+  if (app.mode != SystemMode::ODE) { app.homoclinic_msg = "homoclinic orbits are for ODE systems"; return; }
+  const size_t n = app.state_names.size();
+  if (n < 2) { app.homoclinic_msg = "need a 2+ dimensional ODE"; return; }
+  AppState::Param *param = app.params.empty() ? nullptr : find_param(app, app.cont_param);
+  if (param == nullptr && !app.params.empty()) param = &app.params[0];
+  const double pval = param ? param->value : 0.0;
+
+  dynsys::analysis::Model model = build_model(app, param);
+
+  /* 1. choose a saddle. Prefer a planar saddle from the auto-scan; otherwise
+   * correct an equilibrium from the current state and require it be a saddle. */
+  std::vector<double> x0(n, 0.0);
+  for (size_t i = 0; i < n; ++i) x0[i] = state_at(app.current, i);
+  bool have_saddle = false;
+  if (n == 2 && !app.phase_fixed_points.empty()) {
+    for (const auto &fp : app.phase_fixed_points)
+      if (fp.is_saddle) { x0 = {fp.x, fp.y}; have_saddle = true; break; }
+  }
+  /* Newton-correct the equilibrium from x0 using the model's vector field +
+   * finite-difference Jacobian (a few iterations; local to keep this driver
+   * self-contained). */
+  {
+    std::vector<double> xc = x0, f(n), Jl, delta;
+    std::string er; bool ok = false;
+    for (int it = 0; it < 80; ++it) {
+      if (!model.vector_field(xc.data(), pval, f.data(), &er)) break;
+      double fn = 0; for (double v : f) fn += v*v; fn = std::sqrt(fn);
+      if (fn < 1e-11) { ok = true; break; }
+      if (!dynsys::analysis::finite_diff_jacobian(model, xc.data(), pval, &Jl, &er, 1e-7)) break;
+      std::vector<double> rhs(n); for (size_t i = 0; i < n; ++i) rhs[i] = -f[i];
+      if (!dynsys::analysis::solve_linear(Jl, rhs, &delta)) break;
+      double dn = 0; for (double v : delta) dn += v*v; dn = std::sqrt(dn);
+      double damp = dn > 1.0 ? 1.0/dn : 1.0;
+      for (size_t i = 0; i < n; ++i) xc[i] += damp*delta[i];
+    }
+    if (ok) { x0 = xc; have_saddle = true; }
+  }
+  if (!have_saddle) { app.homoclinic_msg = "could not locate a saddle equilibrium to connect"; return; }
+
+  /* Jacobian + unstable eigendirection for the nudge. */
+  std::vector<double> J; std::string e;
+  if (!dynsys::analysis::finite_diff_jacobian(model, x0.data(), pval, &J, &e, 1e-7)) {
+    app.homoclinic_msg = "Jacobian failed at the saddle"; return; }
+  std::vector<dynsys::analysis::Complex> ev;
+  dynsys::analysis::eigenvalues(J, n, &ev);
+  int n_pos = 0; for (auto &z : ev) if (z.real() > 1e-7) ++n_pos;
+  if (n_pos == 0 || n_pos == (int)n) { app.homoclinic_msg = "equilibrium is not a saddle (no homoclinic possible)"; return; }
+
+  /* crude unstable direction: power-iterate J to get the dominant eigvec */
+  std::vector<double> d(n, 0.0); d[0] = 1.0;
+  for (int it = 0; it < 200; ++it) {
+    std::vector<double> nd(n, 0.0);
+    for (size_t i = 0; i < n; ++i) for (size_t j = 0; j < n; ++j) nd[i] += J[i*n+j]*d[j];
+    double nr = 0; for (double v : nd) nr += v*v; nr = std::sqrt(nr);
+    if (nr < 1e-300) break;
+    for (double &v : nd) v /= nr;
+    d = nd;
+  }
+
+  /* 2. integrate forward from x0 + eps*d with RK4 to trace one excursion. We
+   * stop when the orbit returns close to the saddle after having left it. */
+  const double eps = 1e-4;
+  std::vector<double> x(n);
+  for (size_t i = 0; i < n; ++i) x[i] = x0[i] + eps*d[i];
+  const double dt = (app.dt > 0 ? app.dt : 0.01);
+  std::vector<std::vector<double>> seed;
+  seed.reserve(20000);
+  auto fld = [&](const std::vector<double> &xx, std::vector<double> &ff) {
+    ff.assign(n, 0.0); std::string er; return model.vector_field(xx.data(), pval, ff.data(), &er);
+  };
+  double maxdev = 0.0; bool left = false; int steps = 0; const int maxsteps = 200000;
+  std::vector<double> k1(n),k2(n),k3(n),k4(n),tmp(n);
+  for (; steps < maxsteps; ++steps) {
+    seed.push_back(x);
+    double dev = 0; for (size_t i = 0; i < n; ++i){ double dd=x[i]-x0[i]; dev+=dd*dd; } dev = std::sqrt(dev);
+    maxdev = std::max(maxdev, dev);
+    if (dev > 5.0*eps) left = true;
+    if (left && dev < 5.0*eps && seed.size() > 50) break; /* returned near saddle */
+    if (dev > 1e6 || !std::isfinite(dev)) break;          /* diverged: not homoclinic */
+    /* RK4 */
+    if (!fld(x,k1)) break;
+    for (size_t i=0;i<n;i++){ tmp[i]=x[i]+0.5*dt*k1[i]; }
+    if(!fld(tmp,k2)) break;
+    for (size_t i=0;i<n;i++){ tmp[i]=x[i]+0.5*dt*k2[i]; }
+    if(!fld(tmp,k3)) break;
+    for (size_t i=0;i<n;i++){ tmp[i]=x[i]+dt*k3[i]; }
+    if(!fld(tmp,k4)) break;
+    for (size_t i=0;i<n;i++) x[i]+=dt*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6.0;
+  }
+  if (seed.size() < 20) { app.homoclinic_msg = "could not trace an excursion off the saddle"; return; }
+
+  /* 3. solve the truncated BVP. The truncation half-time should be a MODERATE
+   * multiple of the saddle's slowest timescale (1/min|Re lambda|) -- NOT the
+   * raw simulation length, which can be huge when the saddle quantity is
+   * nonzero and the seed orbit spirals slowly. Too-large T wrecks the uniform
+   * mesh resolution. */
+  double lam_min = 1e9;
+  for (auto &z : ev) { double a = std::fabs(z.real()); if (a > 1e-7) lam_min = std::min(lam_min, a); }
+  if (!std::isfinite(lam_min) || lam_min <= 0) lam_min = 1.0;
+  double Tsane = 8.0 / lam_min;                     /* ~8 e-foldings to the saddle */
+  double Tseed = 0.5 * dt * (double)seed.size();
+  dynsys::analysis::HomoclinicSettings hs;
+  hs.mesh = std::min(300, std::max(80, (int)seed.size()/8));
+  hs.T = std::min(Tseed, std::max(8.0, Tsane));     /* moderate, capped         */
+  hs.free_T = false; hs.newton_iters = 80;
+  app.homoclinic = dynsys::analysis::solve_homoclinic(model, x0, pval, seed, hs);
+  app.homoclinic_ready = app.homoclinic.ok;
+  app.homoclinic_msg = "homoclinic: " + app.homoclinic.message;
+  app.analysis_message = app.homoclinic_msg;
+}
+
+/* Two-parameter continuation of the homoclinic locus. Requires a homoclinic to
+ * have been found first (run_homoclinic): its converged orbit seeds the curve.
+ * Continues in the secondary parameter twopar_p2, finding the primary parameter
+ * cont_param at which the connection closes at each step. */
+void run_homoclinic_curve(AppState &app) {
+  app.homoclinic_curve_ready = false;
+  if (!app.homoclinic_ready || app.homoclinic.orbit.size() < 4) {
+    app.homoclinic_msg = "find a homoclinic orbit first (it seeds the curve)"; return;
+  }
+  AppState::Param *pp = app.params.empty() ? nullptr : find_param(app, app.cont_param);
+  AppState::Param *qp = find_param(app, app.twopar_p2);
+  if (pp == nullptr) pp = app.params.empty() ? nullptr : &app.params[0];
+  if (pp == nullptr || qp == nullptr || pp == qp) {
+    app.homoclinic_msg = "set two distinct parameters (cont_param + twopar_p2) for the curve"; return;
+  }
+  dynsys::analysis::Model2 m2 = build_model2(app, pp, qp);
+  dynsys::analysis::HomoclinicContSettings cs;
+  cs.dq = std::max(1e-3, (qp->has_range ? (qp->max_value-qp->min_value)/60.0 : 0.05));
+  cs.max_steps = 40; cs.both_directions = true;
+  if (qp->has_range) { cs.q_min = qp->min_value; cs.q_max = qp->max_value; }
+  cs.store_orbits = false;
+  cs.bvp.mesh = (int)app.homoclinic.orbit.size() - 1;
+  cs.bvp.T = app.homoclinic.T; cs.bvp.free_T = false; cs.bvp.newton_iters = 60;
+  app.homoclinic_curve = dynsys::analysis::continue_homoclinic(
+      m2, app.homoclinic.saddle, pp->value, qp->value, app.homoclinic.orbit, cs);
+  app.homoclinic_curve_ready = app.homoclinic_curve.ok;
+  app.homoclinic_msg = "homoclinic curve: " + app.homoclinic_curve.message;
+  app.analysis_message = app.homoclinic_msg;
+}
+
+/* PHASE E: periodic-orbit continuation by COLLOCATION. Simulate at the current
+ * continuation parameter to land on a cycle, extract one loop as the initial
+ * guess (mesh points + period), then hand it to analysis::continue_limit_cycle,
+ * which solves the periodic BVP exactly (cycle + period) and follows it — so it
+ * tracks unstable cycles and folds of cycles, unlike the lcc_* sweep. */
+void run_cycle_collocation(AppState &app) {
+  app.cyc_ready = false;
+  if (app.mode != SystemMode::ODE) { app.cyc_msg = "periodic-orbit continuation is for ODE systems"; return; }
+  AppState::Param *param = app.params.empty() ? nullptr : find_param(app, app.cont_param);
+  if (param == nullptr && !app.params.empty()) param = &app.params[0];
+  if (param == nullptr) { app.cyc_msg = "declare a parameter to continue in"; return; }
+  const size_t n = app.state_names.size();
+  if (n < 2) { app.cyc_msg = "need at least 2 state variables for a periodic orbit"; return; }
+
+  const Integrator saved = app.integrator;
+  if (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45)
+    app.integrator = Integrator::RK4;
+  const double dt = app.dt > 0 ? app.dt : 0.01;
+
+  /* settle onto the attractor, then record until the first state returns near
+   * its starting value with matching direction (one loop). */
+  char err[256] = {0};
+  State s = app.start; resize_state(s, n);
+  bool ok = true;
+  for (int j = 0; j < 40000; ++j) { State nx{}; if (!step_ode_state(app, s, &nx, err, sizeof(err))) { ok = false; break; } s = nx; }
+  if (!ok) { app.integrator = saved; app.cyc_msg = "integration failed while settling onto a cycle"; return; }
+
+  /* record a long sample, capture the section crossing of x0 through its mean */
+  std::vector<std::vector<double>> traj;
+  std::vector<double> times;
+  const int rec = 60000;
+  traj.reserve(rec);
+  double mean0 = 0;
+  { State t = s; for (int j = 0; j < rec; ++j) { State nx{}; if (!step_ode_state(app, t, &nx, err, sizeof(err))) { ok=false; break; }
+      std::vector<double> row(n); for (size_t i=0;i<n;i++) row[i]=state_at(nx,i); traj.push_back(row); times.push_back((j+1)*dt); mean0+=row[0]; t=nx; } }
+  if (!ok || traj.size() < 100) { app.integrator = saved; app.cyc_msg = "could not record a cycle"; return; }
+  mean0 /= (double)traj.size();
+
+  /* find two successive upward crossings of x0 == mean0 -> one period */
+  int c1 = -1, c2 = -1;
+  for (size_t j = 1; j < traj.size(); ++j) {
+    if (traj[j-1][0] < mean0 && traj[j][0] >= mean0) {
+      if (c1 < 0) c1 = (int)j; else { c2 = (int)j; break; }
+    }
+  }
+  if (c1 < 0 || c2 < 0 || c2 <= c1) { app.integrator = saved; app.cyc_msg = "no clean periodic crossing found (is there a stable cycle here?)"; return; }
+  const double period_guess = (c2 - c1) * dt;
+
+  /* resample the loop [c1,c2) into `mesh` evenly spaced points */
+  const int mesh = 60;
+  std::vector<std::vector<double>> guess(mesh, std::vector<double>(n, 0.0));
+  for (int k = 0; k < mesh; ++k) {
+    const double frac = (double)k / mesh;
+    const int idx = c1 + (int)std::floor(frac * (c2 - c1));
+    guess[(size_t)k] = traj[(size_t)std::min(idx, (int)traj.size()-1)];
+  }
+  app.integrator = saved;
+
+  dynsys::analysis::Model model = build_model(app, param);
+  dynsys::analysis::CycleSettings cs;
+  if (param->has_range) { cs.p_min = param->min_value; cs.p_max = param->max_value; }
+  else { cs.p_min = param->value - 3.0; cs.p_max = param->value + 3.0; }
+  cs.mesh = mesh; cs.dp = std::max(1e-3, (cs.p_max - cs.p_min) / 120.0); cs.max_steps = 400;
+  /* pseudo-arclength so the branch follows folds of cycles (LPC), with Floquet
+   * multipliers for stability / period-doubling / torus detection. The
+   * arclength step is sized to the parameter window so we cover it in a sane
+   * number of steps but can still turn around folds. */
+  cs.arclength = true;
+  cs.compute_floquet = true;
+  cs.ds = std::max(1e-3, (cs.p_max - cs.p_min) / 80.0);
+
+  app.cyc_branch = dynsys::analysis::continue_limit_cycle(model, guess, period_guess, param->value, cs);
+  app.cyc_ready = app.cyc_branch.ok;
+  sync_param_values(app);
+  app.cyc_msg = app.cyc_branch.ok
+      ? "collocation: " + app.cyc_branch.message
+      : std::string("collocation: ") + app.cyc_branch.message;
+  app.analysis_message = app.cyc_msg;
+}
+
+/* PHASE E (nicety): trace a FOLD-OF-CYCLES (LPC) curve in the
+ * (cont_param, twopar_p2) plane. Seeds a cycle by simulation at the current
+ * (p,q), then calls analysis::lpc_curve which, for each q, continues the cycle
+ * in p and locates the saddle-node of cycles. */
+void run_lpc_curve(AppState &app) {
+  app.lpc_ready = false;
+  if (app.mode != SystemMode::ODE) { app.lpc_msg = "fold-of-cycles curves are for ODE systems"; return; }
+  AppState::Param *pp = find_param(app, app.cont_param);
+  AppState::Param *qp = find_param(app, app.twopar_p2);
+  if (pp == nullptr || qp == nullptr || pp == qp) { app.lpc_msg = "pick two distinct parameters (cont param + 2nd param)"; return; }
+  const size_t n = app.state_names.size();
+  if (n < 2) { app.lpc_msg = "need at least 2 state variables for a periodic orbit"; return; }
+
+  /* seed a cycle at the current parameters by simulation (same approach as the
+   * collocation runner) */
+  const Integrator saved = app.integrator;
+  if (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45) app.integrator = Integrator::RK4;
+  const double dt = app.dt > 0 ? app.dt : 0.01;
+  char err[256] = {0};
+  State s = app.start; resize_state(s, n); bool ok = true;
+  for (int j = 0; j < 40000; ++j) { State nx{}; if (!step_ode_state(app, s, &nx, err, sizeof(err))) { ok=false; break; } s = nx; }
+  std::vector<std::vector<double>> traj; double mean0 = 0;
+  if (ok) { State t = s; for (int j = 0; j < 60000; ++j) { State nx{}; if (!step_ode_state(app, t, &nx, err, sizeof(err))) { ok=false; break; }
+      std::vector<double> row(n); for (size_t i=0;i<n;i++) row[i]=state_at(nx,i); traj.push_back(row); mean0+=row[0]; t=nx; } }
+  if (!ok || traj.size() < 100) { app.integrator = saved; app.lpc_msg = "could not seed a cycle at the current parameters"; return; }
+  mean0 /= (double)traj.size();
+  int c1=-1,c2=-1;
+  for (size_t j=1;j<traj.size();++j) if (traj[j-1][0]<mean0 && traj[j][0]>=mean0) { if(c1<0)c1=(int)j; else {c2=(int)j; break;} }
+  if (c1<0||c2<0||c2<=c1) { app.integrator = saved; app.lpc_msg = "no clean cycle to seed from at the current parameters"; return; }
+  const double period_guess = (c2-c1)*dt;
+  const int mesh = 50;
+  std::vector<std::vector<double>> guess(mesh, std::vector<double>(n,0.0));
+  for (int k=0;k<mesh;k++){ const int idx=c1+(int)std::floor((double)k/mesh*(c2-c1)); guess[(size_t)k]=traj[(size_t)std::min(idx,(int)traj.size()-1)]; }
+  app.integrator = saved;
+
+  dynsys::analysis::Model2 model = build_model2(app, pp, qp);
+  dynsys::analysis::TwoParamSettings s2;
+  if (pp->has_range) { s2.p_min=pp->min_value; s2.p_max=pp->max_value; } else { s2.p_min=pp->value-3.0; s2.p_max=pp->value+3.0; }
+  if (qp->has_range) { s2.q_min=qp->min_value; s2.q_max=qp->max_value; } else { s2.q_min=qp->value-3.0; s2.q_max=qp->value+3.0; }
+  s2.max_points = 40;
+  dynsys::analysis::CycleSettings cs; cs.mesh=mesh; cs.dp=std::max(1e-3,(s2.p_max-s2.p_min)/120.0); cs.max_steps=200;
+
+  app.lpc_curve_data = dynsys::analysis::lpc_curve(model, guess, period_guess, pp->value, qp->value, s2, cs);
+  app.lpc_ready = app.lpc_curve_data.ok;
+  sync_param_values(app);
+  app.lpc_msg = app.lpc_curve_data.ok ? ("fold-of-cycles: " + app.lpc_curve_data.message)
+                                      : std::string("fold-of-cycles: ") + app.lpc_curve_data.message;
+  app.analysis_message = app.lpc_msg;
+}
+
+/* PHASE E: exact equilibria via the CAS. Extract each state equation's RHS
+ * text from the system source, substitute current parameter values as exact
+ * rationals, and ask Sangaku to solve f(x)=0 exactly (solve-poly in 1-D,
+ * Groebner in N-D). Polynomial fields only; anything transcendental is
+ * reported as such. Results land in app.cas_equi_* for the UI. */
+void run_exact_equilibria(AppState &app) {
+  app.cas_equi_ready = false;
+  app.cas_equi_lines.clear();
+  if (!dynsys::cas::is_available()) {
+    app.cas_equi_msg = "CAS unavailable (set LIZARD and SANGAKU_ROOT, or use the Nix shell)";
+    return;
+  }
+  if (app.mode == SystemMode::IFS) { app.cas_equi_msg = "exact equilibria apply to ODE/map systems"; return; }
+  const size_t n = app.state_names.size();
+  if (n == 0) { app.cas_equi_msg = "no system"; return; }
+
+  /* pull RHS text per state variable from the source */
+  std::vector<std::string> rhs(n);
+  std::vector<bool> got(n, false);
+  {
+    std::string src(app.system_input);
+    std::istringstream is(src);
+    std::string line;
+    while (std::getline(is, line)) {
+      /* strip comments (after '#') and skip blanks */
+      auto hash = line.find('#'); if (hash != std::string::npos) line = line.substr(0, hash);
+      auto eq = line.find('=');
+      if (eq == std::string::npos) continue;
+      std::string lhs = line.substr(0, eq), r = line.substr(eq + 1);
+      std::string name, perr; std::vector<std::string> ps;
+      if (!parse_lhs(lhs, &name, &ps, &perr)) continue;
+      int di = derivative_index_for_name(app.state_names, name);
+      int ni = next_index_for_name(app.state_names, name);
+      int idx = di >= 0 ? di : ni;
+      if (idx < 0 || idx >= (int)n) continue;
+      /* for a MAP, the equilibrium condition is x_next = x, i.e. RHS - x = 0 */
+      if (ni >= 0) r = "(" + r + ") - (" + app.state_names[(size_t)idx] + ")";
+      rhs[(size_t)idx] = r; got[(size_t)idx] = true;
+    }
+  }
+  for (size_t i = 0; i < n; ++i)
+    if (!got[i]) { app.cas_equi_msg = "could not find the equation for " + app.state_names[i]; return; }
+
+  /* current parameter values as exact rationals */
+  std::vector<std::pair<std::string, dynsys::cas::Rational>> subst;
+  for (const auto &p : app.params) {
+    bool ex = false;
+    dynsys::cas::Rational rr = dynsys::cas::rationalize(p.value, &ex, 1e-9);
+    subst.emplace_back(p.name, rr);
+  }
+
+  dynsys::cas::EquilibriaReport rep =
+      dynsys::cas::solve_equilibria(rhs, app.state_names, subst);
+  app.cas_equi_ready = rep.ok;
+  app.cas_equi_lines = rep.solutions;
+  app.cas_equi_is_poly = rep.polynomial;
+  app.cas_equi_msg = rep.ok ? std::string("exact (") + std::to_string(rep.solutions.size()) + " result line(s))"
+                            : rep.message;
+}
+
 void run_equilibrium_continuation(AppState &app) {
   if (app.mode != SystemMode::ODE) {
     app.analysis_message = "continuation currently applies to ODE mode only";
@@ -6959,24 +8399,29 @@ void run_equilibrium_continuation(AppState &app) {
   app.cont_branch =
       dynsys::analysis::continue_equilibrium(model, x0, p0, settings);
   app.cont_ready = app.cont_branch.ok;
+  app.cont_switched_ready = false; /* the previous switched branch is stale */
 
   /* Restore the live parameter — the model closures already restore it
    * per call, but be explicit. */
   sync_param_values(app);
 
-  size_t n_fold = 0, n_hopf = 0;
+  size_t n_fold = 0, n_hopf = 0, n_bt = 0, n_cusp = 0, n_gh = 0, n_bp = 0;
   for (size_t i : app.cont_branch.special_indices) {
-    if (app.cont_branch.points[i].special ==
-        dynsys::analysis::SpecialPointKind::Fold)
-      ++n_fold;
-    else if (app.cont_branch.points[i].special ==
-             dynsys::analysis::SpecialPointKind::Hopf)
-      ++n_hopf;
+    using K = dynsys::analysis::SpecialPointKind;
+    switch (app.cont_branch.points[i].special) {
+      case K::Fold: ++n_fold; break;
+      case K::Hopf: ++n_hopf; break;
+      case K::BogdanovTakens: ++n_bt; break;
+      case K::Cusp: ++n_cusp; break;
+      case K::GeneralizedHopf: ++n_gh; break;
+      case K::BranchPoint: ++n_bp; break;
+      default: break;
+    }
   }
-  char msg[256];
+  char msg[384];
   std::snprintf(msg, sizeof(msg),
-                "continuation: %zu points, %zu fold(s), %zu Hopf point(s) — %s",
-                app.cont_branch.points.size(), n_fold, n_hopf,
+                "continuation: %zu points, %zu fold(s), %zu Hopf; codim-2: %zu BT, %zu cusp, %zu gen-Hopf; %zu branch point(s) — %s",
+                app.cont_branch.points.size(), n_fold, n_hopf, n_bt, n_cusp, n_gh, n_bp,
                 app.cont_branch.message.c_str());
   app.analysis_message = msg;
 }
@@ -7026,8 +8471,16 @@ void run_continuation(AppState &app) {
       app.cont_yy.push_back(idx < b.points.size() && yi < (int)pt.x.size() ? pt.x[(size_t)yi] : 0.0);
       app.cont_stable.push_back(pt.stable ? 1 : 0);
       int sp = 0;
-      if (pt.special == dynsys::analysis::SpecialPointKind::Fold) { sp = 1; ++app.cont_n_fold; }
-      else if (pt.special == dynsys::analysis::SpecialPointKind::Hopf) { sp = 2; ++app.cont_n_hopf; }
+      using K = dynsys::analysis::SpecialPointKind;
+      switch (pt.special) {
+        case K::Fold:            sp = 1; ++app.cont_n_fold; break;
+        case K::Hopf:            sp = 2; ++app.cont_n_hopf; break;
+        case K::BogdanovTakens:  sp = 3; break;
+        case K::Cusp:            sp = 4; break;
+        case K::GeneralizedHopf: sp = 5; break;
+        case K::BranchPoint:     sp = 6; break;
+        default: sp = 0; break;
+      }
       app.cont_special.push_back(sp);
     }
   };
@@ -7489,7 +8942,7 @@ void run_lyapunov_spectrum(AppState &app) {
       app.angle_x += io.MouseDelta.y * 0.4f;
     }
     if (io.MouseWheel != 0.0f) {
-      app.zoom *= std::pow(1.15f, io.MouseWheel);
+      app.zoom *= std::pow(1.15f, (float)clamped_wheel(io.MouseWheel));
       app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
       update_projection(app);
     }
@@ -7507,26 +8960,58 @@ std::string capture_screenshot_png(AppState &app) {
   if (w <= 0 || h <= 0) return "";
   std::vector<unsigned char> buf((size_t)w * h * 4);
   glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  /* read the buffer we just rendered into (called post-RenderDrawData,
+   * pre-SwapBuffers, so the back buffer holds the complete frame) */
+  glReadBuffer(0x0405 /*GL_BACK*/);
   glReadPixels(0, 0, w, h, GL_RGBA, /*GL_UNSIGNED_BYTE*/ 0x1401, buf.data());
-  /* flip vertically into an RGB buffer */
-  std::vector<unsigned char> rgb((size_t)w * h * 3);
-  for (int y = 0; y < h; ++y) {
-    const unsigned char *src = &buf[(size_t)(h - 1 - y) * w * 4];
-    unsigned char *dst = &rgb[(size_t)y * w * 3];
-    for (int x = 0; x < w; ++x) {
+
+  /* When capturing a clean (chrome-suppressed) frame, save the FULL window so
+   * nothing is hidden and the image is full-size. Otherwise fall back to
+   * cropping the toolbar/panel out of a normal frame. */
+  int cx0 = 0, cy0_top = 0, cx1 = w, cy1_top = h;
+  if (!app.capturing_clean) {
+    cy0_top = (int)std::lround(app.window_toolbar_h);
+    const bool panel_shown = app.show_side_panel && app.panel_x1 > app.panel_x0 + 1.0f;
+    if (panel_shown && app.panel_x0 <= 2.0f) cx0 = std::max(cx0, (int)std::lround(app.panel_x1));
+  }
+  cx0 = std::max(0, std::min(cx0, w - 1));
+  cx1 = std::max(cx0 + 1, std::min(cx1, w));
+  cy0_top = std::max(0, std::min(cy0_top, h - 1));
+  cy1_top = std::max(cy0_top + 1, std::min(cy1_top, h));
+  const int cw = cx1 - cx0, ch = cy1_top - cy0_top;
+
+  std::vector<unsigned char> rgb((size_t)cw * ch * 3);
+  for (int y = 0; y < ch; ++y) {
+    /* destination row y corresponds to window row (cy0_top + y) from the top;
+     * in the bottom-left framebuffer that is row (h - 1 - (cy0_top + y)). */
+    const int srcrow = h - 1 - (cy0_top + y);
+    const unsigned char *src = &buf[((size_t)srcrow * w + cx0) * 4];
+    unsigned char *dst = &rgb[(size_t)y * cw * 3];
+    for (int x = 0; x < cw; ++x) {
       dst[x * 3 + 0] = src[x * 4 + 0];
       dst[x * 3 + 1] = src[x * 4 + 1];
       dst[x * 3 + 2] = src[x * 4 + 2];
     }
   }
-  char path[256];
+  const int outw = cw, outh = ch;
+  char name[128];
   std::time_t t = std::time(nullptr);
   std::tm *lt = std::localtime(&t);
-  std::snprintf(path, sizeof(path), "dynsys_%04d%02d%02d_%02d%02d%02d.png",
-                lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
-                lt->tm_hour, lt->tm_min, lt->tm_sec);
-  if (png_write_rgb(path, rgb.data(), w, h)) return std::string(path);
-  return "";
+  int yr = lt ? lt->tm_year + 1900 : 0;
+  if (yr < 2000 || yr > 3000) {
+    /* the system clock is implausible; fall back to a counter so we still
+     * produce a uniquely-named file rather than a misleading date */
+    static int seq = 0; ++seq;
+    std::snprintf(name, sizeof(name), "dynsys_capture_%03d.png", seq);
+  } else {
+    std::snprintf(name, sizeof(name), "dynsys_%04d%02d%02d_%02d%02d%02d.png",
+                  yr, lt->tm_mon + 1, lt->tm_mday, lt->tm_hour, lt->tm_min, lt->tm_sec);
+  }
+  if (!png_write_rgb(name, rgb.data(), outw, outh)) return "";
+  /* report an absolute path so the user can actually find the file */
+  char cwd[1024];
+  if (getcwd(cwd, sizeof(cwd))) return std::string(cwd) + "/" + name;
+  return std::string(name);
 }
 
 /* PHASE6-UI: top toolbar — view switch, run controls, key stats. Fixed,
@@ -7542,16 +9027,13 @@ void draw_top_toolbar(AppState &app) {
                            ImGuiWindowFlags_NoBringToFrontOnFocus;
   ImGui::Begin("##toolbar", nullptr, flags);
 
-  /* Visible build stamp: if you don't see this line at the top of the
-   * window, you are running an OLD binary — rebuild (make clean && make).*/
-  ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f), "dynsys NEW-UI " __DATE__);
+  /* Application title. */
+  ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.65f, 1.0f), "Dynsys");
   ImGui::SameLine();
-  if (ImGui::SmallButton("Logistic demo")) load_logistic_bifurcation_demo(app);
-  ImGui::SameLine();
-  if (ImGui::SmallButton("Save PNG")) {
-    std::string p = capture_screenshot_png(app);
-    app.screenshot_msg = p.empty() ? "screenshot failed" : ("saved " + p);
-    app.screenshot_msg_timer = 180; /* show ~3s at 60fps */
+  if (ImGui::SmallButton(app.capture_request ? "Saving..." : "Save PNG")) {
+    /* Defer the actual pixel capture to AFTER this frame is rendered (see the
+     * main loop). Capturing here would read the previous/empty back buffer. */
+    app.capture_request = true;
   }
   ImGui::SameLine();
   if (app.screenshot_msg_timer > 0) {
@@ -7559,7 +9041,24 @@ void draw_top_toolbar(AppState &app) {
     ImGui::TextColored(ImVec4(0.6f, 0.95f, 0.7f, 1.0f), "%s", app.screenshot_msg.c_str());
     ImGui::SameLine();
   }
-  ImGui::TextDisabled("(full-window plot)"); ImGui::SameLine();
+  ImGui::TextUnformatted("|"); ImGui::SameLine();
+
+  if (ImGui::SmallButton("Reset view")) reset_current_view(app);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Reset zoom/pan (or camera) for the current view to a sane framing.");
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Reset all")) {
+    reset_current_view(app);
+    reset_simulation(app);
+    /* also drop every 2D view back to auto framing so nothing stays zoomed out */
+    app.phase_auto_bounds = true; app.phase_bounds_valid = false;
+    app.bif_view_valid = false; app.cont_view_valid = false;
+    app.fractal_dirty = true; app.basin_dirty = true; app.scan_dirty = true;
+    app.scan_view_init = false;
+  }
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Reset the simulation and all view framings.");
+  ImGui::SameLine();
   ImGui::TextUnformatted("|"); ImGui::SameLine();
 
   if (ImGui::Button(app.show_side_panel ? "<< panel" : "panel >>"))
@@ -7708,6 +9207,11 @@ void draw_gui(AppState &app) {
     case AppState::ActiveView::Scene3D:     /* drawn in main loop */ break;
   }
 
+  /* During a clean capture frame we suppress all chrome (top toolbar + side
+   * controls panel) so the saved PNG shows the FULL plot at full size, with
+   * nothing hidden behind the menus. */
+  if (app.capturing_clean) return;
+
   draw_top_toolbar(app);
 
   if (!app.show_side_panel) {
@@ -7721,6 +9225,14 @@ void draw_gui(AppState &app) {
   ImGui::SetNextWindowSize(ImVec2(440, static_cast<float>(app.window_height) - top), ImGuiCond_FirstUseEver);
   ImGuiWindowFlags side_flags = ImGuiWindowFlags_NoMove;
   ImGui::Begin("controls", nullptr, side_flags);
+  /* Record the panel's on-screen rect so Save PNG can crop the controls out
+   * and save only the plotted system. */
+  {
+    ImVec2 pp = ImGui::GetWindowPos();
+    ImVec2 ps = ImGui::GetWindowSize();
+    app.panel_x0 = pp.x; app.panel_y0 = pp.y;
+    app.panel_x1 = pp.x + ps.x; app.panel_y1 = pp.y + ps.y;
+  }
 
   ImGui::Text("FPS: %d | mode: %s | integrator: %s | dim: %zu", app.fps, mode_name(app.mode), integrator_name(app.integrator), app.state_names.size());
   ImGui::Checkbox("auto performance governor", &app.perf_governor_enabled);
@@ -7836,12 +9348,15 @@ void draw_gui(AppState &app) {
     /* State-space (Julia) needs 2 state variables. For a 1-D map only
      * parameter-space is meaningful, so force it and disable the toggle. */
     const bool can_state_space = (app.state_names.size() >= 2);
+    const bool can_buddha = (app.state_names.size() >= 2 && app.params.size() >= 2);
     if (!can_state_space) app.fractal_mode = AppState::FractalMode::ParameterSpace;
     if (ImGui::CollapsingHeader("Fractal", ImGuiTreeNodeFlags_DefaultOpen)) {
       int mode = (int)app.fractal_mode;
-      const char *modes[] = {"parameter space (Mandelbrot-type)", "state space (Julia-type)"};
+      const char *modes[] = {"parameter space (Mandelbrot-type)", "state space (Julia-type)",
+                             "Buddhabrot (trajectory density)"};
+      const int nmodes = can_buddha ? 3 : 2;
       if (!can_state_space) ImGui::BeginDisabled();
-      if (ImGui::Combo("mode", &mode, modes, 2)) {
+      if (ImGui::Combo("mode", &mode, modes, nmodes)) {
         app.fractal_mode = (AppState::FractalMode)mode;
         app.fractal_dirty = true;
       }
@@ -7850,6 +9365,11 @@ void draw_gui(AppState &app) {
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("State-space (Julia) needs 2 state variables; this 1-D map only has parameter-space.");
       }
+      if (app.fractal_mode == AppState::FractalMode::Buddhabrot)
+        ImGui::TextWrapped("Buddhabrot: accumulates the orbits of ESCAPING points into a density "
+                           "map. It builds up and sharpens the longer you leave it. Best on the "
+                           "complex-quadratic (Mandelbrot) system.");
+      else
       ImGui::TextWrapped("Mandelbrot = which parameter values keep the start orbit bounded. "
                          "Julia = which initial points stay bounded for fixed parameters. "
                          "The logistic bifurcation diagram is the real-axis slice of this.");
@@ -7886,31 +9406,72 @@ void draw_gui(AppState &app) {
   if (app.active_view == AppState::ActiveView::Scene3DBridge) {
     if (ImGui::CollapsingHeader("3D bridge", ImGuiTreeNodeFlags_DefaultOpen)) {
       bool changed = false;
-      /* Classic mode is only meaningful for the quadratic family (a 1-D map);
-       * for anything else, force and lock CurrentSystem mode so the view
-       * always reflects the loaded system rather than a fixed logistic cascade. */
-      const bool classic_ok = (app.mode == SystemMode::Map && effective_dimension(app) == 1);
-      if (!classic_ok && app.bridge_mode == AppState::BridgeMode::Classic) {
+      /* The projection-solid bridge is only meaningful when the LOADED system
+       * has a matching family (logistic/quadratic -> z^2+c, cubic map -> z^3+c,
+       * sine map -> c*sin z). For systems with no such bridge (Henon, Lozi,
+       * Ikeda, tent, Gauss, the ODE flows, ...) the button is disabled and we
+       * say why. "current system" always works; "side-by-side" is the special
+       * Mandelbrot/logistic illustration. */
+      const int sys_fam = bridge_family_for_system(app);
+      const bool proj_ok = (sys_fam >= 0);
+      const char *fam_name = (sys_fam == 1) ? "cubic  z\u00b3+c"
+                           : (sys_fam == 2) ? "sine  c\u00b7sin(z)"
+                           : (sys_fam == 0) ? "quadratic  z\u00b2+c" : "(none)";
+      /* keep the family in sync with the loaded system */
+      if (sys_fam == 0) app.bridge_family = AppState::BridgeFamily::Quadratic;
+      else if (sys_fam == 1) app.bridge_family = AppState::BridgeFamily::Cubic;
+      else if (sys_fam == 2) app.bridge_family = AppState::BridgeFamily::Sine;
+      if (!proj_ok && app.bridge_mode == AppState::BridgeMode::ProjectionSolid) {
         app.bridge_mode = AppState::BridgeMode::CurrentSystem;
-        app.bridge_built = false;
+        app.bridge_built = false; app.bridge_cam_init = false;
       }
-      int mode = (app.bridge_mode == AppState::BridgeMode::Classic) ? 0 : 1;
+
+      int mode = (app.bridge_mode == AppState::BridgeMode::ProjectionSolid) ? 2
+               : (app.bridge_mode == AppState::BridgeMode::Classic)         ? 0 : 1;
+      const int mode_was = mode;
       ImGui::TextUnformatted("mode:");
       ImGui::SameLine();
-      if (!classic_ok) ImGui::BeginDisabled();
-      if (ImGui::RadioButton("logistic/Mandelbrot", mode == 0)) { mode = 0; changed = true; }
-      if (!classic_ok) {
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Classic mode needs a 1-D map (the quadratic family). "
-                            "Load the logistic map to use it.");
+      if (!proj_ok) ImGui::BeginDisabled();
+      if (ImGui::RadioButton("projection solid", mode == 2)) { mode = 2; }
+      if (!proj_ok) ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (proj_ok)
+          ImGui::SetTooltip("ONE 3D object whose two shadows are this system's fractal set and its "
+                            "bifurcation diagram. Family: %s (matched to the loaded system).", fam_name);
+        else
+          ImGui::SetTooltip("No unified bridge exists for this system. It only exists when the 1-D "
+                            "map is the real slice of an iterated complex polynomial (logistic, "
+                            "cubic, sine) or the complex-quadratic system. Load one of those, or "
+                            "use 'current system'.");
       }
       ImGui::SameLine();
-      if (ImGui::RadioButton("current system", mode == 1)) { mode = 1; changed = true; }
-      app.bridge_mode = (mode == 0 && classic_ok) ? AppState::BridgeMode::Classic
-                                                  : AppState::BridgeMode::CurrentSystem;
+      if (ImGui::RadioButton("side-by-side", mode == 0)) { mode = 0; }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The Mandelbrot set (flat) + logistic bifurcation rising along its real "
+                          "axis. A fixed Mandelbrot/logistic illustration, any system loaded.");
+      ImGui::SameLine();
+      if (ImGui::RadioButton("current system", mode == 1)) { mode = 1; }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Lifts the CURRENTLY LOADED system's bifurcation diagram into 3D.");
+      if (mode != mode_was) { changed = true; app.bridge_built = false; app.bridge_cam_init = false; }
+      app.bridge_mode = (mode == 2 && proj_ok) ? AppState::BridgeMode::ProjectionSolid
+                      : (mode == 0) ? AppState::BridgeMode::Classic
+                      : (mode == 1) ? AppState::BridgeMode::CurrentSystem
+                                    : app.bridge_mode;
 
-      if (app.bridge_mode == AppState::BridgeMode::Classic) {
+      if (app.bridge_mode == AppState::BridgeMode::ProjectionSolid) {
+        ImGui::TextWrapped("One 3D object built by iterating this system's complex map over the "
+                           "plane. Its footprint (look down the vertical axis) is the fractal "
+                           "connectedness set; its real-axis silhouette (look from the front) is "
+                           "the bifurcation diagram. Two projections of the SAME structure.");
+        ImGui::Text("family (from loaded system): %s", fam_name);
+        if (app.bridge_family == AppState::BridgeFamily::Sine)
+          ImGui::TextDisabled("(sine is experimental: sparse and largely chaotic.)");
+        changed |= ImGui::Checkbox("color by period", &app.bridge_color_by_period);
+        changed |= ImGui::SliderInt("resolution", &app.bridge_mandel_res, 120, 700);
+        ImGui::TextDisabled("Tip: look straight down -> the set; from the front -> the bifurcation "
+                            "diagram. Left-drag rotate, right-drag move, wheel zoom.");
+      } else if (app.bridge_mode == AppState::BridgeMode::Classic) {
         ImGui::TextWrapped("The Mandelbrot set (flat) with the logistic bifurcation diagram "
                            "rising along its real axis. They align because z^2+c and the "
                            "logistic map are conjugate. (This exact correspondence is special "
@@ -7918,8 +9479,18 @@ void draw_gui(AppState &app) {
         changed |= ImGui::Checkbox("show Mandelbrot", &app.bridge_show_mandelbrot);
         ImGui::SameLine();
         changed |= ImGui::Checkbox("show bifurcation", &app.bridge_show_bifurcation);
+        changed |= ImGui::Checkbox("color by period (show bulb \u2194 window correspondence)", &app.bridge_color_by_period);
+        if (app.bridge_color_by_period)
+          ImGui::TextDisabled("Each Mandelbrot bulb and the cascade window above it share a color "
+                              "keyed to the attracting cycle's period (1 amber, 2 blue, 3 green, ...).");
         changed |= ImGui::SliderInt("Mandelbrot resolution", &app.bridge_mandel_res, 120, 700);
       } else {
+        const int sf = bridge_family_for_system(app);
+        if (sf < 0)
+          ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.0f),
+                             "This system has no unified fractal<->bifurcation bridge, so this is "
+                             "NOT the Mandelbrot-style 3D object -- it is just this system's "
+                             "bifurcation diagram lifted into 3D.");
         ImGui::TextWrapped("Lifts THIS system's bifurcation diagram into 3D: the primary "
                            "parameter along x, the observable's value as height, and an "
                            "optional second parameter stacked along z. Works for any system.");
@@ -7941,7 +9512,7 @@ void draw_gui(AppState &app) {
       changed |= ImGui::SliderInt("bifurcation slices", &app.bridge_bif_slices, 60, 1500);
       changed |= ImGui::SliderInt("attractor points/slice", &app.bridge_bif_keep, 20, 400);
       changed |= ImGui::SliderFloat("bifurcation height", &app.bridge_height, 5.0f, 40.0f, "%.1f");
-      if (ImGui::Button("Rebuild bridge") || changed) app.bridge_built = false;
+      if (ImGui::Button("Rebuild bridge") || changed) { app.bridge_built = false; app.bridge_cam_init = false; }
       ImGui::TextDisabled("%d points. drag to rotate, wheel to zoom.", app.bridge_point_count);
     }
   }
@@ -7964,9 +9535,14 @@ void draw_gui(AppState &app) {
   /* PHASE B: 2-parameter scan controls. */
   if (app.active_view == AppState::ActiveView::ParamScan2D && app.params.size() >= 2) {
     if (ImGui::CollapsingHeader("2-parameter scan", ImGuiTreeNodeFlags_DefaultOpen)) {
-      ImGui::TextWrapped("Largest Lyapunov exponent over a grid of two parameters. Periodic "
-                         "windows (dark/blue) form the shrimp shapes inside the chaotic sea "
-                         "(bright/warm). Best on maps (Henon, Tinkerbell).");
+      ImGui::TextWrapped("Largest Lyapunov exponent over a grid of TWO parameters: dark/blue = "
+                         "periodic, bright/warm = chaotic.");
+      ImGui::TextWrapped("When is this useful? To map a system's behaviour across its parameter "
+                         "plane at a glance -- where it's periodic vs chaotic, where period-"
+                         "doubling cascades and 'shrimp' windows sit, and how regimes border each "
+                         "other. It answers 'for which parameter pairs is this system stable / "
+                         "chaotic?' in one picture, instead of scanning one parameter at a time. "
+                         "Best on maps (Henon, Tinkerbell, the standard map).");
       if (ImGui::BeginCombo("x param", app.params[std::min((size_t)app.scan_px_index, app.params.size()-1)].name.c_str())) {
         for (int i = 0; i < (int)app.params.size(); ++i)
           if (ImGui::Selectable(app.params[i].name.c_str(), i == app.scan_px_index)) { app.scan_px_index = i; app.scan_view_init = false; }
@@ -8006,7 +9582,22 @@ void draw_gui(AppState &app) {
       }
       ImGui::EndCombo();
     }
-    ImGui::InputTextMultiline("##system_input", app.system_input, sizeof(app.system_input), ImVec2(-FLT_MIN, 280.0f), ImGuiInputTextFlags_AllowTabInput);
+    /* Equation editor with a line-number gutter on the left. Systems are
+     * short and typically don't scroll, so a simple aligned gutter is enough;
+     * we don't reach into ImGui internals to chase the editor's scroll. */
+    {
+      const float ed_h = 280.0f;
+      int nlines = 1;
+      for (const char *p = app.system_input; *p; ++p) if (*p == '\n') ++nlines;
+      ImGui::BeginChild("##gutter", ImVec2(34.0f, ed_h), false,
+                        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+      for (int i = 1; i <= nlines; ++i)
+        ImGui::TextColored(ImVec4(0.45f, 0.50f, 0.58f, 1.0f), "%3d", i);
+      ImGui::EndChild();
+      ImGui::SameLine(0.0f, 4.0f);
+      ImGui::InputTextMultiline("##system_input", app.system_input, sizeof(app.system_input),
+                                ImVec2(-FLT_MIN, ed_h), ImGuiInputTextFlags_AllowTabInput);
+    }
     if (ImGui::Button("Apply system")) {
       if (compile_system(app, app.system_input, &app.parse_error)) reset_simulation(app);
     }
@@ -8310,6 +9901,24 @@ void draw_gui(AppState &app) {
     if (ImGui::Button("Clear Poincare")) app.poincare_points.clear();
     ImGui::Separator();
     if (ImGui::Button("Find fixed point")) find_fixed_point(app);
+    /* Exact equilibria via the CAS: finds ALL equilibria exactly (not just the
+     * one Newton lands on), for polynomial fields with rational parameters. */
+    if (dynsys::cas::is_available() && app.mode != SystemMode::IFS) {
+      ImGui::SameLine();
+      if (ImGui::Button("Find ALL equilibria exactly (CAS)")) run_exact_equilibria(app);
+      if (app.cas_equi_ready) {
+        if (!app.cas_equi_is_poly)
+          ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "%s", app.cas_equi_msg.c_str());
+        else {
+          ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1.0f), "exact equilibria:");
+          for (const auto &s : app.cas_equi_lines) ImGui::BulletText("%s", s.c_str());
+          if (app.state_names.size() > 1)
+            ImGui::TextDisabled("(N-D: shown as the Groebner basis of the solution ideal — each generator = 0)");
+        }
+      } else if (!app.cas_equi_msg.empty()) {
+        ImGui::TextDisabled("exact equilibria: %s", app.cas_equi_msg.c_str());
+      }
+    }
     if (app.fixed_ready) {
       std::string fp = "fixed point:";
       for (size_t i = 0; i < app.state_names.size(); ++i) {
@@ -8524,27 +10133,340 @@ void draw_gui(AppState &app) {
     ImGui::SameLine();
     ImGui::Checkbox("detect Hopf", &app.cont_detect_hopf);
 
+    /* Two-parameter continuation: trace a fold or Hopf CURVE in the
+     * (cont_param, 2nd param) plane. This is the codim-1-curve-in-2-params
+     * feature — e.g. where does a fold persist as two parameters vary. */
+    if (app.params.size() >= 2) {
+      ImGui::SeparatorText("two-parameter curves (codim-1 in 2 params)");
+      ImGui::TextDisabled("x axis = continuation param '%s'; choose a 2nd param for the y axis:", app.cont_param);
+      if (ImGui::BeginCombo("2nd param (y)", app.twopar_p2[0] ? app.twopar_p2 : "(pick)")) {
+        for (const auto &pr : app.params)
+          if (ImGui::Selectable(pr.name.c_str(), pr.name == app.twopar_p2))
+            std::snprintf(app.twopar_p2, sizeof(app.twopar_p2), "%s", pr.name.c_str());
+        ImGui::EndCombo();
+      }
+      if (ImGui::Button("Trace fold curve")) run_two_param_curve(app, dynsys::analysis::TwoParamKind::Fold);
+      ImGui::SameLine();
+      if (ImGui::Button("Trace Hopf curve")) run_two_param_curve(app, dynsys::analysis::TwoParamKind::Hopf);
+      if (!app.twopar_msg.empty())
+        ImGui::TextWrapped("%s", app.twopar_msg.c_str());
+      if (app.twopar_ready && app.twopar_curve.points.size() > 1) {
+        /* small (p,q) plot of the curve */
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImVec2 o = ImGui::GetCursorScreenPos();
+        const float W = ImGui::GetContentRegionAvail().x, H = 150.0f;
+        ImVec2 e(o.x + W, o.y + H);
+        dl->AddRectFilled(o, e, IM_COL32(16,16,20,220));
+        dl->AddRect(o, e, IM_COL32(110,110,120,200));
+        double pmn=1e300,pmx=-1e300,qmn=1e300,qmx=-1e300;
+        for (auto &pt : app.twopar_curve.points){ pmn=std::min(pmn,pt.p);pmx=std::max(pmx,pt.p);qmn=std::min(qmn,pt.q);qmx=std::max(qmx,pt.q);}
+        const double pr=(pmx-pmn)>1e-12?(pmx-pmn):1.0, qr=(qmx-qmn)>1e-12?(qmx-qmn):1.0;
+        auto sc=[&](double p,double q){ return ImVec2((float)(o.x+6+(W-12)*(p-pmn)/pr),(float)(e.y-6-(H-12)*(q-qmn)/qr)); };
+        const ImU32 col = app.twopar_curve.kind==dynsys::analysis::SpecialPointKind::Hopf
+                          ? IM_COL32(120,200,255,235) : IM_COL32(255,210,80,235);
+        for (size_t i=1;i<app.twopar_curve.points.size();++i){
+          auto&a=app.twopar_curve.points[i-1]; auto&b=app.twopar_curve.points[i];
+          /* break the line across the two-direction join (large jump) */
+          if (std::fabs(a.p-b.p)+std::fabs(a.q-b.q) < 0.4*(pr+qr))
+            dl->AddLine(sc(a.p,a.q), sc(b.p,b.q), col, 2.0f);
+        }
+        /* codim-2 markers detected ON the curve (cusp / BT / generalized Hopf) */
+        for (size_t idx : app.twopar_curve.special_indices) {
+          const auto &sp = app.twopar_curve.points[idx];
+          ImVec2 c2 = sc(sp.p, sp.q); const float r = 5.0f;
+          ImU32 mc; const char *ml;
+          switch (sp.special) {
+            case dynsys::analysis::SpecialPointKind::Cusp:            mc=IM_COL32(255,160,80,255);  ml="CP"; break;
+            case dynsys::analysis::SpecialPointKind::BogdanovTakens:  mc=IM_COL32(255,120,120,255); ml="BT"; break;
+            case dynsys::analysis::SpecialPointKind::GeneralizedHopf: mc=IM_COL32(180,140,255,255); ml="GH"; break;
+            default: mc=IM_COL32(230,230,230,255); ml="*"; break;
+          }
+          dl->AddRectFilled(ImVec2(c2.x-r,c2.y-r), ImVec2(c2.x+r,c2.y+r), mc);
+          dl->AddRect(ImVec2(c2.x-r,c2.y-r), ImVec2(c2.x+r,c2.y+r), IM_COL32(20,20,25,255), 0,0,1.5f);
+          dl->AddText(ImVec2(c2.x+7,c2.y-6), mc, ml);
+        }
+        char lab[192]; std::snprintf(lab,sizeof(lab),"%s  (x: %s, y: %s)%s",
+                       app.twopar_curve.kind==dynsys::analysis::SpecialPointKind::Hopf?"Hopf curve":"fold curve",
+                       app.cont_param, app.twopar_p2,
+                       app.twopar_curve.special_indices.empty()?"":"  CP=cusp BT=Bogdanov-Takens GH=gen.Hopf");
+        dl->AddText(ImVec2(o.x+8,o.y+6), col, lab);
+        ImGui::Dummy(ImVec2(W, H+4));
+
+        /* text readout of each codim-2 point: refined location + normal form */
+        for (size_t idx : app.twopar_curve.special_indices) {
+          const auto &sp = app.twopar_curve.points[idx];
+          const char *kn = sp.special==dynsys::analysis::SpecialPointKind::BogdanovTakens ? "Bogdanov-Takens"
+                         : sp.special==dynsys::analysis::SpecialPointKind::Cusp ? "Cusp"
+                         : sp.special==dynsys::analysis::SpecialPointKind::GeneralizedHopf ? "generalized Hopf" : "codim-2";
+          if (sp.special==dynsys::analysis::SpecialPointKind::BogdanovTakens && sp.has_codim2_nf)
+            ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  BT normal form: a=%.4g, b=%.4g  (a,b != 0 => non-degenerate)",
+                              kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.bt_a, sp.bt_b);
+          else
+            ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  [refined]",
+                              kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2);
+        }
+      }
+    }
+
+    /* Periodic-orbit continuation by collocation: solves the cycle + its
+     * period as a BVP and follows it (tracks unstable cycles and folds of
+     * cycles), distinct from the simulate-and-measure sweep in the LimitCycle
+     * view. Needs a 2+ D ODE with a stable cycle to seed from. */
+    if (app.mode == SystemMode::ODE && app.state_names.size() >= 2 && !app.params.empty()) {
+      ImGui::SeparatorText("periodic-orbit continuation (collocation)");
+      ImGui::TextDisabled("continues in '%s' from a cycle seeded at the current value", app.cont_param);
+      if (ImGui::Button("Continue limit cycle (collocation)")) run_cycle_collocation(app);
+      if (!app.cyc_msg.empty()) ImGui::TextWrapped("%s", app.cyc_msg.c_str());
+
+      /* Homoclinic orbit: connection from a saddle back to itself, solved as a
+       * truncated boundary-value problem with projection boundary conditions. */
+      ImGui::SeparatorText("homoclinic orbit (saddle connection)");
+      ImGui::TextDisabled("finds a saddle, seeds an excursion off it, solves the truncated BVP");
+      if (ImGui::Button("Find homoclinic orbit")) run_homoclinic(app);
+      if (!app.homoclinic_msg.empty()) ImGui::TextWrapped("%s", app.homoclinic_msg.c_str());
+      if (app.homoclinic_ready && app.homoclinic.orbit.size() > 2) {
+        const auto &H = app.homoclinic;
+        ImGui::Text("saddle at (%.4g, %.4g)  |  half-time T = %.3g  |  peak deviation = %.3g  |  %d unstable dir%s",
+                    H.saddle.size()>0?H.saddle[0]:0.0, H.saddle.size()>1?H.saddle[1]:0.0,
+                    H.T, H.amplitude, H.n_unstable, H.n_unstable==1?"":"s");
+        /* phase-plane plot of the orbit (first two coordinates) + the saddle */
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImVec2 o = ImGui::GetCursorScreenPos();
+        const float W = ImGui::GetContentRegionAvail().x, Hh = 200.0f;
+        ImVec2 e(o.x + W, o.y + Hh);
+        dl->AddRectFilled(o, e, IM_COL32(16,16,20,220));
+        dl->AddRect(o, e, IM_COL32(110,110,120,200));
+        double xmn=1e300,xmx=-1e300,ymn=1e300,ymx=-1e300;
+        for (auto &pt : H.orbit) { xmn=std::min(xmn,pt[0]);xmx=std::max(xmx,pt[0]);
+          if (pt.size()>1){ymn=std::min(ymn,pt[1]);ymx=std::max(ymx,pt[1]);} }
+        if (H.orbit[0].size()<2) { ymn=-1; ymx=1; }
+        const double xr=(xmx-xmn)>1e-9?(xmx-xmn):1.0, yr=(ymx-ymn)>1e-9?(ymx-ymn):1.0;
+        auto sc=[&](double x,double y){ return ImVec2((float)(o.x+8+(W-16)*(x-xmn)/xr),(float)(e.y-8-(Hh-16)*(y-ymn)/yr)); };
+        for (size_t i=1;i<H.orbit.size();++i){
+          double y0 = H.orbit[i-1].size()>1?H.orbit[i-1][1]:0.0;
+          double y1 = H.orbit[i].size()>1?H.orbit[i][1]:0.0;
+          dl->AddLine(sc(H.orbit[i-1][0],y0), sc(H.orbit[i][0],y1), IM_COL32(140,230,255,255), 2.0f);
+        }
+        if (H.saddle.size()>=1) {
+          ImVec2 sp = sc(H.saddle[0], H.saddle.size()>1?H.saddle[1]:0.0);
+          dl->AddLine(ImVec2(sp.x-5,sp.y-5),ImVec2(sp.x+5,sp.y+5),IM_COL32(255,120,120,255),2.0f);
+          dl->AddLine(ImVec2(sp.x-5,sp.y+5),ImVec2(sp.x+5,sp.y-5),IM_COL32(255,120,120,255),2.0f);
+          dl->AddText(ImVec2(sp.x+7,sp.y-6),IM_COL32(255,120,120,255),"saddle");
+        }
+        dl->AddText(ImVec2(o.x+8,o.y+6), IM_COL32(200,200,210,220),
+                    "homoclinic orbit (cyan) leaving & returning to the saddle (x-y projection)");
+        ImGui::Dummy(ImVec2(W, Hh+4));
+
+        /* two-parameter continuation of the homoclinic locus */
+        ImGui::TextDisabled("continue the homoclinic in 2 params (%s vs %s):", app.cont_param, app.twopar_p2);
+        if (ImGui::Button("Continue homoclinic curve")) run_homoclinic_curve(app);
+        if (app.homoclinic_curve_ready && app.homoclinic_curve.points.size() > 1) {
+          const auto &HC = app.homoclinic_curve;
+          ImGui::Text("homoclinic locus: %zu points", HC.points.size());
+          ImDrawList *dl2 = ImGui::GetWindowDrawList();
+          ImVec2 o2 = ImGui::GetCursorScreenPos();
+          const float W2 = ImGui::GetContentRegionAvail().x, H2 = 170.0f;
+          ImVec2 e2(o2.x + W2, o2.y + H2);
+          dl2->AddRectFilled(o2, e2, IM_COL32(16,16,20,220));
+          dl2->AddRect(o2, e2, IM_COL32(110,110,120,200));
+          double qmn=1e300,qmx=-1e300,pmn2=1e300,pmx2=-1e300;
+          for (auto &pt : HC.points){ qmn=std::min(qmn,pt.q);qmx=std::max(qmx,pt.q);pmn2=std::min(pmn2,pt.p);pmx2=std::max(pmx2,pt.p);}
+          const double qr=(qmx-qmn)>1e-12?(qmx-qmn):1.0, pr2=(pmx2-pmn2)>1e-12?(pmx2-pmn2):1.0;
+          auto scC=[&](double q,double p){ return ImVec2((float)(o2.x+8+(W2-16)*(q-qmn)/qr),(float)(e2.y-8-(H2-16)*(p-pmn2)/pr2)); };
+          /* sort points by q for a clean polyline */
+          std::vector<const dynsys::analysis::HomoclinicCurvePoint*> sorted;
+          for (auto &pt : HC.points) sorted.push_back(&pt);
+          std::sort(sorted.begin(), sorted.end(), [](auto a, auto b){ return a->q < b->q; });
+          for (size_t i=1;i<sorted.size();++i)
+            dl2->AddLine(scC(sorted[i-1]->q,sorted[i-1]->p), scC(sorted[i]->q,sorted[i]->p), IM_COL32(255,180,120,255), 2.0f);
+          for (auto *pt : sorted) dl2->AddCircleFilled(scC(pt->q,pt->p), 2.5f, IM_COL32(255,210,150,255));
+          dl2->AddText(ImVec2(o2.x+8,o2.y+6), IM_COL32(200,200,210,220), "homoclinic locus (orange): primary param (y) vs secondary (x)");
+          ImGui::Dummy(ImVec2(W2, H2+4));
+        }
+      }
+      if (app.cyc_ready && app.cyc_branch.samples.size() > 1) {
+        /* plot period and amplitude vs parameter */
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImVec2 o = ImGui::GetCursorScreenPos();
+        const float W = ImGui::GetContentRegionAvail().x, H = 150.0f;
+        ImVec2 e(o.x + W, o.y + H);
+        dl->AddRectFilled(o, e, IM_COL32(16,16,20,220));
+        dl->AddRect(o, e, IM_COL32(110,110,120,200));
+        double pmn=1e300,pmx=-1e300,amn=1e300,amx=-1e300,Tmn=1e300,Tmx=-1e300;
+        for (auto &smp : app.cyc_branch.samples){ pmn=std::min(pmn,smp.p);pmx=std::max(pmx,smp.p);
+          amn=std::min(amn,smp.amplitude);amx=std::max(amx,smp.amplitude);
+          Tmn=std::min(Tmn,smp.period);Tmx=std::max(Tmx,smp.period);}
+        const double pr=(pmx-pmn)>1e-12?(pmx-pmn):1.0;
+        const double ar=(amx-amn)>1e-12?(amx-amn):1.0, Tr=(Tmx-Tmn)>1e-12?(Tmx-Tmn):1.0;
+        auto scA=[&](double p,double a){ return ImVec2((float)(o.x+6+(W-12)*(p-pmn)/pr),(float)(e.y-6-(H-12)*(a-amn)/ar)); };
+        auto scT=[&](double p,double T){ return ImVec2((float)(o.x+6+(W-12)*(p-pmn)/pr),(float)(e.y-6-(H-12)*(T-Tmn)/Tr)); };
+        for (size_t i=1;i<app.cyc_branch.samples.size();++i){
+          auto&a=app.cyc_branch.samples[i-1]; auto&b=app.cyc_branch.samples[i];
+          /* amplitude: green if stable, red if not; period: faint blue */
+          dl->AddLine(scT(a.p,a.period), scT(b.p,b.period), IM_COL32(110,160,220,150), 1.5f);
+          const ImU32 col = b.stable ? IM_COL32(120,220,135,235) : IM_COL32(255,130,95,235);
+          dl->AddLine(scA(a.p,a.amplitude), scA(b.p,b.amplitude), col, 2.0f);
+        }
+        /* mark fold-of-cycles (LPC) points on the branch */
+        for (const auto &smp : app.cyc_branch.samples)
+          if (smp.is_fold) {
+            ImVec2 cc = scA(smp.p, smp.amplitude);
+            dl->AddCircleFilled(cc, 5.0f, IM_COL32(255,210,80,255));
+            dl->AddText(ImVec2(cc.x+7,cc.y-6), IM_COL32(255,210,80,255), "LPC");
+          }
+        /* mark period-doubling (PD) and Neimark-Sacker (NS / torus) points */
+        for (const auto &smp : app.cyc_branch.samples) {
+          if (smp.is_pd) {
+            ImVec2 cc = scA(smp.p, smp.amplitude);
+            dl->AddCircleFilled(cc, 4.5f, IM_COL32(255,120,200,255));
+            dl->AddText(ImVec2(cc.x+7,cc.y+4), IM_COL32(255,120,200,255), "PD");
+          }
+          if (smp.is_ns) {
+            ImVec2 cc = scA(smp.p, smp.amplitude);
+            dl->AddCircleFilled(cc, 4.5f, IM_COL32(150,200,255,255));
+            dl->AddText(ImVec2(cc.x+7,cc.y+4), IM_COL32(150,200,255,255), "NS");
+          }
+        }
+        dl->AddText(ImVec2(o.x+8,o.y+6), IM_COL32(200,200,210,220),
+                    "amplitude (green=stable, red=unstable) + period (blue); yellow=LPC, pink=PD, cyan=NS");
+        if (app.cyc_branch.turned)
+          dl->AddText(ImVec2(o.x+8,o.y+22), IM_COL32(255,210,80,220),
+                      "branch turned around a fold of cycles (arclength)");
+        ImGui::Dummy(ImVec2(W, H+4));
+
+        /* Floquet multipliers of the cycle at a chosen sample, drawn on the unit
+         * circle: multipliers inside = stable directions, crossing the circle =
+         * a bifurcation (+1 fold, -1 period-doubling, complex pair = torus). */
+        {
+          static int fl_idx = -1;
+          const int nsamp = (int)app.cyc_branch.samples.size();
+          if (fl_idx < 0 || fl_idx >= nsamp) fl_idx = nsamp / 2;
+          ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+          ImGui::SliderInt("##flsample", &fl_idx, 0, nsamp - 1, "Floquet @ sample %d");
+          const auto &fs = app.cyc_branch.samples[(size_t)fl_idx];
+          ImGui::Text("parameter %s = %.5g   period = %.5g   |largest non-trivial multiplier| = %.4f  (%s)",
+                      app.cont_param, fs.p, fs.period, fs.max_nontrivial_mult,
+                      fs.stable ? "stable" : "unstable");
+          ImDrawList *fd = ImGui::GetWindowDrawList();
+          ImVec2 fo = ImGui::GetCursorScreenPos();
+          const float FH = 150.0f, FW = ImGui::GetContentRegionAvail().x;
+          ImVec2 fe(fo.x + FW, fo.y + FH);
+          fd->AddRectFilled(fo, fe, IM_COL32(16,16,20,220));
+          fd->AddRect(fo, fe, IM_COL32(110,110,120,200));
+          const ImVec2 ctr(fo.x + FW*0.5f, fo.y + FH*0.5f);
+          const float R = (FH*0.5f - 12.0f);
+          /* unit circle + axes */
+          fd->AddCircle(ctr, R, IM_COL32(120,120,140,220), 64, 1.5f);
+          fd->AddLine(ImVec2(ctr.x - R - 8, ctr.y), ImVec2(ctr.x + R + 8, ctr.y), IM_COL32(80,80,90,200));
+          fd->AddLine(ImVec2(ctr.x, ctr.y - R - 8), ImVec2(ctr.x, ctr.y + R + 8), IM_COL32(80,80,90,200));
+          fd->AddText(ImVec2(ctr.x + R - 4, ctr.y + 4), IM_COL32(120,120,140,220), "+1");
+          fd->AddText(ImVec2(ctr.x - R - 14, ctr.y + 4), IM_COL32(120,120,140,220), "-1");
+          /* plot each multiplier */
+          for (size_t i = 0; i < fs.floquet_re.size(); ++i) {
+            const double re = fs.floquet_re[i], im = fs.floquet_im[i];
+            const float X = ctr.x + (float)re * R, Y = ctr.y - (float)im * R;
+            const double mag = std::hypot(re, im);
+            const bool trivial = std::hypot(re - 1.0, im) < 0.06;
+            ImU32 col = trivial ? IM_COL32(150,150,160,220)
+                                : (mag < 1.0 ? IM_COL32(120,220,135,255) : IM_COL32(255,130,95,255));
+            fd->AddCircleFilled(ImVec2(X, Y), 4.0f, col);
+          }
+          fd->AddText(ImVec2(fo.x+8, fo.y+6), IM_COL32(200,200,210,220),
+                      "Floquet multipliers (grey=trivial ~1, green=|.|<1, red=|.|>1); circle = unit |.|=1");
+          ImGui::Dummy(ImVec2(FW, FH+4));
+        }
+      }
+      /* Two-parameter fold-of-cycles (LPC) curve. Needs a 2nd parameter. */
+      if (app.params.size() >= 2) {
+        if (ImGui::Button("Trace fold-of-cycles curve (2 params)")) run_lpc_curve(app);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(x: %s, y: %s)", app.cont_param, app.twopar_p2[0]?app.twopar_p2:"pick 2nd param above");
+        if (app.lpc_ready && !app.lpc_msg.empty()) ImGui::TextWrapped("%s", app.lpc_msg.c_str());
+        else if (!app.lpc_ready && !app.lpc_msg.empty()) ImGui::TextDisabled("%s", app.lpc_msg.c_str());
+        if (app.lpc_ready && app.lpc_curve_data.points.size() > 1) {
+          ImDrawList *dl = ImGui::GetWindowDrawList();
+          ImVec2 o = ImGui::GetCursorScreenPos();
+          const float W = ImGui::GetContentRegionAvail().x, H = 150.0f;
+          ImVec2 e(o.x+W,o.y+H);
+          dl->AddRectFilled(o,e,IM_COL32(16,16,20,220)); dl->AddRect(o,e,IM_COL32(110,110,120,200));
+          double pmn=1e300,pmx=-1e300,qmn=1e300,qmx=-1e300;
+          for(auto&pt:app.lpc_curve_data.points){pmn=std::min(pmn,pt.p);pmx=std::max(pmx,pt.p);qmn=std::min(qmn,pt.q);qmx=std::max(qmx,pt.q);}
+          const double pr=(pmx-pmn)>1e-12?(pmx-pmn):1.0, qr=(qmx-qmn)>1e-12?(qmx-qmn):1.0;
+          auto sc=[&](double p,double q){ return ImVec2((float)(o.x+6+(W-12)*(p-pmn)/pr),(float)(e.y-6-(H-12)*(q-qmn)/qr)); };
+          for(size_t i=1;i<app.lpc_curve_data.points.size();++i){
+            auto&a=app.lpc_curve_data.points[i-1]; auto&b=app.lpc_curve_data.points[i];
+            dl->AddLine(sc(a.p,a.q), sc(b.p,b.q), IM_COL32(255,180,90,235), 2.0f);
+          }
+          char lab[256]; std::snprintf(lab,sizeof(lab),"fold-of-cycles (LPC) curve  (x: %s, y: %s)", app.cont_param, app.twopar_p2);
+          dl->AddText(ImVec2(o.x+8,o.y+6), IM_COL32(255,180,90,235), lab);
+          ImGui::Dummy(ImVec2(W,H+4));
+        }
+      }
+    }
+
     if (ImGui::Button("Continue equilibrium")) run_equilibrium_continuation(app);
     ImGui::SameLine();
     if (ImGui::Button("Clear branch")) {
       app.cont_branch = dynsys::analysis::Branch{};
       app.cont_ready = false;
+      app.cont_switched_branch = dynsys::analysis::Branch{};
+      app.cont_switched_ready = false;
     }
 
     if (app.cont_ready && !app.cont_branch.points.empty()) {
       ImGui::Text("branch: %zu points", app.cont_branch.points.size());
-      /* Special points table. */
+      /* Special points table with codim-2 classification + branch switching. */
       if (!app.cont_branch.special_indices.empty()) {
         ImGui::Text("special points:");
         for (size_t i : app.cont_branch.special_indices) {
           const auto &bp = app.cont_branch.points[i];
-          const char *kind =
-              bp.special == dynsys::analysis::SpecialPointKind::Fold ? "FOLD"
-              : bp.special == dynsys::analysis::SpecialPointKind::Hopf
-                  ? "HOPF"
-                  : "end";
+          using K = dynsys::analysis::SpecialPointKind;
+          const char *kind = "end";
+          switch (bp.special) {
+            case K::Fold:            kind = "FOLD (LP)"; break;
+            case K::Hopf:            kind = "HOPF"; break;
+            case K::BogdanovTakens:  kind = "BOGDANOV-TAKENS (codim-2)"; break;
+            case K::Cusp:            kind = "CUSP (codim-2)"; break;
+            case K::GeneralizedHopf: kind = "GENERALIZED HOPF / Bautin (codim-2)"; break;
+            case K::BranchPoint:     kind = "BRANCH POINT"; break;
+            default: kind = "end"; break;
+          }
           ImGui::BulletText("%s at %s = %.6g", kind, app.cont_param, bp.p);
+          /* show the normal-form coefficient where we have one */
+          if (bp.has_normal_form) {
+            if (bp.special == K::Hopf || bp.special == K::GeneralizedHopf)
+              ImGui::TextDisabled("      first Lyapunov coeff l1 = %.4g (%s)", bp.lyapunov1,
+                                  bp.lyapunov1 < 0 ? "supercritical" : (bp.lyapunov1 > 0 ? "subcritical" : "degenerate"));
+            else if (bp.special == K::Fold || bp.special == K::Cusp)
+              ImGui::TextDisabled("      fold coeff a = %.4g (%s)", bp.fold_a,
+                                  std::fabs(bp.fold_a) < 1e-2 ? "cusp/degenerate" : "non-degenerate");
+          }
+          /* offer branch switching at a branch point */
+          if (bp.special == K::BranchPoint) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton((std::string("switch branch##") + std::to_string(i)).c_str())) {
+              AppState::Param *bpar = app.params.empty() ? nullptr : find_param(app, app.cont_param);
+              if (bpar == nullptr && !app.params.empty()) bpar = &app.params[0];
+              if (bpar != nullptr) {
+                dynsys::analysis::Model model = build_model(app, bpar);
+                dynsys::analysis::ContinuationSettings s;
+                s.p_min = app.cont_p_min; s.p_max = app.cont_p_max;
+                s.h0 = app.cont_h0; s.max_points = app.cont_max_points;
+                s.detect_fold = app.cont_detect_fold; s.detect_hopf = app.cont_detect_hopf;
+                app.cont_switched_branch = dynsys::analysis::switch_branch(model, bp, s);
+                app.cont_switched_ready = app.cont_switched_branch.ok;
+                app.analysis_message = app.cont_switched_branch.ok
+                    ? std::string("branch switched: ") + app.cont_switched_branch.message
+                    : std::string("branch switch: ") + app.cont_switched_branch.message;
+                sync_param_values(app);
+              }
+            }
+          }
         }
+        if (app.cont_switched_ready)
+          ImGui::TextColored(ImVec4(0.5f,1.0f,0.6f,1.0f),
+                             "switched branch: %zu points (drawn in cyan on the diagram)",
+                             app.cont_switched_branch.points.size());
       }
       /* Simple stability-vs-parameter strip: draw the branch as a
        * polyline of (p, first-coordinate), colored by stability. */
@@ -8563,6 +10485,13 @@ void draw_gui(AppState &app) {
         xmn = std::min(xmn, xv);
         xmx = std::max(xmx, xv);
       }
+      /* extend bounds over the switched branch too, so it's not clipped */
+      if (app.cont_switched_ready)
+        for (const auto &bp : app.cont_switched_branch.points) {
+          pmn = std::min(pmn, bp.p); pmx = std::max(pmx, bp.p);
+          const double xv = bp.x.empty() ? 0.0 : bp.x[0];
+          xmn = std::min(xmn, xv); xmx = std::max(xmx, xv);
+        }
       const double pr = (pmx - pmn) > 1e-12 ? (pmx - pmn) : 1.0;
       const double xr = (xmx - xmn) > 1e-12 ? (xmx - xmn) : 1.0;
       auto to_screen = [&](double p, double x) {
@@ -8587,8 +10516,20 @@ void draw_gui(AppState &app) {
         draw->AddCircle(to_screen(bp.p, bp.x.empty() ? 0 : bp.x[0]), 5.0f, col,
                         16, 2.0f);
       }
+      /* the switched (crossing) branch, drawn in cyan; stability still shown by
+       * brightness so the user can read both branches at once. */
+      if (app.cont_switched_ready) {
+        for (size_t i = 1; i < app.cont_switched_branch.points.size(); ++i) {
+          const auto &a = app.cont_switched_branch.points[i - 1];
+          const auto &b = app.cont_switched_branch.points[i];
+          const ImU32 col = b.stable ? IM_COL32(90, 230, 230, 235)
+                                     : IM_COL32(120, 160, 200, 200);
+          draw->AddLine(to_screen(a.p, a.x.empty() ? 0 : a.x[0]),
+                        to_screen(b.p, b.x.empty() ? 0 : b.x[0]), col, 2.0f);
+        }
+      }
       draw->AddText(ImVec2(p0.x + 8, p0.y + 6), IM_COL32(200, 200, 210, 220),
-                    "green: stable  red: unstable  (vertical: first state var)");
+                    "green: stable  red: unstable  cyan: switched branch  (vertical: first state var)");
       ImGui::Dummy(ImVec2(bw, bh + 4));
     }
   }
@@ -8699,8 +10640,23 @@ void draw_gui(AppState &app) {
     for (const auto &obs : app.observables)
       draw_series_plot(app, obs.name.c_str(), obs.name.c_str(), ImVec2(-FLT_MIN, 90));
   }
-  if (ImGui::CollapsingHeader("Poincare section")) {
-    draw_scatter_plot("Poincare section", app.poincare_points, ImVec2(-FLT_MIN, 300));
+  if (ImGui::CollapsingHeader("Poincare section", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (app.poincare_points.empty()) {
+      ImGui::TextWrapped("No section points yet. Enable a section in the system text, e.g. for a "
+                         "3-D flow: 'section = z - 27; section_direction = positive; "
+                         "section_plot = x, y'. Then run the simulation: each time the trajectory "
+                         "crosses the plane z=27 going upward, the (x,y) point is recorded here.");
+      ImGui::TextDisabled("For a flow with no explicit section, local maxima of the observable are "
+                          "recorded as a Poincare-style section automatically.");
+    } else {
+      ImGui::Text("%zu section points", app.poincare_points.size());
+      /* a large square plot so the section structure is actually legible */
+      const float side = std::min(ImGui::GetContentRegionAvail().x, 560.0f);
+      draw_scatter_plot("Poincare section", app.poincare_points, ImVec2(side, side));
+      ImGui::TextDisabled("A Poincare section turns a continuous flow into a map: structure here "
+                          "(curves, islands, scatter) reveals periodic / quasi-periodic / chaotic "
+                          "motion. Export via the button above.");
+    }
   }
 
   ImGui::EndTabItem(); } /* Data & view */
@@ -8718,7 +10674,7 @@ bool init_glfw_window(AppState &app, GLFWwindow **out_window) {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-  GLFWwindow *window = glfwCreateWindow(app.window_width, app.window_height, "dynsys laboratory — TPCAS + Dear ImGui", nullptr, nullptr);
+  GLFWwindow *window = glfwCreateWindow(app.window_width, app.window_height, "Dynsys", nullptr, nullptr);
   if (window == nullptr) {
     std::fprintf(stderr, "Failed to create GLFW window\n");
     glfwTerminate();
@@ -8883,9 +10839,131 @@ void update_perf_governor(AppState &app, double raw_frame_ms) {
   app.perf_throttle_active = (app.perf_throttle > 0.02);
 }
 
+/* Headless single-frame render to a PNG. Used for visual verification / CI:
+ *   dynsys --shot <preset-substring> <view> [--frames N] [--out FILE] [--mode M]
+ * <view> is one of: line phase scene3d bifurcation fractal bridge basins
+ *                   paramscan continuation ifs limitcycle
+ * For the bridge, --mode is one of: projection | side | current
+ * Requires a usable (possibly virtual, e.g. Xvfb) display. */
+int run_shot(int argc, char **argv) {
+  std::string preset_q, view_q = "phase", out_file, bridge_mode_q = "projection", bridge_family_q = "", fractalmode_q = "";
+  int frames = 90;
+  for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_file = argv[++i];
+    else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) bridge_mode_q = argv[++i];
+    else if (std::strcmp(argv[i], "--family") == 0 && i + 1 < argc) bridge_family_q = argv[++i];
+    else if (std::strcmp(argv[i], "--fractalmode") == 0 && i + 1 < argc) fractalmode_q = argv[++i];
+    else if (preset_q.empty()) preset_q = argv[i];
+    else view_q = argv[i];
+  }
+
+  AppState app{};
+  int idx = 0;
+  if (!preset_q.empty()) {
+    for (int i = 0; i < kPresetCount; ++i) {
+      std::string n = kPresets[i].name;
+      std::string lo; for (char c : n) lo += (char)std::tolower((unsigned char)c);
+      std::string q; for (char c : preset_q) q += (char)std::tolower((unsigned char)c);
+      if (lo.find(q) != std::string::npos) { idx = i; break; }
+    }
+  }
+  apply_preset(app, idx);
+  std::string err;
+  if (!compile_system(app, app.system_input, &err)) {
+    std::fprintf(stderr, "compile failed: %s\n", err.c_str()); return EXIT_FAILURE;
+  }
+  allocate_points(app);
+  reset_simulation(app);
+
+  auto pick = [&](const char *k){ return view_q == k; };
+  if (pick("line")) app.active_view = AppState::ActiveView::Line1D;
+  else if (pick("phase")) app.active_view = AppState::ActiveView::Phase2D;
+  else if (pick("scene3d")) app.active_view = AppState::ActiveView::Scene3D;
+  else if (pick("bifurcation")) app.active_view = AppState::ActiveView::Bifurcation;
+  else if (pick("fractal")) app.active_view = AppState::ActiveView::Fractal;
+  if (!fractalmode_q.empty()) {
+    if (fractalmode_q == "buddhabrot" || fractalmode_q == "buddha") app.fractal_mode = AppState::FractalMode::Buddhabrot;
+    else if (fractalmode_q == "state" || fractalmode_q == "julia") app.fractal_mode = AppState::FractalMode::StateSpace;
+    else app.fractal_mode = AppState::FractalMode::ParameterSpace;
+    /* frame on the preset window, then mark init done so entry won't reset mode */
+    if (app.home_view_set) {
+      app.fractal_xmin = app.home_x_min; app.fractal_xmax = app.home_x_max;
+      app.fractal_ymin = app.home_y_min; app.fractal_ymax = app.home_y_max;
+    }
+    app.fractal_view_init = true;
+    app.fractal_dirty = true;
+  }
+  else if (pick("bridge")) app.active_view = AppState::ActiveView::Scene3DBridge;
+  else if (pick("basins")) app.active_view = AppState::ActiveView::Basins;
+  else if (pick("paramscan")) app.active_view = AppState::ActiveView::ParamScan2D;
+  else if (pick("continuation")) app.active_view = AppState::ActiveView::Continuation;
+  else if (pick("ifs")) app.active_view = AppState::ActiveView::IFS;
+  else if (pick("limitcycle")) app.active_view = AppState::ActiveView::LimitCycle;
+
+  if (bridge_mode_q == "side") app.bridge_mode = AppState::BridgeMode::Classic;
+  else if (bridge_mode_q == "current") app.bridge_mode = AppState::BridgeMode::CurrentSystem;
+  else app.bridge_mode = AppState::BridgeMode::ProjectionSolid;
+  /* enforce the same gating as the live UI: projection-solid only when the
+   * loaded system actually has a unified bridge; otherwise lift the system. */
+  if (app.bridge_mode == AppState::BridgeMode::ProjectionSolid &&
+      bridge_family_for_system(app) < 0)
+    app.bridge_mode = AppState::BridgeMode::CurrentSystem;
+  if (bridge_family_q == "cubic") app.bridge_family = AppState::BridgeFamily::Cubic;
+  else if (bridge_family_q == "sine") app.bridge_family = AppState::BridgeFamily::Sine;
+  else if (bridge_family_q == "quadratic") app.bridge_family = AppState::BridgeFamily::Quadratic;
+  /* else: leave whatever compile_system auto-detected for the loaded system */
+
+  app.window_width = 1280; app.window_height = 1000; /* larger canvas for crisp shots */
+  GLFWwindow *window = nullptr;
+  if (!init_glfw_window(app, &window)) { std::fprintf(stderr, "no GL window (need a display, e.g. Xvfb)\n"); return EXIT_FAILURE; }
+  init_imgui(window);
+  app.shader_program = create_shader_program(kVertexShaderSrc, kFragmentShaderSrc);
+  glGenVertexArrays(1, &app.vao); glGenBuffers(1, &app.vbo); glGenBuffers(1, &app.cbo);
+  upload_buffers(app); update_projection(app);
+
+  for (int f = 0; f < frames; ++f) {
+    glfwPollEvents();
+    if (!app.paused && app.mode != SystemMode::IFS) {
+      char e[256] = {0};
+      for (int s = 0; s < app.steps_per_frame; ++s) {
+        State nx{}; if (!step_state(app, app.current, &nx, e, sizeof e)) break;
+        app.current = nx; app.history.push_back(app.current);
+      }
+      upload_buffers(app);
+    }
+    ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
+    ensure_valid_view(app);
+    if (app.active_view == AppState::ActiveView::Scene3D && view_valid(app, AppState::ActiveView::Scene3D))
+      render_scene_background(app);
+    else if (app.active_view == AppState::ActiveView::Scene3DBridge)
+      render_bridge_scene(app);
+    else
+      draw_scene(app);
+    if (f == frames - 1) app.capturing_clean = true;
+    draw_gui(app);
+    ImGui::Render();
+    glViewport(0, 0, app.window_width, app.window_height);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (f == frames - 1) {
+      std::string p = capture_screenshot_png(app);
+      app.capturing_clean = false;
+      if (!p.empty() && !out_file.empty()) { std::rename(p.c_str(), out_file.c_str()); p = out_file; }
+      std::printf("shot: preset='%s' view=%s -> %s\n", kPresets[idx].name, view_q.c_str(), p.c_str());
+    }
+    glfwSwapBuffers(window);
+  }
+  ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
+  glfwDestroyWindow(window); glfwTerminate();
+  return EXIT_SUCCESS;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--headless") == 0) {
     return run_headless(argc, argv);
+  }
+  if (argc >= 2 && std::strcmp(argv[1], "--shot") == 0) {
+    return run_shot(argc, argv);
   }
   AppState app{};
   set_lorenz(app);
@@ -8958,6 +11036,35 @@ int main(int argc, char **argv) {
     ImGui::Render();
     glViewport(0, 0, app.window_width, app.window_height);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    /* Serviced here. We render ONE extra frame with the chrome suppressed
+     * (capturing_clean) so the PNG is the full-size plot with nothing hidden
+     * behind the toolbar/panel, then capture that clean backbuffer. */
+    if (app.capture_request) {
+      app.capture_request = false;
+      app.capturing_clean = true;
+      /* re-render this frame without the GUI chrome */
+      ImGui_ImplOpenGL3_NewFrame();
+      ImGui_ImplGlfw_NewFrame();
+      ImGui::NewFrame();
+      ensure_valid_view(app);
+      if (app.active_view == AppState::ActiveView::Scene3D &&
+          view_valid(app, AppState::ActiveView::Scene3D)) {
+        render_scene_background(app);
+      } else if (app.active_view == AppState::ActiveView::Scene3DBridge) {
+        render_bridge_scene(app);
+      } else {
+        draw_scene(app);
+      }
+      draw_gui(app); /* returns early (chrome suppressed) but paints backgrounds */
+      ImGui::Render();
+      glViewport(0, 0, app.window_width, app.window_height);
+      ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+      std::string p = capture_screenshot_png(app);
+      app.capturing_clean = false;
+      app.screenshot_msg = p.empty() ? "PNG save failed (check write permissions in the run directory)"
+                                      : ("saved " + p);
+      app.screenshot_msg_timer = 240; /* ~4s at 60fps */
+    }
     glfwSwapBuffers(window);
   }
   glDeleteVertexArrays(1, &app.vao);

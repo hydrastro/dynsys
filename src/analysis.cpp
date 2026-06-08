@@ -20,10 +20,36 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
+#include <thread>
+#include <atomic>
 
 namespace dynsys::analysis {
 
 namespace {
+
+/* Run body(i) for i in [0,count) across hardware threads. Falls back to a plain
+ * serial loop when only one core is available or count is tiny, so behaviour is
+ * identical (just faster) on multi-core machines. body must be thread-safe with
+ * respect to disjoint i (each call should touch only its own slice of output).*/
+template <typename F>
+void parallel_for(int count, F &&body) {
+  if (count <= 0) return;
+  unsigned hw = std::thread::hardware_concurrency();
+  if (hw < 2 || count < 64) { for (int i = 0; i < count; ++i) body(i); return; }
+  unsigned nthreads = std::min<unsigned>(hw, (unsigned)count);
+  std::atomic<int> next{0};
+  auto worker = [&]() {
+    for (;;) {
+      int i = next.fetch_add(1, std::memory_order_relaxed);
+      if (i >= count) break;
+      body(i);
+    }
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(nthreads);
+  for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+  for (auto &th : pool) th.join();
+}
 
 constexpr double kRadix = 2.0; /* floating-point base for balancing */
 
@@ -483,6 +509,33 @@ double hopf_test(const Model &m, const double *x, double p, double tol) {
   return found ? signed_val : std::nan("");
 }
 
+/* Branch-point test function. A branch point (where two equilibrium branches
+ * cross) is a point on the curve where the bordered (n+1)x(n+1) matrix
+ * [ f_x  f_p ; v^T ] (v = curve tangent) becomes singular, WHILE the
+ * equilibrium itself persists. At a regular point this determinant is nonzero;
+ * at a fold it stays nonzero (a fold is a turning point, not a crossing). So a
+ * sign change of this determinant that is NOT accompanied by a fold-test sign
+ * change brackets a branch point. Returns NaN on evaluation failure. */
+double branch_point_test(const Model &m, const double *x, double p,
+                         const std::vector<double> &tangent, std::size_t n) {
+  std::vector<double> J, fp;
+  std::string err;
+  if (!jacobian_x(m, x, p, &J, &err)) return std::nan("");
+  if (!dfdp(m, x, p, &fp, &err)) return std::nan("");
+  const std::size_t N = n + 1;
+  std::vector<double> A(N * N, 0.0);
+  for (std::size_t r = 0; r < n; ++r) {
+    for (std::size_t c = 0; c < n; ++c) A[r * N + c] = J[r * n + c];
+    A[r * N + n] = fp[r];
+  }
+  /* last row: the curve tangent (length N). If unavailable, fall back to e_last. */
+  if (tangent.size() == N)
+    for (std::size_t c = 0; c < N; ++c) A[n * N + c] = tangent[c];
+  else
+    A[n * N + n] = 1.0;
+  return determinant(A, N);
+}
+
 }  // namespace
 
 /* ---- pseudo-arclength continuation -------------------------- */
@@ -502,8 +555,11 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
   std::vector<double> x = x0;
   if (!correct_equilibrium(m, &x, p0, settings.max_corrector_iters,
                            settings.corrector_tol, &err)) {
-    branch.message = "could not converge starting equilibrium: " +
-                     (err.empty() ? std::string("residual too large") : err);
+    branch.message =
+        "no equilibrium found from this start — Newton did not converge (" +
+        (err.empty() ? std::string("residual too large") : err) +
+        "). Try 'Find fixed point' first, or note that some systems "
+        "(e.g. conservative ones like Nose-Hoover) have no isolated equilibrium.";
     return branch;
   }
 
@@ -526,9 +582,31 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
       bp.stable = cl.n_unstable == 0 && cl.n_center == 0;
     }
     bp.special = kind;
+    /* Classify criticality + upgrade to codim-2 at special points. */
+    if (kind == SpecialPointKind::Fold) {
+      double a = 0.0, l0 = 0.0; std::string e2;
+      if (fold_normal_form(m, bp.x, bp.p, &a, &l0, &e2)) {
+        bp.fold_a = a; bp.has_normal_form = true;
+        /* Bogdanov-Takens: a SECOND eigenvalue also near zero (a double zero
+         * eigenvalue) turns the fold into a BT point. Cusp: the fold's own
+         * quadratic coefficient a vanishes. BT takes precedence. */
+        int near_zero = 0;
+        for (const Complex &z : bp.eigenvalues)
+          if (std::abs(z) < 1e-2) ++near_zero;
+        if (near_zero >= 2) bp.special = SpecialPointKind::BogdanovTakens;
+        else if (std::fabs(a) < 1e-2) bp.special = SpecialPointKind::Cusp;
+      }
+    } else if (kind == SpecialPointKind::Hopf) {
+      double l1 = 0.0, w = 0.0; std::string e2;
+      if (hopf_first_lyapunov(m, bp.x, bp.p, &l1, &w, &e2)) {
+        bp.lyapunov1 = l1; bp.has_normal_form = true;
+        /* Generalized Hopf (Bautin): the first Lyapunov coefficient vanishes. */
+        if (std::fabs(l1) < 1e-3) bp.special = SpecialPointKind::GeneralizedHopf;
+      }
+    }
+    if (bp.special != SpecialPointKind::None)
+      branch.special_indices.push_back(branch.points.size());
     branch.points.push_back(std::move(bp));
-    if (kind != SpecialPointKind::None)
-      branch.special_indices.push_back(branch.points.size() - 1);
   };
 
   /* Initial tangent: solve the bordered system for the null vector of
@@ -586,6 +664,7 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
   record_point(z, SpecialPointKind::None);
   double prev_fold = fold_test(m, x.data(), p0);
   double prev_hopf = hopf_test(m, x.data(), p0, settings.event_tol * 1e2);
+  double prev_bp = branch_point_test(m, x.data(), p0, tangent, n);
 
   double h = settings.h0;
 
@@ -700,10 +779,17 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
      * continuation point. */
     std::vector<double> x_new(z_new.begin(), z_new.begin() + n);
 
+    /* Compute the branch-point test up front so the fold block can tell a real
+     * fold from a branch point (at a pitchfork the fold test also vanishes, but
+     * the point is a BP, not a fold/cusp). */
+    const double bp_new_pre = branch_point_test(m, x_new.data(), p_new, tangent, n);
+    const bool bp_coincides = std::isfinite(prev_bp) && std::isfinite(bp_new_pre) &&
+                              prev_bp * bp_new_pre < 0.0;
+
     if (settings.detect_fold) {
       const double f_new = fold_test(m, x_new.data(), p_new);
       if (std::isfinite(prev_fold) && std::isfinite(f_new) &&
-          prev_fold * f_new < 0.0) {
+          prev_fold * f_new < 0.0 && !bp_coincides) {
         std::vector<double> z_ev = z_new;
         auto g = [&](const double *xx, double pp) {
           return fold_test(m, xx, pp);
@@ -729,6 +815,83 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
       prev_hopf = hp_new;
     }
 
+    /* Branch-point detection: the augmented-system determinant changes sign
+     * WITHOUT a simultaneous fold (which would also flip it). When found,
+     * locate it, compute the SECOND tangent (the other branch's direction) for
+     * branch switching, and tag the point. */
+    {
+      const double bp_new = bp_new_pre;
+      if (std::isfinite(prev_bp) && std::isfinite(bp_new) && prev_bp * bp_new < 0.0) {
+        std::vector<double> z_ev = z_new;
+        auto g = [&](const double *xx, double pp) {
+          return branch_point_test(m, xx, pp, tangent, n);
+        };
+        refine_event(z, z_new, g, tangent, &z_ev);
+        /* second tangent: a direction in the null space of [f_x f_p] that is
+         * independent of the current curve tangent. Solve the bordered system
+         * with the RHS picking out a complementary direction, then orthogonal-
+         * ize against the primary tangent. */
+        std::vector<double> x_ev(z_ev.begin(), z_ev.begin() + n);
+        std::vector<double> Jb, fpb;
+        std::vector<double> t2;
+        if (jacobian_x(m, x_ev.data(), z_ev[n], &Jb, &err) &&
+            dfdp(m, x_ev.data(), z_ev[n], &fpb, &err)) {
+          /* M = [f_x | f_p] is n x (n+1). At a branch point it has a 2-D null
+           * space spanned by the curve tangent and the crossing direction. We
+           * find the crossing direction as the smallest eigenvector of the
+           * (n+1)x(n+1) Gram matrix M^T M, with the primary tangent projected
+           * out (so we get the transverse null vector, not the tangent). */
+          const std::size_t Nn = n + 1;
+          std::vector<double> M(n * Nn, 0.0);
+          for (std::size_t r = 0; r < n; ++r) {
+            for (std::size_t c = 0; c < n; ++c) M[r * Nn + c] = Jb[r * n + c];
+            M[r * Nn + n] = fpb[r];
+          }
+          std::vector<double> G(Nn * Nn, 0.0);
+          for (std::size_t i = 0; i < Nn; ++i)
+            for (std::size_t j = 0; j < Nn; ++j) {
+              double s = 0.0;
+              for (std::size_t r = 0; r < n; ++r) s += M[r * Nn + i] * M[r * Nn + j];
+              G[i * Nn + j] = s;
+            }
+          /* deflate the primary tangent: G' = G + C * (t t^T) with large C so
+           * the tangent direction becomes the LARGEST, leaving the crossing
+           * direction as the smallest eigenvector. */
+          double gmax = 0.0; for (double v : G) gmax = std::max(gmax, std::fabs(v));
+          const double C = (gmax + 1.0) * 1e3;
+          for (std::size_t i = 0; i < Nn; ++i)
+            for (std::size_t j = 0; j < Nn; ++j)
+              G[i * Nn + j] += C * tangent[i] * tangent[j];
+          /* smallest eigenvector of G' via inverse power iteration on (G'+epsI) */
+          std::vector<double> Gr = G;
+          for (std::size_t i = 0; i < Nn; ++i) Gr[i * Nn + i] += 1e-9;
+          std::vector<double> v(Nn, 0.0); v[ (n>0?n:0) ] = 1.0; /* seed toward the p-direction */
+          bool ok_it = true;
+          for (int it = 0; it < 100; ++it) {
+            std::vector<double> nv;
+            if (!solve_linear(Gr, v, &nv)) { ok_it = false; break; }
+            double nrm = 0.0; for (double q : nv) nrm += q * q; nrm = std::sqrt(nrm);
+            if (nrm < 1e-300) { ok_it = false; break; }
+            for (double &q : nv) q /= nrm;
+            v = nv;
+          }
+          if (ok_it) {
+            /* remove any residual primary-tangent component and normalize */
+            double dot = 0.0; for (std::size_t i = 0; i < Nn; ++i) dot += v[i] * tangent[i];
+            for (std::size_t i = 0; i < Nn; ++i) v[i] -= dot * tangent[i];
+            double nrm = 0.0; for (double q : v) nrm += q * q; nrm = std::sqrt(nrm);
+            if (nrm > 1e-6) { for (double &q : v) q /= nrm; t2 = v; }
+          }
+        }
+        const std::size_t idx_before = branch.points.size();
+        record_point(z_ev, SpecialPointKind::BranchPoint);
+        /* attach the second tangent to the just-recorded branch point */
+        if (!t2.empty() && branch.points.size() > idx_before)
+          branch.points[idx_before].second_tangent = t2;
+      }
+      prev_bp = bp_new;
+    }
+
     record_point(z_new, SpecialPointKind::None);
     ++produced;
 
@@ -750,6 +913,1051 @@ Branch continue_equilibrium(const Model &m, const std::vector<double> &x0,
     branch.message = "completed (" + std::to_string(produced) + " points)";
   branch.ok = branch.points.size() > 1;
   return branch;
+}
+
+/* ---- branch switching --------------------------------------------------- */
+
+Branch switch_branch(const Model &m, const BranchPoint &bp,
+                     const ContinuationSettings &settings) {
+  Branch out;
+  const std::size_t n = m.n;
+  if (bp.x.size() != n) { out.message = "invalid branch point"; return out; }
+  const double base_h = (settings.h0 > 0 ? settings.h0 : 0.05);
+
+  /* Candidate kick directions in (x,p) space: the precomputed second_tangent
+   * first (if any), then each state-coordinate axis and the parameter axis.
+   * For each, step off the branch point, re-converge to an equilibrium at the
+   * new parameter, and accept the first that lands on a DISTINCT branch and
+   * continues. Trying coordinate kicks (not only the null tangent) makes this
+   * robust even at degenerate branch points where the null space is hard to
+   * pin down numerically (e.g. a pitchfork, where both f_x and f_p vanish). */
+  std::vector<std::vector<double>> dirs;
+  if (bp.second_tangent.size() == n + 1) dirs.push_back(bp.second_tangent);
+  for (std::size_t i = 0; i < n; ++i) {
+    std::vector<double> d(n + 1, 0.0); d[i] = 1.0; dirs.push_back(d);
+  }
+  { std::vector<double> d(n + 1, 0.0); d[n] = 1.0; dirs.push_back(d); }
+
+  for (const auto &dir : dirs) {
+    for (double sgn : {+1.0, -1.0}) {
+      for (double scale : {4.0, 8.0, 16.0, 2.0}) {
+        const double h = sgn * scale * base_h;
+        std::vector<double> x_new(n);
+        for (std::size_t i = 0; i < n; ++i) x_new[i] = bp.x[i] + h * dir[i];
+        double p_new = bp.p + h * dir[n];
+        /* if this direction doesn't move p, nudge it so we leave the singular
+         * point instead of re-finding the same equilibrium. */
+        if (std::fabs(dir[n]) < 1e-12) p_new = bp.p + sgn * scale * base_h * 0.5;
+        std::string err;
+        if (!correct_equilibrium(m, &x_new, p_new, settings.max_corrector_iters,
+                                 settings.corrector_tol, &err))
+          continue;
+        double d2 = 0.0;
+        for (std::size_t i = 0; i < n; ++i) { const double dd = x_new[i] - bp.x[i]; d2 += dd * dd; }
+        if (std::sqrt(d2) < 1e-5) continue; /* landed back on the BP / same branch */
+        Branch b = continue_equilibrium(m, x_new, p_new, settings);
+        if (b.ok && b.points.size() > 3) {
+          b.message = "switched branch at p=" + std::to_string(bp.p) + "; " + b.message;
+          return b;
+        }
+      }
+    }
+  }
+  out.message = "branch switch failed to converge onto a distinct branch";
+  return out;
+}
+
+/* ---- two-parameter continuation of fold/Hopf curves --------------------- */
+namespace {
+
+/* the codim-1 defining function g(x,p,q): det(f_x) for a fold; for Hopf, the
+ * minimum |Re| over complex pairs signed by Re (zero when a pair is on the
+ * imaginary axis). Built on finite-difference Jacobians of the 2-param field. */
+double g_fold2(const Model2 &m, const std::vector<double> &x, double p, double q) {
+  const std::size_t n = m.n;
+  std::vector<double> J(n * n);
+  std::vector<double> f0(n), fp(n);
+  std::string err;
+  if (!m.vector_field(x.data(), p, q, f0.data(), &err)) return std::nan("");
+  const double h = 1e-7;
+  std::vector<double> xt = x;
+  for (std::size_t j = 0; j < n; ++j) {
+    const double save = xt[j]; const double dh = h * (std::fabs(save) + 1.0);
+    xt[j] = save + dh;
+    if (!m.vector_field(xt.data(), p, q, fp.data(), &err)) return std::nan("");
+    for (std::size_t i = 0; i < n; ++i) J[i * n + j] = (fp[i] - f0[i]) / dh;
+    xt[j] = save;
+  }
+  return determinant(J, n);
+}
+
+double g_hopf2(const Model2 &m, const std::vector<double> &x, double p, double q) {
+  const std::size_t n = m.n;
+  std::vector<double> J(n * n), f0(n), fp(n);
+  std::string err;
+  if (!m.vector_field(x.data(), p, q, f0.data(), &err)) return std::nan("");
+  const double h = 1e-7;
+  std::vector<double> xt = x;
+  for (std::size_t j = 0; j < n; ++j) {
+    const double save = xt[j]; const double dh = h * (std::fabs(save) + 1.0);
+    xt[j] = save + dh;
+    if (!m.vector_field(xt.data(), p, q, fp.data(), &err)) return std::nan("");
+    for (std::size_t i = 0; i < n; ++i) J[i * n + j] = (fp[i] - f0[i]) / dh;
+    xt[j] = save;
+  }
+  std::vector<std::complex<double>> ev;
+  if (!eigenvalues(J, n, &ev)) return std::nan("");
+  bool found = false; double best = 0, sgn = 0;
+  for (const auto &z : ev)
+    if (std::fabs(z.imag()) > 1e-7) {
+      const double a = std::fabs(z.real());
+      if (!found || a < best) { best = a; sgn = z.real(); found = true; }
+    }
+  return found ? sgn : std::nan("");
+}
+
+/* the extended residual G(u) where u = [x(0..n-1), p, q], length n+2.
+ * G has n+1 components: f (n of them) and the codim-1 condition g. */
+void G_residual(const Model2 &m, TwoParamKind kind, const std::vector<double> &u,
+                std::vector<double> *out) {
+  const std::size_t n = m.n;
+  std::vector<double> x(u.begin(), u.begin() + n);
+  const double p = u[n], q = u[n + 1];
+  out->assign(n + 1, 0.0);
+  std::string err;
+  std::vector<double> f(n);
+  if (m.vector_field(x.data(), p, q, f.data(), &err))
+    for (std::size_t i = 0; i < n; ++i) (*out)[i] = f[i];
+  (*out)[n] = (kind == TwoParamKind::Fold) ? g_fold2(m, x, p, q) : g_hopf2(m, x, p, q);
+}
+
+/* finite-difference Jacobian of G wrt u: (n+1) x (n+2). */
+void G_jacobian(const Model2 &m, TwoParamKind kind, const std::vector<double> &u,
+                std::vector<double> *Jout) {
+  const std::size_t n = m.n, R = n + 1, C = n + 2;
+  Jout->assign(R * C, 0.0);
+  std::vector<double> g0, gp;
+  G_residual(m, kind, u, &g0);
+  std::vector<double> ut = u;
+  for (std::size_t j = 0; j < C; ++j) {
+    const double save = ut[j]; const double dh = 1e-6 * (std::fabs(save) + 1.0);
+    ut[j] = save + dh;
+    G_residual(m, kind, ut, &gp);
+    for (std::size_t i = 0; i < R; ++i) (*Jout)[i * C + j] = (gp[i] - g0[i]) / dh;
+    ut[j] = save;
+  }
+}
+
+}  // namespace
+
+TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
+                              const std::vector<double> &x0, double p0, double q0,
+                              const TwoParamSettings &settings) {
+  TwoParamCurve curve;
+  curve.kind = (kind == TwoParamKind::Fold) ? SpecialPointKind::Fold : SpecialPointKind::Hopf;
+  const std::size_t n = m.n;
+  if (x0.size() != n || n == 0) { curve.message = "bad starting point"; return curve; }
+  const std::size_t C = n + 2;        /* unknowns: x, p, q */
+  const std::size_t Rr = n + 1;       /* equations */
+
+  /* Newton corrector onto G=0 with an arclength constraint (project the step
+   * orthogonal to the current tangent). We use a least-squares solve of the
+   * (n+1) x (n+2) system by appending the tangent row to make it square. */
+  auto correct = [&](std::vector<double> *u, const std::vector<double> &tan) -> bool {
+    for (int it = 0; it < settings.max_corrector_iters; ++it) {
+      std::vector<double> G; G_residual(m, kind, *u, &G);
+      double res = 0; for (double v : G) res += v * v; res = std::sqrt(res);
+      if (res < settings.corrector_tol) return true;
+      std::vector<double> J; G_jacobian(m, kind, *u, &J);
+      /* square (n+2)x(n+2): G-rows + tangent row (=0 in residual) */
+      std::vector<double> A(C * C, 0.0), b(C, 0.0);
+      for (std::size_t i = 0; i < Rr; ++i) {
+        for (std::size_t j = 0; j < C; ++j) A[i * C + j] = J[i * C + j];
+        b[i] = -G[i];
+      }
+      for (std::size_t j = 0; j < C; ++j) A[Rr * C + j] = tan[j];
+      b[Rr] = 0.0;
+      std::vector<double> dz;
+      if (!solve_linear(A, b, &dz)) return false;
+      for (std::size_t j = 0; j < C; ++j) (*u)[j] += dz[j];
+    }
+    std::vector<double> G; G_residual(m, kind, *u, &G);
+    double res = 0; for (double v : G) res += v * v;
+    return std::sqrt(res) < 1e-6;
+  };
+
+  /* tangent: null vector of the (n+1)x(n+2) Jacobian (the curve direction). */
+  auto tangent_of = [&](const std::vector<double> &u, const std::vector<double> &prev,
+                        std::vector<double> *t) -> bool {
+    std::vector<double> J; G_jacobian(m, kind, u, &J);
+    std::vector<double> A(C * C, 0.0), b(C, 0.0);
+    for (std::size_t i = 0; i < Rr; ++i)
+      for (std::size_t j = 0; j < C; ++j) A[i * C + j] = J[i * C + j];
+    if (prev.empty()) { A[Rr * C + (n + 1)] = 1.0; b[Rr] = 1.0; }  /* seed: move in q */
+    else { for (std::size_t j = 0; j < C; ++j) A[Rr * C + j] = prev[j]; b[Rr] = 1.0; }
+    if (!solve_linear(A, b, t)) return false;
+    double nrm = 0; for (double v : *t) nrm += v * v; nrm = std::sqrt(nrm);
+    if (nrm < 1e-300) return false;
+    for (double &v : *t) v /= nrm;
+    if (!prev.empty()) { double d = 0; for (std::size_t j = 0; j < C; ++j) d += (*t)[j]*prev[j];
+      if (d < 0) for (double &v : *t) v = -v; }
+    return true;
+  };
+
+  std::vector<double> u(C);
+  for (std::size_t i = 0; i < n; ++i) u[i] = x0[i];
+  u[n] = p0; u[n + 1] = q0;
+  std::vector<double> empty_prev;
+  if (!correct(&u, std::vector<double>(C, 0.0))) {
+    /* still record the start even if it wasn't a perfect codim-1 point */
+  }
+
+  auto push = [&](const std::vector<double> &uu) {
+    TwoParamPoint pt; pt.p = uu[n]; pt.q = uu[n + 1];
+    pt.x.assign(uu.begin(), uu.begin() + n);
+    curve.points.push_back(std::move(pt));
+  };
+
+  /* trace both directions */
+  for (int dir = 0; dir < 2; ++dir) {
+    std::vector<double> uu = u, tan;
+    if (!tangent_of(uu, empty_prev, &tan)) continue;
+    if (dir == 1) for (double &v : tan) v = -v;
+    int steps = settings.max_points / 2;
+    for (int s = 0; s < steps; ++s) {
+      std::vector<double> un = uu;
+      for (std::size_t j = 0; j < C; ++j) un[j] += settings.h0 * tan[j];
+      std::vector<double> ntan;
+      if (!tangent_of(uu, tan, &ntan)) break;  /* tangent at current point */
+      if (!correct(&un, ntan)) break;
+      const double pp = un[n], qq = un[n + 1];
+      if (pp < settings.p_min || pp > settings.p_max ||
+          qq < settings.q_min || qq > settings.q_max) { push(un); break; }
+      push(un);
+      /* advance */
+      std::vector<double> t2;
+      if (!tangent_of(un, ntan, &t2)) break;
+      uu = un; tan = t2;
+    }
+  }
+
+  /* ---- detect codim-2 points ALONG the curve ----------------------------
+   * Two scalar test functions are evaluated at each curve point; a sign change
+   * between consecutive points brackets a codim-2 point. For a FOLD curve:
+   *   - t_cusp = fold normal-form coefficient a  (a -> 0 is a CUSP)
+   *   - t_bt   = 2nd-smallest |eigenvalue|        (-> 0 is Bogdanov-Takens)
+   * For a HOPF curve:
+   *   - t_gh   = first Lyapunov coefficient l1    (-> 0 is generalized Hopf)
+   *   - t_bt   = Hopf frequency omega             (-> 0 is Bogdanov-Takens)
+   * The single-parameter normal-form routines are evaluated on a temporary
+   * Model that pins q to the point's value and varies p. */
+  if (curve.points.size() > 2) {
+    auto model_at_q = [&](double qfix) {
+      Model mm; mm.n = n;
+      mm.vector_field = [&m, qfix](const double *xx, double pp, double *fo, std::string *er) {
+        return m.vector_field(xx, pp, qfix, fo, er);
+      };
+      return mm;
+    };
+    auto test_funcs = [&](const TwoParamPoint &pt, double *t_cusp_or_gh, double *t_bt) -> bool {
+      Model mm = model_at_q(pt.q);
+      if (kind == TwoParamKind::Fold) {
+        double a = 0, l0 = 0; std::string e;
+        if (!fold_normal_form(mm, pt.x, pt.p, &a, &l0, &e)) return false;
+        *t_cusp_or_gh = a;
+        /* BT indicator on a fold curve: at a fold one eigenvalue is ~0. A BT is
+         * where a SECOND eigenvalue also hits zero. The sum of the non-zero
+         * eigenvalues = trace(J) - (the near-zero eigenvalue) is a SIGNED test
+         * that crosses zero at the BT (unlike |eigenvalue|, which only touches
+         * zero and so can't be bracketed by a sign change). For a 2-D system
+         * this is just the non-trivial real eigenvalue. */
+        std::vector<double> J; if (!finite_diff_jacobian(mm, pt.x.data(), pt.p, &J, &e, 1e-7)) return false;
+        std::vector<std::complex<double>> ev; if (!eigenvalues(J, n, &ev)) return false;
+        /* find the eigenvalue nearest zero (the fold's), sum the real parts of
+         * the rest -> signed BT test */
+        std::size_t iz = 0; double best = 1e300;
+        for (std::size_t k = 0; k < ev.size(); ++k) { double mg = std::abs(ev[k]); if (mg < best) { best = mg; iz = k; } }
+        double sum_rest = 0.0;
+        for (std::size_t k = 0; k < ev.size(); ++k) if (k != iz) sum_rest += ev[k].real();
+        *t_bt = sum_rest;
+        return true;
+      } else {
+        double l1 = 0, w = 0; std::string e;
+        if (!hopf_first_lyapunov(mm, pt.x, pt.p, &l1, &w, &e)) return false;
+        *t_cusp_or_gh = l1;
+        *t_bt = w;     /* omega -> 0 is Bogdanov-Takens */
+        return true;
+      }
+    };
+    std::vector<double> A(curve.points.size(), std::nan("")), B(curve.points.size(), std::nan(""));
+    for (std::size_t i = 0; i < curve.points.size(); ++i) {
+      double a = 0, b = 0;
+      if (test_funcs(curve.points[i], &a, &b)) { A[i] = a; B[i] = b; }
+    }
+    for (std::size_t i = 1; i < curve.points.size(); ++i) {
+      /* skip the join between the two trace directions (large parameter jump) */
+      const double jump = std::fabs(curve.points[i].p - curve.points[i-1].p) +
+                          std::fabs(curve.points[i].q - curve.points[i-1].q);
+      if (jump > 1.0) continue;
+      SpecialPointKind k = SpecialPointKind::None;
+      bool use_bt_test = false;
+      if (std::isfinite(B[i-1]) && std::isfinite(B[i]) && B[i-1] * B[i] < 0.0) {
+        k = SpecialPointKind::BogdanovTakens; use_bt_test = true;   /* BT takes precedence */
+      } else if (std::isfinite(A[i-1]) && std::isfinite(A[i]) && A[i-1] * A[i] < 0.0) {
+        /* A sign change of the cusp/GH test (fold coeff a, or l1) only counts if
+         * it crosses ZERO, not infinity: the fold coefficient diverges (and
+         * flips sign) where the cycle/center-manifold reduction is singular,
+         * which is NOT a cusp. Require the magnitude on BOTH sides be modest
+         * (a genuine zero crossing) -- a pole shows |value| blowing up. */
+        const double m0 = std::fabs(A[i-1]), m1 = std::fabs(A[i]);
+        const double near = std::min(m0, m1), far = std::max(m0, m1);
+        const bool looks_like_zero = (near < 0.5) && (far < 50.0);
+        if (looks_like_zero)
+          k = (kind == TwoParamKind::Fold) ? SpecialPointKind::Cusp
+                                           : SpecialPointKind::GeneralizedHopf;
+      }
+      if (k != SpecialPointKind::None) {
+        /* BISECTION refine the codim-2 location along the curve segment
+         * [i-1, i]. Parametrize by t in [0,1] linearly interpolating (p,q,x);
+         * at each t re-solve the equilibrium in p at the interpolated q, then
+         * evaluate the relevant test function (BT: t_bt, else t_cusp_or_gh) and
+         * bisect on its sign. This pins the point far more precisely than just
+         * tagging the nearer curve node. */
+        const TwoParamPoint &P0 = curve.points[i-1], &P1 = curve.points[i];
+        auto eval_t = [&](double t, TwoParamPoint *refp, double *tf) -> bool {
+          const double q = P0.q + t * (P1.q - P0.q);
+          double p = P0.p + t * (P1.p - P0.p);
+          std::vector<double> x(n);
+          for (std::size_t kk = 0; kk < n; ++kk) x[kk] = P0.x[kk] + t * (P1.x[kk] - P0.x[kk]);
+          Model mm = model_at_q(q);
+          std::string e;
+          if (!correct_equilibrium(mm, &x, p, settings.max_corrector_iters, settings.corrector_tol, &e))
+            return false;
+          double a = 0, b = 0;
+          /* recompute both test functions at the corrected point */
+          TwoParamPoint tp; tp.p = p; tp.q = q; tp.x = x;
+          if (!test_funcs(tp, &a, &b)) return false;
+          *tf = use_bt_test ? b : a;
+          if (refp) { *refp = tp; }
+          return true;
+        };
+        double lo = 0.0, hi = 1.0, flo = use_bt_test ? B[i-1] : A[i-1];
+        TwoParamPoint best; bool havebest = false;
+        for (int it = 0; it < 40; ++it) {
+          const double mid = 0.5 * (lo + hi);
+          double fm; TwoParamPoint rp;
+          if (!eval_t(mid, &rp, &fm)) break;
+          havebest = true; best = rp;
+          if (flo * fm <= 0.0) { hi = mid; } else { lo = mid; flo = fm; }
+          if (hi - lo < 1e-10) break;
+        }
+        /* tag the nearer node (for the diagram), and attach the refined point */
+        std::size_t at = (std::fabs(use_bt_test ? B[i-1] : A[i-1]) <
+                          std::fabs(use_bt_test ? B[i] : A[i])) ? i-1 : i;
+        if (curve.points[at].special == SpecialPointKind::None) {
+          curve.points[at].special = k;
+          if (havebest) {
+            curve.points[at].p2 = best.p; curve.points[at].q2 = best.q;
+            curve.points[at].x2 = best.x;
+            /* codim-2 normal-form coefficients at the refined point */
+            if (k == SpecialPointKind::BogdanovTakens) {
+              Model mm = model_at_q(best.q);
+              double a = 0, b = 0; std::string e;
+              if (bt_normal_form(mm, best.x, best.p, &a, &b, &e)) {
+                curve.points[at].bt_a = a; curve.points[at].bt_b = b;
+                curve.points[at].has_codim2_nf = true;
+              }
+            }
+          } else {
+            curve.points[at].p2 = curve.points[at].p;
+            curve.points[at].q2 = curve.points[at].q;
+            curve.points[at].x2 = curve.points[at].x;
+          }
+          curve.special_indices.push_back(at);
+        }
+      }
+    }
+  }
+
+  curve.ok = curve.points.size() > 2;
+  curve.message = curve.ok ? ("traced " + std::to_string(curve.points.size()) + " points" +
+                              (curve.special_indices.empty() ? "" :
+                               ", " + std::to_string(curve.special_indices.size()) + " codim-2 point(s)"))
+                           : "could not trace a curve from this start";
+  return curve;
+}
+
+/* ---- periodic-orbit continuation by collocation ------------------------- */
+namespace {
+
+/* The unknown vector U packs the m mesh points (each length n) followed by the
+ * period T:  U = [X0_0..X0_{n-1}, X1_..., ..., X{m-1}_..., T], length m*n+1.
+ * Residual F(U) (same length): trapezoidal collocation on each interval
+ *   X[i+1] - X[i] - (T/m) * 0.5*(f(X[i]) + f(X[i+1])) = 0   (i = 0..m-1, wrap)
+ * which is m*n equations, plus one phase condition fixing the orbit's phase:
+ *   <X[0] - Xprev[0], f(Xprev[0])> = 0  (orthogonality to the reference field;
+ *   for the first solve we instead pin the first coordinate of X[0] to its
+ *   guess, which is robust). */
+struct CycleCtx {
+  const Model *m;
+  double p;
+  std::size_t n, mesh;
+  std::vector<double> phase_ref;   /* reference point X0 for the phase cond. */
+  std::vector<double> phase_dir;   /* f(phase_ref): direction for orthogonality */
+  bool pin_mode = true;            /* true: pin X0[0]; false: integral phase   */
+  double pin_val = 0.0;            /* value to pin X0[0] to (pin_mode)         */
+  /* Adaptive mesh: fraction of the period spanned by each interval i (length
+   * `mesh`, summing to 1). Empty => uniform 1/mesh (the original behaviour, so
+   * existing callers/tests are unchanged). Remeshing redistributes these to put
+   * more points where the orbit moves fast / curves sharply (stiff relaxation
+   * cycles), which a uniform-in-time mesh resolves poorly. */
+  std::vector<double> frac;
+};
+
+bool cyc_field(const CycleCtx &c, const double *x, std::vector<double> *f) {
+  f->assign(c.n, 0.0);
+  std::string err;
+  return c.m->vector_field(x, c.p, f->data(), &err);
+}
+
+/* residual of the collocation system at U */
+bool cyc_residual(const CycleCtx &c, const std::vector<double> &U, std::vector<double> *Fout) {
+  const std::size_t n = c.n, M = c.mesh;
+  const double T = U[M * n];
+  Fout->assign(M * n + 1, 0.0);
+  std::vector<double> fi(n), fj(n), xi(n), xj(n);
+  for (std::size_t i = 0; i < M; ++i) {
+    const std::size_t j = (i + 1) % M;
+    for (std::size_t k = 0; k < n; ++k) { xi[k] = U[i*n+k]; xj[k] = U[j*n+k]; }
+    if (!cyc_field(c, xi.data(), &fi)) return false;
+    if (!cyc_field(c, xj.data(), &fj)) return false;
+    /* interval duration: adaptive fraction if provided, else uniform T/M */
+    const double dti = (c.frac.size() == M) ? (T * c.frac[i]) : (T / (double)M);
+    for (std::size_t k = 0; k < n; ++k)
+      (*Fout)[i*n+k] = xj[k] - xi[k] - dti * 0.5 * (fi[k] + fj[k]);
+  }
+  /* phase condition */
+  if (c.pin_mode || c.phase_ref.size() < n || c.phase_dir.size() < n) {
+    /* pin the first coordinate (also the safe fallback when no integral phase
+     * reference has been set yet) */
+    (*Fout)[M*n] = U[0] - (c.pin_mode ? c.pin_val : U[0]);
+  } else {
+    double s = 0.0;
+    for (std::size_t k = 0; k < n; ++k) s += (U[k] - c.phase_ref[k]) * c.phase_dir[k];
+    (*Fout)[M*n] = s;
+  }
+  return true;
+}
+
+/* Adaptive remeshing. Given a converged orbit U (M points + period) and a
+ * CycleCtx, redistribute the mesh points so they equidistribute a monitor
+ * function (here arclength + a curvature weight), and write the resulting
+ * per-interval TIME fractions into c.frac. Returns a new orbit Unew sampled at
+ * the redistributed points (same M, same period). This concentrates points on
+ * the fast/sharp parts of relaxation cycles, which a uniform-in-time mesh
+ * resolves poorly. No-op-safe: on any failure it leaves things unchanged. */
+bool cyc_remesh(CycleCtx &c, const std::vector<double> &U, std::vector<double> *Unew) {
+  const std::size_t n = c.n, M = c.mesh;
+  if (M < 4) return false;
+  const double T = U[M * n];
+  if (!(T > 0)) return false;
+
+  /* current interval time fractions (uniform or existing adaptive) */
+  std::vector<double> fr(M);
+  for (std::size_t i = 0; i < M; ++i) fr[i] = (c.frac.size() == M) ? c.frac[i] : 1.0 / (double)M;
+
+  /* monitor density per interval: arclength of the segment plus a small floor,
+   * raised to a power<1 so adaptation is gentle (avoids starving slow arcs). */
+  std::vector<double> w(M, 0.0);
+  double wsum = 0.0, len_total = 0.0;
+  for (std::size_t i = 0; i < M; ++i) {
+    const std::size_t j = (i + 1) % M;
+    double seg = 0.0;
+    for (std::size_t k = 0; k < n; ++k) { const double d = U[j*n+k] - U[i*n+k]; seg += d * d; }
+    seg = std::sqrt(seg);
+    len_total += seg;
+    w[i] = seg;
+  }
+  if (!(len_total > 0)) return false;
+  /* monitor = (arclength density)^alpha, smoothed, with a floor */
+  const double alpha = 0.5;
+  for (std::size_t i = 0; i < M; ++i) {
+    double dens = w[i] / (len_total / (double)M); /* relative speed */
+    dens = std::pow(dens + 0.15, alpha);
+    w[i] = dens; wsum += dens;
+  }
+  if (!(wsum > 0)) return false;
+
+  /* cumulative monitor at node boundaries (length M+1, periodic) */
+  std::vector<double> cum(M + 1, 0.0);
+  for (std::size_t i = 0; i < M; ++i) cum[i + 1] = cum[i] + w[i] / wsum; /* 0..1 */
+
+  /* also need cumulative TIME at each original node for resampling the orbit */
+  std::vector<double> tcum(M + 1, 0.0);
+  for (std::size_t i = 0; i < M; ++i) tcum[i + 1] = tcum[i] + fr[i];
+
+  /* new nodes equidistributed in the monitor variable xi in [0,1). For each new
+   * node find where cum crosses k/M, interpolate the orbit (linear) and the
+   * time there. */
+  Unew->assign(M * n + 1, 0.0);
+  std::vector<double> new_tnode(M + 1, 0.0);
+  for (std::size_t inew = 0; inew <= M; ++inew) {
+    const double target = (double)inew / (double)M; /* in [0,1] */
+    /* locate interval [cum[s], cum[s+1]] containing target */
+    std::size_t s = 0;
+    while (s < M && cum[s + 1] < target) ++s;
+    if (s >= M) s = M - 1;
+    const double seg = cum[s + 1] - cum[s];
+    const double local = seg > 1e-15 ? (target - cum[s]) / seg : 0.0;
+    if (inew < M) {
+      const std::size_t a = s % M, b = (s + 1) % M;
+      for (std::size_t k = 0; k < n; ++k)
+        (*Unew)[inew * n + k] = (1.0 - local) * U[a * n + k] + local * U[b * n + k];
+    }
+    new_tnode[inew] = tcum[s] + local * (tcum[s + 1] - tcum[s]); /* fractional time in [0,1] */
+  }
+  (*Unew)[M * n] = T;
+
+  /* new per-interval time fractions from the new node times */
+  std::vector<double> newfrac(M, 0.0);
+  double fsum = 0.0;
+  for (std::size_t i = 0; i < M; ++i) {
+    double d = new_tnode[i + 1] - new_tnode[i];
+    if (d <= 1e-9) d = 1e-9;
+    newfrac[i] = d; fsum += d;
+  }
+  if (!(fsum > 0)) return false;
+  for (std::size_t i = 0; i < M; ++i) newfrac[i] /= fsum;
+  c.frac = newfrac;
+  return true;
+}
+
+/* Newton solve of the collocation system; returns refined U. Uses a finite-
+ * difference Jacobian (dense (M*n+1)^2) — fine for the modest mesh sizes here.*/
+bool cyc_newton(const CycleCtx &c, std::vector<double> *U, int iters, double tol) {
+  const std::size_t N = c.mesh * c.n + 1;
+  std::vector<double> F0, Fp;
+  for (int it = 0; it < iters; ++it) {
+    if (!cyc_residual(c, *U, &F0)) return false;
+    double res = 0; for (double v : F0) res += v*v; res = std::sqrt(res);
+    if (res < tol) return true;
+    std::vector<double> J(N * N, 0.0);
+    std::vector<double> Ut = *U;
+    for (std::size_t j = 0; j < N; ++j) {
+      const double save = Ut[j]; const double dh = 1e-7 * (std::fabs(save) + 1.0);
+      Ut[j] = save + dh;
+      if (!cyc_residual(c, Ut, &Fp)) return false;
+      for (std::size_t i = 0; i < N; ++i) J[i*N+j] = (Fp[i] - F0[i]) / dh;
+      Ut[j] = save;
+    }
+    std::vector<double> b(N); for (std::size_t i = 0; i < N; ++i) b[i] = -F0[i];
+    std::vector<double> du;
+    if (!solve_linear(J, b, &du)) return false;
+    /* damped step for robustness */
+    double nrm = 0; for (double v : du) nrm += v*v; nrm = std::sqrt(nrm);
+    double damp = (nrm > 1.0) ? 1.0 / nrm : 1.0;
+    for (std::size_t j = 0; j < N; ++j) (*U)[j] += damp * du[j];
+  }
+  if (!cyc_residual(c, *U, &F0)) return false;
+  double res = 0; for (double v : F0) res += v*v;
+  return std::sqrt(res) < tol * 100;
+}
+
+/* amplitude (peak-to-peak) and min/max of the first coordinate over the mesh */
+void cyc_amp(const std::vector<double> &U, std::size_t n, std::size_t M,
+             double *amp, double *mn, double *mx) {
+  double lo = 1e300, hi = -1e300;
+  for (std::size_t i = 0; i < M; ++i) { const double v = U[i*n]; lo = std::min(lo, v); hi = std::max(hi, v); }
+  *mn = lo; *mx = hi; *amp = hi - lo;
+}
+
+/* Fold-of-cycles (LPC) test function: the determinant of the collocation
+ * Jacobian at a converged cycle U. Away from a cycle fold the periodic BVP is
+ * regular and this is bounded away from zero; at an LPC (a nontrivial Floquet
+ * multiplier crossing +1, where the cycle branch turns) the system becomes
+ * singular and the determinant changes sign. We rescale rows to keep the
+ * determinant in a sane numeric range (only its SIGN is used downstream). */
+double cycle_fold_test(const CycleCtx &c, const std::vector<double> &U) {
+  const std::size_t N = c.mesh * c.n + 1;
+  std::vector<double> F0, Fp;
+  if (!cyc_residual(c, U, &F0)) return std::nan("");
+  std::vector<double> J(N * N, 0.0), Ut = U;
+  for (std::size_t j = 0; j < N; ++j) {
+    const double save = Ut[j]; const double dh = 1e-7 * (std::fabs(save) + 1.0);
+    Ut[j] = save + dh;
+    if (!cyc_residual(c, Ut, &Fp)) return std::nan("");
+    for (std::size_t i = 0; i < N; ++i) J[i*N+j] = (Fp[i] - F0[i]) / dh;
+    Ut[j] = save;
+  }
+  /* row-normalize so det doesn't under/overflow for large meshes */
+  for (std::size_t i = 0; i < N; ++i) {
+    double s = 0; for (std::size_t j = 0; j < N; ++j) s += J[i*N+j]*J[i*N+j];
+    s = std::sqrt(s); if (s < 1e-300) s = 1.0;
+    for (std::size_t j = 0; j < N; ++j) J[i*N+j] /= s;
+  }
+  return determinant(J, N);
+}
+
+/* ---- Floquet multipliers of a converged cycle -------------------------------
+ * Integrate the variational equation  Phi' = T * Df(x(s)) * Phi,  Phi(0)=I,
+ * over one period (s: 0->1) using the orbit samples in U and the model Jacobian.
+ * The monodromy matrix Phi(1) has eigenvalues = the Floquet multipliers. One is
+ * always ~1 (along the flow); the others govern stability. RK4 on the matrix
+ * ODE between mesh points (interpolating x along the orbit). */
+void cycle_floquet(const CycleCtx &c, const std::vector<double> &U,
+                   std::vector<Complex> *mult_out) {
+  const std::size_t n = c.n, M = c.mesh;
+  const double T = U[M * n];
+  mult_out->clear();
+  if (n == 0 || M < 2 || !(T > 0)) return;
+
+  auto node = [&](std::size_t i, std::vector<double> &x) {
+    i %= M; for (std::size_t k = 0; k < n; ++k) x[k] = U[i*n+k];
+  };
+  /* cumulative node times in [0,1]: uniform (i/M) unless an adaptive mesh frac
+   * is present, in which case node i sits at the cumulative sum of fractions. */
+  std::vector<double> tnode(M + 1, 0.0);
+  for (std::size_t i = 0; i < M; ++i)
+    tnode[i + 1] = tnode[i] + ((c.frac.size() == M) ? c.frac[i] : 1.0 / (double)M);
+  std::vector<double> xa(n), xb(n);
+  /* interpolate the orbit at normalized period-time s in [0,1) using tnode */
+  auto orbit_at_s = [&](double s, std::vector<double> &x) {
+    s -= std::floor(s);
+    std::size_t i = 0;
+    while (i < M && tnode[i + 1] < s) ++i;
+    if (i >= M) i = M - 1;
+    const double seg = tnode[i + 1] - tnode[i];
+    const double t = seg > 1e-15 ? (s - tnode[i]) / seg : 0.0;
+    node(i, xa); node(i + 1, xb);
+    for (std::size_t k = 0; k < n; ++k) x[k] = (1.0 - t) * xa[k] + t * xb[k];
+  };
+  std::vector<double> Jf(n * n);
+  auto jac_at = [&](const std::vector<double> &x) -> bool {
+    std::string err;
+    if (c.m->jacobian_x && c.m->jacobian_x(x.data(), c.p, Jf.data(), &err)) return true;
+    std::vector<double> f0(n), f1(n), xx = x;
+    if (!c.m->vector_field(x.data(), c.p, f0.data(), &err)) return false;
+    for (std::size_t j = 0; j < n; ++j) {
+      const double save = xx[j], dh = 1e-7 * (std::fabs(save) + 1.0);
+      xx[j] = save + dh;
+      if (!c.m->vector_field(xx.data(), c.p, f1.data(), &err)) return false;
+      for (std::size_t i = 0; i < n; ++i) Jf[i*n+j] = (f1[i] - f0[i]) / dh;
+      xx[j] = save;
+    }
+    return true;
+  };
+  std::vector<double> Phi(n * n, 0.0);
+  for (std::size_t k = 0; k < n; ++k) Phi[k*n+k] = 1.0;
+  auto matmul = [&](const std::vector<double> &A, const std::vector<double> &B, std::vector<double> &out) {
+    out.assign(n * n, 0.0);
+    for (std::size_t i = 0; i < n; ++i)
+      for (std::size_t kk = 0; kk < n; ++kk) {
+        const double a = A[i*n+kk]; if (a == 0.0) continue;
+        for (std::size_t j = 0; j < n; ++j) out[i*n+j] += a * B[kk*n+j];
+      }
+  };
+  std::vector<double> xcur(n), TJ(n * n), k1, k2, k3, k4, tmp(n * n);
+  const int steps = (int)M * 8;   /* 8 RK4 substeps per mesh interval for stiff cycles */
+  const double h = 1.0 / (double)steps;
+  auto deriv = [&](double s, const std::vector<double> &Ph, std::vector<double> &dPh) -> bool {
+    orbit_at_s(s, xcur);
+    if (!jac_at(xcur)) return false;
+    for (std::size_t i = 0; i < n*n; ++i) TJ[i] = T * Jf[i];
+    matmul(TJ, Ph, dPh);
+    return true;
+  };
+  for (int st = 0; st < steps; ++st) {
+    const double s = (double)st * h;
+    if (!deriv(s, Phi, k1)) { mult_out->clear(); return; }
+    for (std::size_t i = 0; i < n*n; ++i) tmp[i] = Phi[i] + 0.5*h*k1[i];
+    if (!deriv(s + 0.5*h, tmp, k2)) { mult_out->clear(); return; }
+    for (std::size_t i = 0; i < n*n; ++i) tmp[i] = Phi[i] + 0.5*h*k2[i];
+    if (!deriv(s + 0.5*h, tmp, k3)) { mult_out->clear(); return; }
+    for (std::size_t i = 0; i < n*n; ++i) tmp[i] = Phi[i] + h*k3[i];
+    if (!deriv(s + h, tmp, k4)) { mult_out->clear(); return; }
+    for (std::size_t i = 0; i < n*n; ++i)
+      Phi[i] += (h/6.0) * (k1[i] + 2.0*k2[i] + 2.0*k3[i] + k4[i]);
+  }
+  eigenvalues(Phi, n, mult_out);
+}
+
+/* Bordered residual for pseudo-arclength: unknowns V = (U, p), p in last slot. */
+bool cyc_residual_p(CycleCtx c, const std::vector<double> &V,
+                    std::size_t Ulen, std::vector<double> *Fout) {
+  c.p = V[Ulen];
+  std::vector<double> U(V.begin(), V.begin() + Ulen);
+  return cyc_residual(c, U, Fout);
+}
+
+}  // namespace
+
+/* Classify a sample's Floquet multipliers into stability + bifurcation flags.
+ * Drops the trivial multiplier (~1) before judging the rest. */
+static void classify_floquet(const std::vector<Complex> &mult, CycleSample *s) {
+  s->floquet_re.clear(); s->floquet_im.clear();
+  if (mult.empty()) return;
+  /* find and drop the one multiplier closest to +1 (the trivial one) */
+  std::size_t triv = 0; double best = 1e300;
+  for (std::size_t i = 0; i < mult.size(); ++i) {
+    const double d = std::hypot(mult[i].real() - 1.0, mult[i].imag());
+    if (d < best) { best = d; triv = i; }
+  }
+  double maxmag = 0.0; bool pd = false, ns = false;
+  for (std::size_t i = 0; i < mult.size(); ++i) {
+    s->floquet_re.push_back(mult[i].real());
+    s->floquet_im.push_back(mult[i].imag());
+    if (i == triv) continue;
+    const double mag = std::hypot(mult[i].real(), mult[i].imag());
+    if (mag > maxmag) maxmag = mag;
+    if (mult[i].real() < -1.0 + 0.02 && std::fabs(mult[i].imag()) < 0.02) pd = true;
+    if (std::fabs(mult[i].imag()) > 0.02 && std::fabs(mag - 1.0) < 0.03) ns = true;
+  }
+  s->max_nontrivial_mult = maxmag;
+  s->stable = (maxmag < 1.0 + 1e-3);
+  s->is_pd = pd;
+  s->is_ns = ns;
+}
+
+/* Pseudo-arclength continuation of a periodic orbit in the extended space
+ * V = (U, p). Predictor: step along the branch tangent (null vector of the
+ * bordered Jacobian). Corrector: Newton on [ cycle BVP ; arclength constraint ]
+ * which keeps the solution on a plane a distance ds along the tangent. Because
+ * p is an unknown (not marched), this turns around folds of cycles (LPC) where
+ * monotone-in-p continuation stalls. */
+static CycleBranch continue_limit_cycle_arclength(
+    const Model &m, const std::vector<std::vector<double>> &guess_points,
+    double period_guess, double p0, const CycleSettings &settings) {
+  CycleBranch out;
+  const std::size_t n = m.n, M = guess_points.size();
+  if (n == 0 || M < 4 || period_guess <= 0) { out.message = "need a periodic-orbit guess (>=4 points) and T>0"; return out; }
+  for (const auto &g : guess_points) if (g.size() != n) { out.message = "guess point dimension mismatch"; return out; }
+  const std::size_t Ulen = M * n + 1;       /* orbit + period */
+  const std::size_t NV = Ulen + 1;          /* + parameter    */
+
+  CycleCtx c; c.m = &m; c.n = n; c.mesh = M; c.p = p0;
+  c.pin_mode = false;
+
+  /* pack V0 = (U, p) and converge the initial cycle at p0 with a pinned phase */
+  std::vector<double> V(NV, 0.0);
+  for (std::size_t i = 0; i < M; ++i) for (std::size_t k = 0; k < n; ++k) V[i*n+k] = guess_points[i][k];
+  V[M*n] = period_guess; V[Ulen] = p0;
+  {
+    CycleCtx c0 = c; c0.pin_mode = true; c0.pin_val = V[0];
+    std::vector<double> U0(V.begin(), V.begin() + Ulen);
+    if (!cyc_newton(c0, &U0, settings.newton_iters, settings.newton_tol)) {
+      out.message = "Newton did not converge on the initial cycle (try a better guess / larger mesh)";
+      return out;
+    }
+    for (std::size_t i = 0; i < Ulen; ++i) V[i] = U0[i];
+  }
+
+  /* phase condition: orthogonality to the field at a fixed reference X0 */
+  auto set_phase = [&](const std::vector<double> &Vref) {
+    c.pin_mode = false;
+    c.phase_ref.assign(Vref.begin(), Vref.begin() + n);
+    c.p = Vref[Ulen];
+    std::vector<double> fr;
+    if (cyc_field(c, c.phase_ref.data(), &fr)) c.phase_dir = fr; else c.phase_dir.assign(n, 0.0);
+  };
+
+  /* build the (Ulen) x (NV) Jacobian of the cycle residual wrt V by finite diff */
+  auto resid_jac = [&](const std::vector<double> &Vc, std::vector<double> *F, std::vector<double> *J) -> bool {
+    if (!cyc_residual_p(c, Vc, Ulen, F)) return false; /* length Ulen */
+    J->assign(Ulen * NV, 0.0);
+    std::vector<double> Vt = Vc, Fp;
+    for (std::size_t j = 0; j < NV; ++j) {
+      const double save = Vt[j], dh = 1e-7 * (std::fabs(save) + 1.0);
+      Vt[j] = save + dh;
+      if (!cyc_residual_p(c, Vt, Ulen, &Fp)) return false;
+      for (std::size_t i = 0; i < Ulen; ++i) (*J)[i*NV+j] = (Fp[i] - (*F)[i]) / dh;
+      Vt[j] = save;
+    }
+    return true;
+  };
+
+  /* tangent: null vector of the Ulen x NV Jacobian (one-dim kernel generically).
+   * Solve [J; e_k^T] t = e_last for some pivot, then normalize; pick orientation
+   * consistent with prev. */
+  std::vector<double> tangent(NV, 0.0); tangent[Ulen] = 1.0; /* initial guess: increase p */
+  auto compute_tangent = [&](const std::vector<double> &Vc, std::vector<double> &tan_io) -> bool {
+    std::vector<double> F, J;
+    set_phase(Vc);
+    if (!resid_jac(Vc, &F, &J)) return false;
+    /* augment with the previous tangent as the last row to fix the kernel scale:
+     * [ J ] t = [ 0 ]
+     * [ t_prev^T ]   [ 1 ]  */
+    std::vector<double> A(NV * NV, 0.0), b(NV, 0.0);
+    for (std::size_t i = 0; i < Ulen; ++i)
+      for (std::size_t j = 0; j < NV; ++j) A[i*NV+j] = J[i*NV+j];
+    for (std::size_t j = 0; j < NV; ++j) A[Ulen*NV+j] = tan_io[j];
+    b[Ulen] = 1.0;
+    std::vector<double> t;
+    if (!solve_linear(A, b, &t)) return false;
+    double nrm = 0; for (double v : t) nrm += v*v; nrm = std::sqrt(nrm);
+    if (!(nrm > 0) || !std::isfinite(nrm)) return false;
+    for (double &v : t) v /= nrm;
+    /* keep orientation continuous */
+    double dot = 0; for (std::size_t j = 0; j < NV; ++j) dot += t[j]*tan_io[j];
+    if (dot < 0) for (double &v : t) v = -v;
+    tan_io = t;
+    return true;
+  };
+
+  auto record = [&](const std::vector<double> &Vc) {
+    CycleSample s; s.p = Vc[Ulen]; s.period = Vc[M*n];
+    std::vector<double> U(Vc.begin(), Vc.begin() + Ulen);
+    cyc_amp(U, n, M, &s.amplitude, &s.min0, &s.max0);
+    CycleCtx cf = c; cf.p = Vc[Ulen];
+    s.fold_test = cycle_fold_test(cf, U);
+    if (settings.compute_floquet) {
+      std::vector<Complex> mult; cycle_floquet(cf, U, &mult); classify_floquet(mult, &s);
+    }
+    out.samples.push_back(s);
+  };
+
+  set_phase(V);   /* establish the integral phase reference before recording */
+  const std::vector<double> V_seed = V;
+  record(V);
+  /* initial tangent from the converged point */
+  if (!compute_tangent(V, tangent)) { out.message = "could not form branch tangent"; out.ok = out.samples.size() > 1; return out; }
+  const std::vector<double> tangent_seed = tangent;
+
+  const double ds = settings.ds > 0 ? settings.ds : 0.05;
+  bool turned = false;
+  const int steps_per_dir = std::max(1, settings.max_steps / 2);
+
+  for (int dir = 0; dir < 2; ++dir) {
+    V = V_seed;
+    tangent = tangent_seed;
+    if (dir == 1) for (double &v : tangent) v = -v; /* opposite branch direction */
+    double prev_dp_sign = (tangent[Ulen] >= 0 ? 1.0 : -1.0);
+
+    for (int step = 0; step < steps_per_dir; ++step) {
+      /* predictor */
+      std::vector<double> Vp = V;
+      for (std::size_t j = 0; j < NV; ++j) Vp[j] += ds * tangent[j];
+
+      /* corrector: Newton on [ cycle_resid(V) ; tangent . (V - Vp) ] = 0 */
+      std::vector<double> Vc = Vp;
+      bool ok = false;
+      for (int it = 0; it < settings.newton_iters; ++it) {
+        std::vector<double> F, J;
+        set_phase(Vc);
+        if (!resid_jac(Vc, &F, &J)) break;
+        double g = -ds;
+        for (std::size_t j = 0; j < NV; ++j) g += tangent[j] * (Vc[j] - V[j]);
+        double res = 0; for (double v : F) res += v*v; res = std::sqrt(res + g*g);
+        if (res < settings.newton_tol) { ok = true; break; }
+        std::vector<double> A(NV * NV, 0.0), rhs(NV, 0.0);
+        for (std::size_t i = 0; i < Ulen; ++i) {
+          for (std::size_t j = 0; j < NV; ++j) A[i*NV+j] = J[i*NV+j];
+          rhs[i] = -F[i];
+        }
+        for (std::size_t j = 0; j < NV; ++j) A[Ulen*NV+j] = tangent[j];
+        rhs[Ulen] = -g;
+        std::vector<double> dV;
+        if (!solve_linear(A, rhs, &dV)) break;
+        double nrm = 0; for (double v : dV) nrm += v*v; nrm = std::sqrt(nrm);
+        double damp = (nrm > 1.0) ? 1.0 / nrm : 1.0;
+        for (std::size_t j = 0; j < NV; ++j) Vc[j] += damp * dV[j];
+      }
+      if (!ok) break;
+      if (!(Vc[M*n] > 0) || !std::isfinite(Vc[M*n])) break;
+      if (Vc[Ulen] < settings.p_min - 1e-9 || Vc[Ulen] > settings.p_max + 1e-9) {
+        record(Vc); break;
+      }
+      V = Vc;
+      /* adaptive remesh: redistribute the mesh points by arclength so stiff /
+       * relaxation cycles (sharp corners) stay well-resolved as the branch
+       * moves. Updates c.frac and the orbit points; period & parameter keep. */
+      if (settings.adaptive_mesh) {
+        std::vector<double> U(V.begin(), V.begin() + Ulen), Unew;
+        CycleCtx cm = c; cm.p = V[Ulen];
+        if (cyc_remesh(cm, U, &Unew)) {
+          c.frac = cm.frac;
+          for (std::size_t i = 0; i < Ulen; ++i) V[i] = Unew[i];
+          /* re-converge on the new mesh so V is an exact solution there */
+          set_phase(V);
+          std::vector<double> Ufix(V.begin(), V.begin() + Ulen);
+          CycleCtx cf = c; cf.p = V[Ulen]; cf.pin_mode = false;
+          cf.phase_ref = c.phase_ref; cf.phase_dir = c.phase_dir;
+          if (cyc_newton(cf, &Ufix, settings.newton_iters, settings.newton_tol))
+            for (std::size_t i = 0; i < Ulen; ++i) V[i] = Ufix[i];
+        }
+      }
+      if (!compute_tangent(V, tangent)) break;
+      const double dp_sign = (tangent[Ulen] >= 0 ? 1.0 : -1.0);
+      record(V);
+      if (dp_sign * prev_dp_sign < 0) { out.samples.back().is_fold = true; turned = true; }
+      prev_dp_sign = dp_sign;
+    }
+  }
+
+  out.turned = turned;
+  std::sort(out.samples.begin(), out.samples.end(),
+            [](const CycleSample &a, const CycleSample &b){ return a.p < b.p; });
+  /* also flag LPC by fold-test sign change (belt and suspenders) */
+  for (std::size_t i = 1; i < out.samples.size(); ++i) {
+    const double a = out.samples[i-1].fold_test, b = out.samples[i].fold_test;
+    if (std::isfinite(a) && std::isfinite(b) && a * b < 0.0)
+      out.samples[std::fabs(a) < std::fabs(b) ? i-1 : i].is_fold = true;
+  }
+  out.ok = out.samples.size() > 1;
+  out.message = out.ok ? ("traced " + std::to_string(out.samples.size()) + " cycles" +
+                          (turned ? " (turned around a fold of cycles)" : ""))
+                       : "could not continue the cycle";
+  return out;
+}
+
+CycleBranch continue_limit_cycle(const Model &m,
+                                 const std::vector<std::vector<double>> &guess_points,
+                                 double period_guess, double p0,
+                                 const CycleSettings &settings) {
+  if (settings.arclength)
+    return continue_limit_cycle_arclength(m, guess_points, period_guess, p0, settings);
+  CycleBranch out;
+  const std::size_t n = m.n;
+  const std::size_t M = guess_points.size();
+  if (n == 0 || M < 4 || period_guess <= 0) { out.message = "need a periodic-orbit guess (>=4 points) and T>0"; return out; }
+  for (const auto &g : guess_points) if (g.size() != n) { out.message = "guess point dimension mismatch"; return out; }
+
+  /* pack initial U */
+  std::vector<double> U(M * n + 1, 0.0);
+  for (std::size_t i = 0; i < M; ++i) for (std::size_t k = 0; k < n; ++k) U[i*n+k] = guess_points[i][k];
+  U[M*n] = period_guess;
+
+  CycleCtx c; c.m = &m; c.n = n; c.mesh = M; c.p = p0;
+  c.pin_mode = true; c.pin_val = U[0]; /* pin first coord of X0 for the first solve */
+
+  if (!cyc_newton(c, &U, settings.newton_iters, settings.newton_tol)) {
+    out.message = "Newton did not converge on the initial cycle (try a better guess / larger mesh)";
+    return out;
+  }
+
+  auto record = [&](double p) {
+    CycleSample s; s.p = p; s.period = U[M*n];
+    cyc_amp(U, n, M, &s.amplitude, &s.min0, &s.max0);
+    s.stable = false; /* Floquet stability left as future work */
+    s.fold_test = cycle_fold_test(c, U);
+    out.samples.push_back(s);
+  };
+
+  /* switch to an integral-style phase condition for continuation robustness:
+   * orthogonality of X0's increment to the field at the previous X0. */
+  auto set_phase = [&](const std::vector<double> &Uref) {
+    c.pin_mode = false;
+    c.phase_ref.assign(Uref.begin(), Uref.begin() + n);
+    std::vector<double> fr;
+    if (cyc_field(c, c.phase_ref.data(), &fr)) c.phase_dir = fr;
+    else c.phase_dir.assign(n, 0.0);
+  };
+
+  /* trace both directions in the parameter */
+  for (int dir = 0; dir < 2; ++dir) {
+    std::vector<double> Uc = U;
+    double p = p0;
+    const double dp = (dir == 0 ? settings.dp : -settings.dp);
+    if (dir == 0) record(p);
+    int steps = settings.max_steps / 2;
+    for (int s = 0; s < steps; ++s) {
+      const double pnext = p + dp;
+      if (pnext < settings.p_min || pnext > settings.p_max) break;
+      CycleCtx cc = c; cc.p = pnext;
+      set_phase(Uc); cc.pin_mode = c.pin_mode; cc.phase_ref = c.phase_ref; cc.phase_dir = c.phase_dir;
+      std::vector<double> Un = Uc;
+      if (!cyc_newton(cc, &Un, settings.newton_iters, settings.newton_tol)) break;
+      /* sanity: period must stay positive and finite */
+      if (!(Un[M*n] > 0) || !std::isfinite(Un[M*n])) break;
+      Uc = Un; p = pnext; c = cc;
+      CycleSample smp; smp.p = p; smp.period = Uc[M*n];
+      cyc_amp(Uc, n, M, &smp.amplitude, &smp.min0, &smp.max0);
+      smp.fold_test = cycle_fold_test(c, Uc);
+      out.samples.push_back(smp);
+    }
+  }
+  /* sort samples by parameter for a clean plot */
+  std::sort(out.samples.begin(), out.samples.end(),
+            [](const CycleSample &a, const CycleSample &b){ return a.p < b.p; });
+  /* mark fold-of-cycles (LPC). Two signatures: (a) a sign change of the fold
+   * test between adjacent samples, or (b) the branch TERMINATES at a fold —
+   * the cycle solver can't step past a saddle-node of cycles, so the test
+   * collapses toward zero at the last reachable sample. We flag an endpoint
+   * whose |fold_test| is far below the branch's typical magnitude. */
+  for (std::size_t i = 1; i < out.samples.size(); ++i) {
+    const double a = out.samples[i-1].fold_test, b = out.samples[i].fold_test;
+    if (std::isfinite(a) && std::isfinite(b) && a * b < 0.0)
+      out.samples[std::fabs(a) < std::fabs(b) ? i-1 : i].is_fold = true;
+  }
+  if (out.samples.size() >= 4) {
+    /* median |fold_test| as the branch's scale */
+    std::vector<double> mags;
+    for (const auto &s : out.samples) if (std::isfinite(s.fold_test)) mags.push_back(std::fabs(s.fold_test));
+    if (!mags.empty()) {
+      std::sort(mags.begin(), mags.end());
+      const double med = mags[mags.size()/2];
+      /* check both endpoints (the branch stops at a fold) */
+      for (std::size_t e : {std::size_t(0), out.samples.size()-1}) {
+        const double f = std::fabs(out.samples[e].fold_test);
+        if (std::isfinite(f) && med > 0 && f < med * 1e-3)
+          out.samples[e].is_fold = true;
+      }
+    }
+  }
+  out.ok = out.samples.size() > 1;
+  out.message = out.ok ? ("traced " + std::to_string(out.samples.size()) + " cycles")
+                       : "could not continue the cycle";
+  return out;
+}
+
+/* Two-parameter fold-of-cycles (LPC) curve. For each q across [q_min,q_max] we
+ * build the single-parameter cycle model at that q, continue the cycle in p,
+ * and look for a fold-of-cycles (a sign change of the cycle fold test). The
+ * (p,q) where it occurs is one point of the LPC curve. The seed cycle from the
+ * previous q is reused as the next guess, so the locus is followed smoothly. */
+LPCCurve lpc_curve(const Model2 &m,
+                   const std::vector<std::vector<double>> &guess_points,
+                   double period_guess, double p0, double q0,
+                   const TwoParamSettings &settings, const CycleSettings &cyc) {
+  LPCCurve out;
+  const std::size_t n = m.n;
+  if (n < 2 || guess_points.size() < 4) { out.message = "need a 2+ D system and a cycle guess"; return out; }
+
+  const int nq = std::max(8, std::min(settings.max_points, 80));
+  std::vector<std::vector<double>> guess = guess_points;
+  double per = period_guess;
+  (void)q0; /* the seed cycle was simulated at q0; the scan covers [q_min,q_max] */
+
+  auto model_at_q = [&](double qfix) {
+    Model mm; mm.n = n;
+    mm.vector_field = [&m, qfix](const double *xx, double pp, double *fo, std::string *er) {
+      return m.vector_field(xx, pp, qfix, fo, er);
+    };
+    return mm;
+  };
+
+  for (int iq = 0; iq <= nq; ++iq) {
+    const double q = settings.q_min + (settings.q_max - settings.q_min) * (double)iq / nq;
+    Model mm = model_at_q(q);
+    CycleSettings cs = cyc;
+    cs.p_min = settings.p_min; cs.p_max = settings.p_max;
+    CycleBranch br = continue_limit_cycle(mm, guess, per, p0, cs);
+    if (!br.ok || br.samples.empty()) continue;
+    /* find the LPC sample on this branch */
+    for (const auto &smp : br.samples)
+      if (smp.is_fold) {
+        LPCPoint pt; pt.p = smp.p; pt.q = q; pt.period = smp.period; pt.amplitude = smp.amplitude;
+        out.points.push_back(pt);
+        break;
+      }
+    /* reseed the next q from the middle sample of this branch (keeps the guess
+     * close as the locus moves) and update period/p0 toward the LPC if found. */
+    const CycleSample &mid = br.samples[br.samples.size()/2];
+    per = mid.period; p0 = mid.p;
+  }
+  out.ok = out.points.size() >= 2;
+  out.message = out.ok ? ("traced " + std::to_string(out.points.size()) + " LPC points")
+                       : "no fold-of-cycles found in this (p,q) window (the cycle may not fold here)";
+  return out;
 }
 
 /* ---- Hopf first Lyapunov coefficient ------------------------------------ */
@@ -992,6 +2200,116 @@ bool hopf_first_lyapunov(const Model &m, const std::vector<double> &x, double p,
   Cplx g = cdot(pp, h1, n);
   *l1 = g.real() / (2.0 * w);
   *omega = w;
+  return true;
+}
+
+/* Bogdanov-Takens normal-form coefficients (a, b).
+ *
+ * At a BT point the Jacobian A has a DOUBLE-ZERO eigenvalue with a 2x2 Jordan
+ * block: right generalized eigenvectors q0, q1 with A q0 = 0, A q1 = q0; left
+ * p0, p1 with A^T p1 = 0, A^T p0 = p1, normalized <p1,q1>=<p0,q0>=1 (and the
+ * cross terms ~0). The planar BT normal form is
+ *      w0' = w1,
+ *      w1' = a w0^2 + b w0 w1 + ...,
+ * with (Kuznetsov, Elements of Applied Bifurcation Theory, 3rd ed., eq. 8.61):
+ *      a = (1/2) <p1, B(q0,q0)>,
+ *      b = <p0, B(q0,q0)> + <p1, B(q0,q1)>,
+ * where B is the bilinear form of second derivatives. The non-degeneracy of the
+ * BT bifurcation requires a != 0 and b != 0. Computed at a point that is assumed
+ * to already be (numerically) a BT point. */
+bool bt_normal_form(const Model &m, const std::vector<double> &x, double p,
+                    double *a_out, double *b_out, std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 2 || x.size() < n) { if (err) *err = "need a 2+ dim system"; return false; }
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+  std::vector<double> JT(n * n);
+  for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < n; ++j) JT[i*n+j] = J[j*n+i];
+
+  /* right null vector q0 (A q0 = 0) and left null vector p1 (A^T p1 = 0) via
+   * inverse iteration on the regularized matrices. */
+  auto inv_null = [&](const std::vector<double> &Min, std::vector<double> *vec) -> bool {
+    std::vector<double> M = Min;
+    for (std::size_t i = 0; i < n; ++i) M[i*n+i] += 1e-9;
+    std::vector<double> v(n, 1.0/std::sqrt((double)n));
+    for (int it = 0; it < 200; ++it) {
+      std::vector<double> nv;
+      if (!solve_linear(M, v, &nv)) return false;
+      double nrm = 0; for (double z : nv) nrm += z*z; nrm = std::sqrt(nrm);
+      if (nrm < 1e-300) return false;
+      for (double &z : nv) z /= nrm;
+      v = nv;
+    }
+    *vec = v; return true;
+  };
+  std::vector<double> q0, p1;
+  if (!inv_null(J, &q0)) { if (err) *err = "BT: q0 solve failed"; return false; }
+  if (!inv_null(JT, &p1)) { if (err) *err = "BT: p1 solve failed"; return false; }
+
+  auto dot = [&](const std::vector<double> &u, const std::vector<double> &v) {
+    double s = 0; for (std::size_t i = 0; i < n; ++i) s += u[i]*v[i]; return s;
+  };
+  { double qn = std::sqrt(dot(q0,q0)); if (qn < 1e-300) { if(err)*err="BT: q0 zero"; return false; } for (double &z:q0) z/=qn; }
+  { double pn = std::sqrt(dot(p1,p1)); if (pn < 1e-300) { if(err)*err="BT: p1 zero"; return false; } for (double &z:p1) z/=pn; }
+  /* fix sign conventions for reproducibility: largest-magnitude component of q0
+   * positive, and <p1,...> oriented so the chain scales consistently. */
+  { std::size_t im = 0; for (std::size_t i = 1; i < n; ++i) if (std::fabs(q0[i]) > std::fabs(q0[im])) im = i;
+    if (q0[im] < 0) for (double &z : q0) z = -z; }
+  { std::size_t im = 0; for (std::size_t i = 1; i < n; ++i) if (std::fabs(p1[i]) > std::fabs(p1[im])) im = i;
+    if (p1[im] < 0) for (double &z : p1) z = -z; }
+
+  /* Generalized eigenvectors via BORDERED systems. To make the bordered matrix
+   * nonsingular for a defective A, border the A-block with the LEFT null vector
+   * in the extra column and the RIGHT null vector in the extra row (Govaerts,
+   * Numerical Methods for Bifurcations..., the standard bordering):
+   *   [ A    p1 ] [q1]   [q0]        [ A^T  q0 ] [p0]   [p1]
+   *   [ q0^T 0  ] [s ] = [0 ]   and  [ p1^T 0  ] [s ] = [0 ].
+   * The q0^T row fixes the gauge <q0,q1>=0; p1 in the column spans coker A. */
+  auto bordered_solve = [&](const std::vector<double> &A, const std::vector<double> &bord_col,
+                            const std::vector<double> &bord_row, const std::vector<double> &rhs_top,
+                            std::vector<double> *sol) -> bool {
+    const std::size_t N = n + 1;
+    std::vector<double> M(N * N, 0.0), r(N, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+      for (std::size_t j = 0; j < n; ++j) M[i*N+j] = A[i*n+j];
+      M[i*N+n] = bord_col[i];
+      r[i] = rhs_top[i];
+    }
+    for (std::size_t j = 0; j < n; ++j) M[n*N+j] = bord_row[j];
+    M[n*N+n] = 0.0; r[n] = 0.0;
+    std::vector<double> z;
+    if (!solve_linear(M, r, &z)) return false;
+    sol->assign(z.begin(), z.begin() + n);
+    return true;
+  };
+
+  std::vector<double> q1, p0;
+  /* q1: A q1 = q0, border col = p1 (coker A), row = q0 (gauge <q0,q1>=0) */
+  if (!bordered_solve(J, p1, q0, q0, &q1)) { if (err) *err = "BT: q1 bordered solve failed"; return false; }
+  /* p0: A^T p0 = p1, border col = q0 (coker A^T), row = p1 (gauge <p1,p0>=0) */
+  if (!bordered_solve(JT, q0, p1, p1, &p0)) { if (err) *err = "BT: p0 bordered solve failed"; return false; }
+
+  /* Jordan-chain normalization (Kuznetsov 8.3.2, eq. 8.61): scale the chains so
+   * that <p1,q1> = 1 and <p0,q0> = 1. */
+  double s_q = dot(p1, q1);
+  if (std::fabs(s_q) < 1e-300) { if (err) *err = "BT: degenerate Jordan chain (<p1,q1>=0)"; return false; }
+  for (double &z : q1) z /= s_q;     /* now <p1,q1> = 1 */
+  double s_p = dot(p0, q0);
+  if (std::fabs(s_p) < 1e-300) { if (err) *err = "BT: degenerate (<p0,q0>=0)"; return false; }
+  for (double &z : p0) z /= s_p;     /* now <p0,q0> = 1 */
+
+  /* bilinear form B(.,.) of second derivatives */
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=1e-3;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+  std::vector<double> Bq0q0, Bq0q1;
+  if (!B_real(c, q0, q0, &Bq0q0)) return false;
+  if (!B_real(c, q0, q1, &Bq0q1)) return false;
+
+  const double a = 0.5 * dot(p1, Bq0q0);
+  const double b = dot(p0, Bq0q0) + dot(p1, Bq0q1);
+  if (a_out) *a_out = a;
+  if (b_out) *b_out = b;
   return true;
 }
 
@@ -1348,6 +2666,336 @@ LyapunovResult lyapunov_spectrum(const Model &m, const std::vector<double> &x0,
   return R;
 }
 
+/* ---- Homoclinic orbits: truncated BVP with projection BCs --------------- */
+namespace {
+
+/* Left eigenvectors of A split by the sign of the real part of the eigenvalue.
+ * The rows of `stable_left` span the stable subspace of A^T (= orthogonal
+ * complement of A's UNSTABLE subspace); rows of `unstable_left` span the
+ * unstable subspace of A^T (= orthogonal complement of A's STABLE subspace).
+ * Real vectors: a complex pair contributes its real and imaginary parts. Built
+ * by inverse iteration on (A^T - lambda I) using the already-computed spectrum.
+ * Returns false if the equilibrium is not hyperbolic (an eigenvalue on the
+ * imaginary axis) since the projection BCs are then undefined. */
+bool saddle_left_subspaces(const std::vector<double> &A, std::size_t n,
+                           std::vector<std::vector<double>> *stable_left,
+                           std::vector<std::vector<double>> *unstable_left,
+                           int *n_unstable, std::string *err) {
+  std::vector<Cplx> ev;
+  if (!eigenvalues(A, n, &ev)) { if (err) *err = "eigenvalue failure at saddle"; return false; }
+  /* A^T */
+  std::vector<double> AT(n * n);
+  for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < n; ++j) AT[i*n+j] = A[j*n+i];
+
+  stable_left->clear(); unstable_left->clear();
+  int nu = 0;
+  std::vector<bool> done(ev.size(), false);
+  for (std::size_t k = 0; k < ev.size(); ++k) {
+    if (done[k]) continue;
+    const double re = ev[k].real(), im = ev[k].imag();
+    if (std::fabs(re) < 1e-7) { if (err) *err = "saddle is not hyperbolic (eigenvalue on imaginary axis)"; return false; }
+
+    /* inverse iteration on (A^T - lambda I) for the left eigenvector */
+    std::vector<Cplx> M(n * n);
+    for (std::size_t i = 0; i < n; ++i)
+      for (std::size_t j = 0; j < n; ++j)
+        M[i*n+j] = Cplx(AT[i*n+j], 0.0) - ((i==j) ? Cplx(re, im) : Cplx(0,0));
+    for (std::size_t i = 0; i < n; ++i) M[i*n+i] += Cplx(1e-9, 0); /* regularize */
+    std::vector<Cplx> v(n, Cplx(1.0/std::sqrt((double)n), 0)); v[0] = Cplx(1,0);
+    for (int it = 0; it < 120; ++it) {
+      std::vector<Cplx> nv;
+      if (!solve_complex(M, v, n, &nv)) { if (err) *err = "left eigenvector solve failed"; return false; }
+      double nrm = 0; for (auto &z : nv) nrm += std::norm(z); nrm = std::sqrt(nrm);
+      if (nrm < 1e-300) break;
+      for (auto &z : nv) z /= nrm;
+      v = nv;
+    }
+    auto &dst = (re > 0) ? *unstable_left : *stable_left;
+    if (std::fabs(im) < 1e-9) {
+      std::vector<double> rv(n); for (std::size_t i = 0; i < n; ++i) rv[i] = v[i].real();
+      dst.push_back(rv);
+      if (re > 0) nu += 1;
+      done[k] = true;
+    } else {
+      /* complex pair -> real & imaginary parts span the 2-D real subspace */
+      std::vector<double> rr(n), ri(n);
+      for (std::size_t i = 0; i < n; ++i) { rr[i] = v[i].real(); ri[i] = v[i].imag(); }
+      dst.push_back(rr); dst.push_back(ri);
+      if (re > 0) nu += 2;
+      done[k] = true;
+      /* mark the conjugate as done */
+      for (std::size_t j = k+1; j < ev.size(); ++j)
+        if (!done[j] && std::fabs(ev[j].real() - re) < 1e-7 && std::fabs(ev[j].imag() + im) < 1e-7) { done[j] = true; break; }
+    }
+  }
+  if (n_unstable) *n_unstable = nu;
+  return true;
+}
+
+} /* anonymous namespace */
+
+HomoclinicResult solve_homoclinic(const Model &m,
+                                  const std::vector<double> &x0_guess, double p,
+                                  const std::vector<std::vector<double>> &seed_orbit,
+                                  const HomoclinicSettings &settings) {
+  HomoclinicResult R;
+  const std::size_t n = m.n;
+  const int M = std::max(8, settings.mesh);
+  if (x0_guess.size() != n || seed_orbit.size() < 4) { R.message = "bad input to solve_homoclinic"; return R; }
+
+  /* 1. Refine the saddle equilibrium and get its Jacobian + left subspaces. */
+  std::vector<double> x0 = x0_guess; std::string err;
+  if (!correct_equilibrium(m, &x0, p, 60, 1e-11, &err)) { R.message = "saddle did not converge: " + err; return R; }
+  std::vector<double> A;
+  if (!finite_diff_jacobian(m, x0.data(), p, &A, &err, 1e-7)) { R.message = "Jacobian failed at saddle"; return R; }
+  std::vector<std::vector<double>> Ls, Lu; int nu = 0;
+  if (!saddle_left_subspaces(A, n, &Ls, &Lu, &nu, &err)) { R.message = err; return R; }
+  R.saddle = x0; R.n_unstable = nu;
+  if (nu == 0 || nu == (int)n) { R.message = "equilibrium is a sink or source, not a saddle (no homoclinic)"; return R; }
+
+  /* 2. Initial guess: resample the seed orbit onto mesh+1 points. The seed is
+   *    assumed to be ordered along the orbit and sampled ~uniformly in time
+   *    (e.g. from a fixed-step simulation), so we resample by INDEX fraction to
+   *    match the collocation's uniform-in-tau grid. (Arclength resampling would
+   *    misalign the phase condition's midpoint with the orbit's midpoint.) */
+  const int Np = (int)seed_orbit.size();
+  std::vector<double> U((size_t)(M+1)*n + 1, 0.0);   /* unknowns: orbit (M+1)*n, then T */
+  auto resample = [&](double s, std::vector<double> &xo) {  /* s in [0,1] index fraction */
+    double f = s * (Np - 1); int i = (int)std::floor(f); if (i > Np-2) i = Np-2; if (i < 0) i = 0;
+    double t = f - i;
+    xo.resize(n); for (std::size_t k = 0; k < n; ++k) xo[k] = (1-t)*seed_orbit[i][k] + t*seed_orbit[i+1][k];
+  };
+  std::vector<double> xtmp(n);
+  for (int j = 0; j <= M; ++j) { resample((double)j/M, xtmp); for (std::size_t k = 0; k < n; ++k) U[(size_t)j*n+k] = xtmp[k]; }
+  /* arclength of the seed, for a default time scale only */
+  double L = 0.0; for (int i = 1; i < Np; ++i) { double d=0; for (std::size_t k=0;k<n;k++){double dd=seed_orbit[i][k]-seed_orbit[i-1][k]; d+=dd*dd;} L += std::sqrt(d); }
+  double Tguess = settings.T;
+  if (Tguess <= 0) Tguess = std::max(1.0, 0.5 * L);
+  U[(size_t)(M+1)*n] = Tguess;
+
+  /* phase condition (Poincare section): the orbit midpoint must lie on the
+   * hyperplane through the seed midpoint normal to the seed velocity there,
+   *   < x(tau_mid) - x_seed_mid , f(x_seed_mid) > = 0.
+   * This pins the time-translation freedom without forcing a coordinate value
+   * and converges fast for the single-orbit solve. (NOTE: a pure section also
+   * admits the trivial collapse onto the saddle, which is why the two-parameter
+   * continuation below is still experimental.) */
+  std::vector<double> xmidseed(n); resample(0.5, xmidseed);
+  std::vector<double> phase_normal(n);
+  { std::string e; m.vector_field(xmidseed.data(), p, phase_normal.data(), &e); }
+  std::vector<double> phase_ref = xmidseed;
+
+  /* 3. Residual of the truncated BVP.
+   *    F has M*n collocation eqs + n_s + n_u boundary eqs + 1 phase eq. */
+  auto field = [&](const double *x, std::vector<double> &f) -> bool {
+    f.resize(n); std::string e; return m.vector_field(x, p, f.data(), &e);
+  };
+  const int n_s = (int)Ls.size(), n_u = (int)Lu.size();
+  const int NF = M*(int)n + n_s + n_u + 1;
+  const int NV = (M+1)*(int)n + 1;
+  auto residual = [&](const std::vector<double> &Uv, std::vector<double> *Fo) -> bool {
+    Fo->assign(NF, 0.0);
+    const double T = Uv[(size_t)(M+1)*n];
+    std::vector<double> fi(n), fj(n), xi(n), xj(n);
+    /* trapezoidal collocation of x' = 2T f(x) on tau in [0,1], M intervals */
+    for (int i = 0; i < M; ++i) {
+      for (std::size_t k = 0; k < n; ++k) { xi[k]=Uv[(size_t)i*n+k]; xj[k]=Uv[(size_t)(i+1)*n+k]; }
+      if (!field(xi.data(), fi)) return false;
+      if (!field(xj.data(), fj)) return false;
+      const double h = 1.0/(double)M;
+      for (std::size_t k = 0; k < n; ++k)
+        (*Fo)[(size_t)i*n+k] = xj[k]-xi[k] - h*T*(fi[k]+fj[k]); /* 2T*0.5*(fi+fj) = T*(fi+fj) */
+    }
+    int row = M*(int)n;
+    /* left BC: (x(0)-x0) orthogonal to stable left-eigvecs => in unstable subsp */
+    for (int r = 0; r < n_s; ++r) {
+      double s = 0; for (std::size_t k = 0; k < n; ++k) s += (Uv[k]-x0[k])*Ls[r][k];
+      (*Fo)[row++] = s;
+    }
+    /* right BC: (x(1)-x0) orthogonal to unstable left-eigvecs => in stable subsp */
+    for (int r = 0; r < n_u; ++r) {
+      double s = 0; for (std::size_t k = 0; k < n; ++k) s += (Uv[(size_t)M*n+k]-x0[k])*Lu[r][k];
+      (*Fo)[row++] = s;
+    }
+    /* phase: orbit midpoint on the seed's Poincare section */
+    { double s = 0; for (std::size_t k = 0; k < n; ++k) s += (Uv[(size_t)(M/2)*n+k]-phase_ref[k])*phase_normal[k];
+      (*Fo)[row++] = s; }
+    return true;
+  };
+
+  /* 4. Gauss-Newton with finite-difference Jacobian (NF x NV, NF<=NV). Solve
+   *    the normal equations (J^T J) dU = -J^T F with a little regularization
+   *    (the system is rectangular: one fewer equation than unknowns, the extra
+   *    freedom is the orbit's overall position which the phase pins softly). */
+  std::vector<double> F(NF), Uv = U;
+  double resn = 0;
+  int step = 0;
+  for (; step < settings.newton_iters; ++step) {
+    if (!residual(Uv, &F)) { R.message = "field eval failed during Newton"; return R; }
+    resn = 0; for (double f : F) resn += f*f; resn = std::sqrt(resn);
+    if (resn < settings.newton_tol) break;
+
+    /* finite-difference Jacobian J (NF x NV) */
+    std::vector<double> J((size_t)NF*NV, 0.0), F2(NF);
+    std::vector<double> Up = Uv;
+    for (int c = 0; c < NV; ++c) {
+      const double save = Up[c];
+      const double dh = 1e-7 * (std::fabs(save) + 1e-3);
+      Up[c] = save + dh;
+      if (!residual(Up, &F2)) { Up[c] = save; continue; }
+      Up[c] = save;
+      for (int r = 0; r < NF; ++r) J[(size_t)r*NV + c] = (F2[r]-F[r])/dh;
+    }
+    if (!settings.free_T) {
+      /* freeze T: zero its whole column so the normal equations give dT ~ 0 */
+      for (int r = 0; r < NF; ++r) J[(size_t)r*NV + (NV-1)] = 0.0;
+    }
+    /* normal equations: (J^T J + mu I) dU = -J^T F */
+    std::vector<double> JTJ((size_t)NV*NV, 0.0), JTF(NV, 0.0);
+    for (int a = 0; a < NV; ++a) {
+      double g = 0; for (int r = 0; r < NF; ++r) g += J[(size_t)r*NV+a]*F[r];
+      JTF[a] = g;
+      for (int b = 0; b < NV; ++b) {
+        double s = 0; for (int r = 0; r < NF; ++r) s += J[(size_t)r*NV+a]*J[(size_t)r*NV+b];
+        JTJ[(size_t)a*NV+b] = s;
+      }
+    }
+    const double mu = 1e-9;
+    for (int a = 0; a < NV; ++a) JTJ[(size_t)a*NV+a] += mu;
+    std::vector<double> dU, rhs(NV);
+    for (int a = 0; a < NV; ++a) rhs[a] = -JTF[a];
+    if (!solve_linear(JTJ, rhs, &dU)) { R.message = "Newton linear solve failed"; break; }
+    double dn = 0; for (double v : dU) dn += v*v; dn = std::sqrt(dn);
+    double damp = dn > 0.5 ? 0.5/dn : 1.0;   /* damp big steps */
+    for (int a = 0; a < NV; ++a) Uv[a] += damp*dU[a];
+    if (Uv[(size_t)(M+1)*n] < 1e-3) Uv[(size_t)(M+1)*n] = 1e-3; /* keep T positive */
+  }
+
+  /* 5. Pack the result. */
+  R.newton_residual = resn; R.newton_steps = step;
+  R.T = Uv[(size_t)(M+1)*n];
+  R.orbit.assign(M+1, std::vector<double>(n));
+  R.tau.assign(M+1, 0.0);
+  double amp = 0;
+  for (int j = 0; j <= M; ++j) {
+    R.tau[j] = (double)j/M;
+    double dev = 0;
+    for (std::size_t k = 0; k < n; ++k) { R.orbit[j][k] = Uv[(size_t)j*n+k]; double d = Uv[(size_t)j*n+k]-x0[k]; dev += d*d; }
+    amp = std::max(amp, std::sqrt(dev));
+  }
+  R.amplitude = amp;
+  R.ok = (resn < 1e-5);
+  R.message = R.ok ? ("converged homoclinic orbit (residual " + std::to_string(resn) + ", T=" + std::to_string(R.T) + ")")
+                   : ("did not fully converge (residual " + std::to_string(resn) + ")");
+  return R;
+}
+
+HomoclinicCurve continue_homoclinic(const Model2 &m2,
+                                    const std::vector<double> &x0_guess,
+                                    double p0, double q0,
+                                    const std::vector<std::vector<double>> &seed_orbit,
+                                    const HomoclinicContSettings &settings) {
+  HomoclinicCurve C;
+  const std::size_t n = m2.n;
+  if (x0_guess.size() != n || seed_orbit.size() < 4) { C.message = "bad input to continue_homoclinic"; return C; }
+
+  /* wrap the two-parameter field as a one-parameter Model at a frozen q */
+  auto model_at_q = [&](double q) {
+    Model m; m.n = n;
+    m.vector_field = [&m2, q](const double *x, double p, double *f, std::string *e) {
+      return m2.vector_field(x, p, q, f, e);
+    };
+    return m;
+  };
+
+  /* At fixed q, find p where the BVP homoclinic closes (residual ~0). Because
+   * the residual is a smooth, roughly-V-shaped function of p with its minimum
+   * (~0) at the homoclinic, we use a short SECANT iteration on p driving the
+   * residual down, re-using the current seed orbit. A handful of BVP solves per
+   * q-step (vs a full scan) keeps continuation affordable. */
+  auto solve_at_q = [&](double q, double p_guess,
+                        const std::vector<std::vector<double>> &seed,
+                        HomoclinicResult *out_best, double *out_p) -> bool {
+    Model m = model_at_q(q);
+    auto resid_at_p = [&](double p, HomoclinicResult *R) -> double {
+      HomoclinicSettings bs = settings.bvp;
+      *R = solve_homoclinic(m, x0_guess, p, seed, bs);
+      if (R->orbit.empty()) return 1e9;
+      return R->newton_residual;
+    };
+    /* Probe p_guess and two neighbours to estimate the local slope of the
+     * residual, then take damped secant steps toward the minimum. */
+    const double hp = std::max(1e-4, 0.25 * settings.dq);
+    double bestp = p_guess, bestr = 1e18; HomoclinicResult bestR;
+    double pa = p_guess;
+    HomoclinicResult Ra; double ra = resid_at_p(pa, &Ra);
+    if (ra < bestr) { bestr = ra; bestp = pa; bestR = Ra; }
+    for (int it = 0; it < 8 && bestr > 1e-7; ++it) {
+      /* numerical derivative of residual wrt p around the current best */
+      HomoclinicResult Rp, Rm; double rp = resid_at_p(bestp + hp, &Rp), rm = resid_at_p(bestp - hp, &Rm);
+      if (rp < bestr) { bestr = rp; bestp = bestp + hp; bestR = Rp; }
+      if (rm < bestr) { bestr = rm; bestp = bestp - hp; bestR = Rm; }
+      double g = (rp - rm) / (2 * hp);          /* d resid / d p   */
+      double gg = (rp - 2 * ra + rm) / (hp * hp); /* curvature      */
+      if (std::fabs(gg) < 1e-12) break;
+      double dp = -g / gg;                       /* Newton step on the residual min */
+      if (dp > 5 * settings.dq) dp = 5 * settings.dq;
+      if (dp < -5 * settings.dq) dp = -5 * settings.dq;
+      double pn = bestp + dp;
+      HomoclinicResult Rn; double rn = resid_at_p(pn, &Rn);
+      ra = rn; pa = pn;
+      if (rn < bestr) { bestr = rn; bestp = pn; bestR = Rn; }
+      else break; /* no improvement: stop */
+    }
+    *out_best = bestR; *out_p = bestp;
+    /* Accept only a GENUINE loop: small residual AND a non-trivial amplitude
+     * (the projection BCs + section also admit the orbit collapsing onto the
+     * saddle, which must be rejected). */
+    return bestr < 5e-4 && bestR.amplitude > 1e-3;
+  };
+
+  auto orbit_to_seed = [&](const HomoclinicResult &R) {
+    return R.orbit;   /* the converged orbit reseeds the next step */
+  };
+
+  /* record the starting point first */
+  {
+    HomoclinicResult R0; double pfit = p0;
+    if (solve_at_q(q0, p0, seed_orbit, &R0, &pfit)) {
+      HomoclinicCurvePoint pt; pt.p = pfit; pt.q = q0; pt.T = R0.T; pt.amplitude = R0.amplitude; pt.residual = R0.newton_residual;
+      C.points.push_back(pt);
+      if (settings.store_orbits) C.orbits.push_back(R0.orbit);
+    } else {
+      C.message = "could not establish a homoclinic at the starting (p,q)";
+      return C;
+    }
+  }
+
+  /* trace in +/- q directions, natural continuation: seed each step from the
+   * previous converged orbit and predict p by the last fitted value. */
+  for (int dir = 0; dir < (settings.both_directions ? 2 : 1); ++dir) {
+    const double sgn = (dir == 0) ? 1.0 : -1.0;
+    double q = q0, p = C.points.front().p;
+    std::vector<std::vector<double>> seed = seed_orbit;
+    HomoclinicResult Rprev;
+    { double pf; solve_at_q(q0, p, seed, &Rprev, &pf); p = pf; seed = orbit_to_seed(Rprev); }
+    for (int s = 0; s < settings.max_steps; ++s) {
+      q += sgn * settings.dq;
+      if (q < settings.q_min || q > settings.q_max) break;
+      HomoclinicResult R; double pfit = p;
+      if (!solve_at_q(q, p, seed, &R, &pfit)) break;   /* lost the curve */
+      HomoclinicCurvePoint pt; pt.p = pfit; pt.q = q; pt.T = R.T; pt.amplitude = R.amplitude; pt.residual = R.newton_residual;
+      C.points.push_back(pt);
+      if (settings.store_orbits) C.orbits.push_back(R.orbit);
+      p = pfit; seed = orbit_to_seed(R);
+    }
+  }
+  C.ok = C.points.size() > 1;
+  C.message = C.ok ? ("traced " + std::to_string(C.points.size()) + " homoclinic points")
+                   : "could not trace the homoclinic curve";
+  return C;
+}
+
 /* ---- Basins of attraction ------------------------------------ */
 BasinResult compute_basins(const std::function<bool(double, double, double *, double *)> &advance,
                            const BasinOptions &opt) {
@@ -1430,7 +3078,103 @@ BasinResult compute_basins(const std::function<bool(double, double, double *, do
   return R;
 }
 
-/* ---- Box-counting fractal dimension --------------------------- */
+BasinResult compute_basins_mt(const std::function<AdvanceFn(int tid)> &make_advance,
+                              const BasinOptions &opt) {
+  BasinResult R;
+  const int W = std::max(2, opt.width), H = std::max(2, opt.height);
+  R.width = W; R.height = H;
+  R.cell_attractor.assign((size_t)W * H, -1);
+  R.cell_speed.assign((size_t)W * H, 0.0f);
+  const double R2 = opt.diverge_r * opt.diverge_r;
+  const double clus2 = opt.cluster_tol * opt.cluster_tol;
+
+  /* Phase 1 (parallel): integrate each cell independently, recording endpoint,
+   * status and step count. Each worker thread owns a private advance (private
+   * eval scratch) so there is no shared mutable state in the hot loop. */
+  struct CellOut { double ex = 0, ey = 0; long steps = 0; int state = 1; }; /* 0 settled,1 diverged,2 nonconv */
+  std::vector<CellOut> cells((size_t)W * H);
+
+  unsigned hw = std::thread::hardware_concurrency();
+  unsigned nthreads = (hw < 2 || H < 8) ? 1u : std::min<unsigned>(hw, (unsigned)H);
+
+  auto do_rows = [&](int tid, int j0, int j1) {
+    AdvanceFn advance = make_advance(tid);
+    for (int j = j0; j < j1; ++j) {
+      const double y0 = opt.ymin + (opt.ymax - opt.ymin) * (double)j / (H - 1);
+      for (int i = 0; i < W; ++i) {
+        const double x0 = opt.xmin + (opt.xmax - opt.xmin) * (double)i / (W - 1);
+        double x = x0, y = y0;
+        long steps = 0; bool diverged = false, settled = false;
+        double px = x, py = y; const long stride = 8;
+        for (; steps < opt.max_steps; ++steps) {
+          double nx = x, ny = y;
+          if (!advance(x, y, &nx, &ny)) { diverged = true; break; }
+          if (!std::isfinite(nx) || !std::isfinite(ny) || nx * nx + ny * ny > R2) { diverged = true; break; }
+          x = nx; y = ny;
+          if ((steps % stride) == (stride - 1)) {
+            const double drift = std::fabs(x - px) + std::fabs(y - py);
+            if (drift < opt.settle_tol) settled = true;
+            px = x; py = y;
+            if (settled) break;
+          }
+        }
+        CellOut &c = cells[(size_t)j * W + i];
+        c.ex = x; c.ey = y; c.steps = steps;
+        c.state = diverged ? 1 : (settled ? 0 : 2);
+      }
+    }
+  };
+
+  if (nthreads <= 1) {
+    do_rows(0, 0, H);
+  } else {
+    std::vector<std::thread> pool;
+    pool.reserve(nthreads);
+    int per = (H + (int)nthreads - 1) / (int)nthreads;
+    for (unsigned t = 0; t < nthreads; ++t) {
+      int j0 = (int)t * per, j1 = std::min(H, j0 + per);
+      if (j0 >= j1) break;
+      pool.emplace_back(do_rows, (int)t, j0, j1);
+    }
+    for (auto &th : pool) th.join();
+  }
+
+  /* Phase 2 (serial): cluster endpoints into attractors with deterministic
+   * labels (identical to the serial compute_basins). */
+  for (int j = 0; j < H; ++j) {
+    for (int i = 0; i < W; ++i) {
+      const size_t idx = (size_t)j * W + i;
+      const CellOut &c = cells[idx];
+      if (c.state == 1) { R.cell_attractor[idx] = -1; ++R.n_diverged; continue; }
+      if (c.state == 2) { R.cell_attractor[idx] = -2; ++R.n_nonconvergent; continue; }
+      const double x = c.ex, y = c.ey;
+      int label = -1;
+      for (size_t a = 0; a < R.attractors.size(); ++a) {
+        const double dx = x - R.attractors[a].first, dy = y - R.attractors[a].second;
+        if (dx * dx + dy * dy < clus2) { label = (int)a; break; }
+      }
+      if (label < 0) {
+        if ((int)R.attractors.size() < opt.max_attractors) {
+          R.attractors.push_back({x, y});
+          label = (int)R.attractors.size() - 1;
+        } else {
+          double best = 1e300; int bi = -1;
+          for (size_t a = 0; a < R.attractors.size(); ++a) {
+            const double dx = x - R.attractors[a].first, dy = y - R.attractors[a].second;
+            const double d = dx * dx + dy * dy;
+            if (d < best) { best = d; bi = (int)a; }
+          }
+          label = bi;
+        }
+      }
+      R.cell_attractor[idx] = label;
+      ++R.n_converged;
+      R.cell_speed[idx] = (float)(1.0 - (double)c.steps / (double)opt.max_steps);
+    }
+  }
+  R.ok = true; R.message = "ok";
+  return R;
+}
 BoxCountResult box_counting_dimension(const std::vector<double> &xs,
                                       const std::vector<double> &ys,
                                       int n_levels) {

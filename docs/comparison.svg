@@ -1,0 +1,286 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1240" viewBox="0 0 1400 1240" font-family="'DejaVu Sans Mono','SFMono-Regular',Consolas,monospace">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#10151f"/>
+    </linearGradient>
+    <linearGradient id="dynsyscol" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b3a2e"/>
+      <stop offset="1" stop-color="#16302a"/>
+    </linearGradient>
+    <linearGradient id="hl" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd24d"/>
+      <stop offset="1" stop-color="#ff9b42"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2dd4bf" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <path d="M34 0H0V34" fill="none" stroke="#1c2530" stroke-width="1"/>
+    </pattern>
+    <filter id="soft"><feGaussianBlur stdDeviation="0.4"/></filter>
+  </defs>
+
+  <rect width="1400" height="1240" fill="url(#bg)"/>
+  <rect width="1400" height="1240" fill="url(#grid)"/>
+  <ellipse cx="250" cy="120" rx="520" ry="280" fill="url(#glow)"/>
+
+  <!-- ===== header ===== -->
+  <text x="60" y="78" font-family="Georgia,'Times New Roman',serif" font-size="46" fill="#f0f4f8" font-style="italic">dynsys</text>
+  <text x="232" y="78" font-family="Georgia,serif" font-size="26" fill="#7d8896">vs. the bifurcation-software landscape</text>
+  <rect x="62" y="92" width="190" height="3" fill="url(#hl)"/>
+  <text x="60" y="124" font-size="15" fill="#9aa6b2">An honest feature comparison. dynsys is a single self-contained native app; the others are mature, specialised research tools.</text>
+  <text x="60" y="146" font-size="13" fill="#67727e">Compiled from each project's documentation, 2024–2026. ● full   ◐ partial / via workaround   ○ not available</text>
+
+  <!-- ===== column headers ===== -->
+  <!-- columns: label area 0..560, then 5 tool columns -->
+  <g font-size="15">
+    <!-- dynsys highlighted column -->
+    <rect x="560" y="170" width="150" height="916" rx="6" fill="url(#dynsyscol)" stroke="#2f6b54" stroke-width="1.5"/>
+    <text x="635" y="200" text-anchor="middle" font-family="Georgia,serif" font-style="italic" font-size="21" fill="#7ee0c0">dynsys</text>
+    <text x="635" y="219" text-anchor="middle" font-size="11" fill="#6f9c8c">C++ · native GUI</text>
+
+    <text x="785" y="200" text-anchor="middle" font-size="18" fill="#cdd6e0">MatCont</text>
+    <text x="785" y="219" text-anchor="middle" font-size="11" fill="#67727e">MATLAB · GUI</text>
+
+    <text x="935" y="200" text-anchor="middle" font-size="18" fill="#cdd6e0">AUTO-07p</text>
+    <text x="935" y="219" text-anchor="middle" font-size="11" fill="#67727e">Fortran · CLI</text>
+
+    <text x="1085" y="200" text-anchor="middle" font-size="18" fill="#cdd6e0">XPPAUT</text>
+    <text x="1085" y="219" text-anchor="middle" font-size="11" fill="#67727e">C · GUI</text>
+
+    <text x="1235" y="200" text-anchor="middle" font-size="18" fill="#cdd6e0">PyDSTool</text>
+    <text x="1235" y="219" text-anchor="middle" font-size="11" fill="#67727e">Python · script</text>
+  </g>
+  <line x1="60" y1="234" x2="1340" y2="234" stroke="#2a3441" stroke-width="1.5"/>
+
+  <!-- ===== rows =====
+       Each row: y center. Marker glyphs centered at x = 635,785,935,1085,1235.
+       Encoding per row described in comments. -->
+  <g font-size="14.5" fill="#c4cdd8">
+    <!-- section: CORE -->
+    <text x="60" y="266" font-size="13" fill="#ffb454" letter-spacing="2">CONTINUATION &amp; BIFURCATIONS</text>
+
+    <!-- row helper: we draw text + 5 glyphs manually -->
+    <!-- Equilibrium continuation -->
+    <text x="60" y="296">Equilibrium / fixed-point continuation</text>
+    <text x="635" y="296" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="296" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="296" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="296" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="296" text-anchor="middle" fill="#7ee0c0">●</text>
+
+    <!-- Fold/Hopf codim-1 detection -->
+    <text x="60" y="324">Fold &amp; Hopf (codim-1) detection</text>
+    <text x="635" y="324" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="324" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="324" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="324" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="324" text-anchor="middle" fill="#7ee0c0">●</text>
+
+    <!-- Codim-1 normal form coefficients -->
+    <text x="60" y="352">Codim-1 normal-form coefficients (l1, fold a)</text>
+    <text x="635" y="352" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="352" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="352" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="352" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="352" text-anchor="middle" fill="#d98c54">◐</text>
+
+    <!-- Codim-2 detection on equilibrium curves -->
+    <text x="60" y="380">Codim-2 on equilibrium curves (BT, cusp, GH)</text>
+    <text x="635" y="380" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="380" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="380" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="380" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="380" text-anchor="middle" fill="#d98c54">◐</text>
+
+    <!-- Branch points + switching -->
+    <text x="60" y="408">Branch points + branch switching</text>
+    <text x="635" y="408" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="408" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="408" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="408" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="408" text-anchor="middle" fill="#d98c54">◐</text>
+
+    <!-- Two-parameter codim-1 curves of equilibria -->
+    <text x="60" y="436">Two-parameter fold / Hopf curves</text>
+    <text x="635" y="436" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="436" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="436" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="436" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="436" text-anchor="middle" fill="#d98c54">◐</text>
+
+    <!-- Codim-2 on the two-parameter curves -->
+    <text x="60" y="464">Codim-2 points on the two-parameter curves</text>
+    <text x="635" y="464" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="464" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="464" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="464" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="464" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- section: CYCLES -->
+    <text x="60" y="502" font-size="13" fill="#ffb454" letter-spacing="2">LIMIT CYCLES</text>
+
+    <!-- Limit-cycle continuation (collocation) -->
+    <text x="60" y="532">Limit-cycle continuation (collocation BVP)</text>
+    <text x="635" y="532" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="532" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="532" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="532" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="532" text-anchor="middle" fill="#7ee0c0">●</text>
+
+    <!-- Fold of cycles (LPC) in two params -->
+    <text x="60" y="560">Fold-of-cycles (LPC) curve in two parameters</text>
+    <text x="635" y="560" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="560" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="560" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="560" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="560" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Period-doubling / torus / NS of cycles -->
+    <text x="60" y="588">Period-doubling / Neimark–Sacker / torus of cycles</text>
+    <text x="635" y="588" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="785" y="588" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="588" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="588" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="588" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Periodic normal forms / codim-2 of cycles -->
+    <text x="60" y="616">Periodic normal forms &amp; codim-2 of cycles</text>
+    <text x="635" y="616" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="785" y="616" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="616" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="616" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="616" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Homoclinic / heteroclinic continuation -->
+    <text x="60" y="644">Homoclinic / heteroclinic continuation</text>
+    <text x="635" y="644" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="785" y="644" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="644" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="644" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="644" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Phase response curves -->
+    <text x="60" y="672">Phase response curves</text>
+    <text x="635" y="672" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="785" y="672" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="672" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="672" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="672" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- section: EXACT / SYMBOLIC -->
+    <text x="60" y="710" font-size="13" fill="#ffb454" letter-spacing="2">EXACT / SYMBOLIC &amp; SIMULATION</text>
+
+    <!-- Exact symbolic equilibria -->
+    <text x="60" y="740">Exact symbolic equilibria (CAS, rational arithmetic)</text>
+    <text x="635" y="740" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="740" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="935" y="740" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="740" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="740" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Certified / exact eigenvalues + Routh-Hurwitz -->
+    <text x="60" y="768">Exact eigenvalues + Routh–Hurwitz (proof-carrying)</text>
+    <text x="635" y="768" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="768" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="935" y="768" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="768" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="768" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Time integration / phase portraits -->
+    <text x="60" y="796">Interactive simulation &amp; phase portraits</text>
+    <text x="635" y="796" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="796" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="796" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="796" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="796" text-anchor="middle" fill="#7ee0c0">●</text>
+
+    <!-- Lyapunov spectrum / chaos -->
+    <text x="60" y="824">Lyapunov spectrum, basins, box-counting dimension</text>
+    <text x="635" y="824" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="824" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="935" y="824" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="824" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="824" text-anchor="middle" fill="#d98c54">◐</text>
+
+    <!-- Fractals + logistic-Mandelbrot bridge -->
+    <text x="60" y="852">Fractals + logistic↔Mandelbrot bridge</text>
+    <text x="635" y="852" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="852" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="935" y="852" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="852" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1235" y="852" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Maps + IFS -->
+    <text x="60" y="880">Iterated maps &amp; IFS (chaos game)</text>
+    <text x="635" y="880" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="880" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="880" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="880" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="880" text-anchor="middle" fill="#d98c54">◐</text>
+
+    <!-- DDEs -->
+    <text x="60" y="908">Delay differential equations (DDEs)</text>
+    <text x="635" y="908" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="785" y="908" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="935" y="908" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="908" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="908" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- section: PRACTICAL -->
+    <text x="60" y="946" font-size="13" fill="#ffb454" letter-spacing="2">PRACTICAL</text>
+
+    <!-- No external runtime -->
+    <text x="60" y="976">Runs with no MATLAB / Fortran / Python dependency</text>
+    <text x="635" y="976" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="976" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="935" y="976" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1085" y="976" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="976" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Single integrated GUI -->
+    <text x="60" y="1004">One integrated real-time GUI (sim + analysis)</text>
+    <text x="635" y="1004" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="785" y="1004" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="1004" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="1085" y="1004" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="1004" text-anchor="middle" fill="#5a6672">○</text>
+
+    <!-- Scriptable / embeddable -->
+    <text x="60" y="1032">Scriptable / embeddable in a larger pipeline</text>
+    <text x="635" y="1032" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="785" y="1032" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="935" y="1032" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="1032" text-anchor="middle" fill="#d98c54">◐</text>
+    <text x="1235" y="1032" text-anchor="middle" fill="#7ee0c0">●</text>
+
+    <!-- Maturity / track record -->
+    <text x="60" y="1060">Decades of maturity &amp; large user community</text>
+    <text x="635" y="1060" text-anchor="middle" fill="#5a6672">○</text>
+    <text x="785" y="1060" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="935" y="1060" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1085" y="1060" text-anchor="middle" fill="#7ee0c0">●</text>
+    <text x="1235" y="1060" text-anchor="middle" fill="#d98c54">◐</text>
+  </g>
+
+  <!-- row separators (subtle) -->
+  <g stroke="#19212c" stroke-width="1">
+    <line x1="60" y1="392" x2="1340" y2="392"/>
+    <line x1="60" y1="476" x2="1340" y2="476"/>
+    <line x1="60" y1="628" x2="1340" y2="628"/>
+    <line x1="60" y1="684" x2="1340" y2="684"/>
+    <line x1="60" y1="836" x2="1340" y2="836"/>
+    <line x1="60" y1="920" x2="1340" y2="920"/>
+  </g>
+
+  <!-- ===== footer: honest positioning ===== -->
+  <line x1="60" y1="1098" x2="1340" y2="1098" stroke="#2a3441" stroke-width="1.5"/>
+  <text x="60" y="1126" font-family="Georgia,serif" font-style="italic" font-size="18" fill="#7ee0c0">Where dynsys is different</text>
+  <text x="60" y="1150" font-size="13.5" fill="#aeb8c4">A single self-contained native binary that puts interactive simulation, phase portraits, 3D, fractals, basins, and continuation in one window —</text>
+  <text x="60" y="1170" font-size="13.5" fill="#aeb8c4">and, uniquely, backs the analysis with a <tspan fill="#ffd24d">proof-carrying exact CAS</tspan>: exact eigenvalues, exact equilibria, and exact Routh–Hurwitz over rational arithmetic.</text>
+
+  <text x="60" y="1202" font-family="Georgia,serif" font-style="italic" font-size="18" fill="#cdd6e0">Where the established tools still lead</text>
+  <text x="60" y="1226" font-size="13.5" fill="#8a95a1">MatCont &amp; AUTO remain the gold standard for deep cycle analysis: torus / period-doubling / Neimark–Sacker, periodic normal forms, homoclinic orbits.</text>
+</svg>

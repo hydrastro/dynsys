@@ -115,7 +115,14 @@ bool finite_diff_jacobian(const Model &m, const double *x, double p,
 
 /* ---- pseudo-arclength continuation of equilibria ------------ */
 
-enum class SpecialPointKind { None, Fold, Hopf, EndOfBranch };
+/* Kinds of special point detected along an equilibrium branch.
+ * Codim-1: Fold (limit point), Hopf. Codim-2 (degeneracies of the codim-1
+ * conditions): BogdanovTakens (fold & Hopf collide, double-zero eigenvalue),
+ * Cusp (fold normal-form coefficient a -> 0), GeneralizedHopf / Bautin (Hopf
+ * first Lyapunov coefficient l1 -> 0). BranchPoint = two equilibrium branches
+ * cross (the augmented system is singular though the fold test need not be). */
+enum class SpecialPointKind { None, Fold, Hopf, BogdanovTakens, Cusp,
+                              GeneralizedHopf, BranchPoint, EndOfBranch };
 
 struct BranchPoint {
   double p = 0.0;               /* parameter value                  */
@@ -124,6 +131,16 @@ struct BranchPoint {
   int n_unstable = 0;           /* unstable eigenvalue count        */
   bool stable = false;          /* n_unstable == 0                  */
   SpecialPointKind special = SpecialPointKind::None;
+  /* Normal-form data attached at special points (NaN when not computed):
+   * at a Hopf, lyapunov1 is the first Lyapunov coefficient; at a Fold,
+   * fold_a is the quadratic normal-form coefficient. These let the UI label
+   * criticality and flag codim-2 degeneracies (l1~0 -> generalized Hopf,
+   * a~0 -> cusp). second_tangent, when non-empty at a BranchPoint, is the
+   * other branch's direction in (x,p) space for branch switching. */
+  double lyapunov1 = 0.0;
+  double fold_a = 0.0;
+  bool has_normal_form = false;
+  std::vector<double> second_tangent; /* length n+1, only at BranchPoint */
 };
 
 struct ContinuationSettings {
@@ -177,6 +194,164 @@ bool hopf_first_lyapunov(const Model &m, const std::vector<double> &x, double p,
  * the magnitude of the near-zero eigenvalue (small => genuinely at a fold). */
 bool fold_normal_form(const Model &m, const std::vector<double> &x, double p,
                       double *a, double *lambda0, std::string *err);
+
+/* Bogdanov-Takens normal-form coefficients (a, b) at a BT point (double-zero
+ * eigenvalue, 2x2 Jordan block). The planar BT normal form is w0'=w1,
+ * w1'=a w0^2 + b w0 w1; non-degeneracy needs a != 0 and b != 0. */
+bool bt_normal_form(const Model &m, const std::vector<double> &x, double p,
+                    double *a, double *b, std::string *err);
+
+/* Branch switching at a branch point. Given a BranchPoint that carries a
+ * second_tangent (the crossing branch's direction in (x,p) space), take a
+ * small step along +/- that direction, re-converge to an equilibrium, and
+ * continue from there — tracing the OTHER branch. Returns an empty/!ok Branch
+ * if bp has no second tangent or the off-branch point can't be corrected. */
+Branch switch_branch(const Model &m, const BranchPoint &bp,
+                     const ContinuationSettings &settings);
+
+/* ---- two-parameter continuation of codim-1 curves ----------------------- *
+ * A system whose vector field depends on TWO parameters (p, q). Used to trace
+ * a curve of fold points or Hopf points in the (p, q) plane: the locus where
+ * the codim-1 condition holds as both parameters vary. */
+struct Model2 {
+  std::size_t n = 0;
+  /* f(x, p, q) -> f_out (length n). */
+  std::function<bool(const double *x, double p, double q, double *f_out, std::string *err)>
+      vector_field;
+};
+
+/* One point on a two-parameter curve: the two parameter values and the
+ * equilibrium there. kind is Fold or Hopf (which curve this is). */
+struct TwoParamPoint {
+  double p = 0.0, q = 0.0;
+  std::vector<double> x;
+  /* codim-2 point detected ON the curve (None for an ordinary point). On a
+   * fold curve: Cusp (fold coeff a -> 0), BogdanovTakens (a 2nd eigenvalue
+   * reaches zero). On a Hopf curve: GeneralizedHopf (l1 -> 0),
+   * BogdanovTakens (frequency omega -> 0). */
+  SpecialPointKind special = SpecialPointKind::None;
+  /* When special != None, the location is REFINED by bisection along the curve:
+   * (p2,q2,x2) is the precise codim-2 point, and the normal-form coefficients
+   * below classify its unfolding (NaN when not computed). For BT: bt_a, bt_b
+   * (the quadratic normal-form coefficients of the planar BT normal form
+   *  w2' = a*w1^2 + b*w1*w2); for Cusp: the fold coeff a is ~0 there and we
+   * report the cubic-ish residual; for GeneralizedHopf: l1 ~ 0 there. */
+  double p2 = 0.0, q2 = 0.0;
+  std::vector<double> x2;
+  double bt_a = 0.0, bt_b = 0.0;
+  bool has_codim2_nf = false;
+};
+struct TwoParamCurve {
+  std::vector<TwoParamPoint> points;
+  std::vector<std::size_t> special_indices; /* indices of codim-2 points */
+  std::string message;
+  bool ok = false;
+  SpecialPointKind kind = SpecialPointKind::Fold;
+};
+
+enum class TwoParamKind { Fold, Hopf };
+
+struct TwoParamSettings {
+  double p_min = -10, p_max = 10;   /* bounds on parameter 1 (x axis)  */
+  double q_min = -10, q_max = 10;   /* bounds on parameter 2 (y axis)  */
+  double h0 = 0.05;                 /* arclength step in (p,q,x) space */
+  int max_points = 800;
+  int max_corrector_iters = 20;
+  double corrector_tol = 1e-9;
+};
+
+/* Trace a fold or Hopf curve in the (p,q) plane, starting from a codim-1 point
+ * found at (p0,q0,x0). The extended system is G(x,p,q) = [ f ; g ] = 0 where g
+ * is the fold test det(f_x) (Fold) or the real-part-sum proxy (Hopf); this is
+ * n+1 equations in n+2 unknowns, whose solution set is the 1-D curve. Returns
+ * points sampled along it, both directions from the start. */
+TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
+                              const std::vector<double> &x0, double p0, double q0,
+                              const TwoParamSettings &settings);
+
+/* ---- HOMOCLINIC ORBITS (connection to a saddle) ------------------------- *
+ * A homoclinic orbit leaves a saddle equilibrium along its unstable manifold
+ * and returns to the SAME saddle along its stable manifold, so x(t) -> x0 as
+ * t -> +/- infinity. We approximate it on a long but finite interval, rescaled
+ * to tau in [0,1], with:
+ *   - collocation of  x'(tau) = 2T f(x)   (T = the truncation half-time; the
+ *     factor 2T maps real time [-T,+T] to tau in [0,1]);
+ *   - PROJECTION boundary conditions (Beyn): the deviation x(0)-x0 lies in the
+ *     unstable subspace of A=f_x(x0) (its stable-subspace projection is zero),
+ *     and x(1)-x0 lies in the stable subspace (its unstable projection is zero);
+ *   - a phase condition pinning the translation freedom.
+ * This is the rigorous truncated-BVP formulation used by HomCont/AUTO. */
+struct HomoclinicSettings {
+  int mesh = 150;            /* collocation intervals over [0,1]            */
+  double T = 0.0;            /* truncation half-time; 0 => auto from the seed */
+  int newton_iters = 40;
+  double newton_tol = 1e-9;
+  bool free_T = true;        /* let Newton adjust T as an unknown            */
+};
+struct HomoclinicResult {
+  bool ok = false;
+  std::string message;
+  std::vector<double> saddle;                 /* x0 (length n)               */
+  std::vector<std::vector<double>> orbit;     /* mesh+1 points, each length n */
+  std::vector<double> tau;                    /* mesh+1 values in [0,1]      */
+  double T = 0.0;                             /* converged half-time         */
+  double amplitude = 0.0;                     /* max deviation from saddle    */
+  int n_unstable = 0;                         /* dim of unstable subspace     */
+  double newton_residual = 0.0;
+  int newton_steps = 0;
+};
+
+/* Solve for a homoclinic orbit to the saddle x0_guess at parameter p. The seed
+ * orbit (one long excursion that leaves and returns near the saddle, e.g. from
+ * a simulation) is given as seed_orbit (>=4 points, ordered along the orbit);
+ * it is resampled onto the collocation mesh. Returns the refined orbit + T. */
+HomoclinicResult solve_homoclinic(const Model &m,
+                                  const std::vector<double> &x0_guess, double p,
+                                  const std::vector<std::vector<double>> &seed_orbit,
+                                  const HomoclinicSettings &settings);
+
+/* ---- two-parameter continuation of the HOMOCLINIC locus ----------------- *
+ * A homoclinic connection is codimension-1, so in a two-parameter (p,q) plane
+ * it traces a CURVE. We continue it by stepping the secondary parameter q and,
+ * at each q, finding the primary parameter p at which the truncated-BVP
+ * homoclinic closes (its boundary/collocation residual is minimised to ~0),
+ * re-using the previous converged orbit as the seed (natural continuation).
+ * This wraps solve_homoclinic as the inner solve. */
+struct HomoclinicCurvePoint {
+  double p = 0.0, q = 0.0;
+  double T = 0.0, amplitude = 0.0;
+  double residual = 0.0;
+};
+struct HomoclinicCurve {
+  std::vector<HomoclinicCurvePoint> points;
+  std::vector<std::vector<std::vector<double>>> orbits; /* the orbit at each point (optional, same order) */
+  std::string message;
+  bool ok = false;
+};
+struct HomoclinicContSettings {
+  int max_steps = 60;        /* number of q-steps in each direction          */
+  double dq = 0.02;          /* step in the secondary parameter q            */
+  double q_min = -1e9, q_max = 1e9; /* stop if q leaves this window           */
+  HomoclinicSettings bvp;    /* inner BVP settings (mesh, T, newton)          */
+  bool both_directions = true;
+  bool store_orbits = false;
+};
+/* Trace the homoclinic curve from a starting (p0,q0) where a homoclinic is
+ * known (seed_orbit shadows it). m2 is the two-parameter field. */
+HomoclinicCurve continue_homoclinic(const Model2 &m2,
+                                    const std::vector<double> &x0_guess,
+                                    double p0, double q0,
+                                    const std::vector<std::vector<double>> &seed_orbit,
+                                    const HomoclinicContSettings &settings);
+
+/* ---- two-parameter continuation of a FOLD-OF-CYCLES (LPC) curve --------- *
+ * Declared after the cycle structs below (it needs CycleSettings). */
+struct LPCPoint { double p = 0.0, q = 0.0; double period = 0.0; double amplitude = 0.0; };
+struct LPCCurve {
+  std::vector<LPCPoint> points;
+  std::string message;
+  bool ok = false;
+};
 
 /* ---- 2D fixed-point scanning (pplane-style) ----------------- *
  * Find ALL equilibria of a planar vector field inside a rectangle by
@@ -288,6 +463,16 @@ struct BasinOptions {
 BasinResult compute_basins(const std::function<bool(double x, double y, double *nx, double *ny)> &advance,
                            const BasinOptions &opt);
 
+/* Parallel variant: `make_advance(tid)` returns an advance function private to
+ * worker thread tid (so each thread can own its own evaluation scratch and
+ * avoid data races). The expensive per-cell integration runs across hardware
+ * threads; the attractor clustering is done serially afterwards so labels stay
+ * deterministic. Produces the same result as compute_basins, just faster on
+ * multi-core machines. Falls back to serial when only one core is available. */
+using AdvanceFn = std::function<bool(double x, double y, double *nx, double *ny)>;
+BasinResult compute_basins_mt(const std::function<AdvanceFn(int tid)> &make_advance,
+                              const BasinOptions &opt);
+
 /* ---- Box-counting fractal dimension --------------------------- *
  * Estimate the box-counting (Minkowski–Bouligand) dimension of a set of
  * 2D points: cover the bounding box with a grid of boxes of side eps,
@@ -350,5 +535,67 @@ struct LimitCycleResult {
 };
 
 LimitCycleResult limit_cycle_period_amplitude(const std::vector<double> &y, double dt);
+
+/* ---- periodic-orbit continuation by collocation ------------------------- *
+ * Represents a periodic orbit on a uniform mesh of m points in [0,1) with the
+ * BVP  x'(s) = T f(x(s)),  x(0) = x(1),  plus an integral phase condition that
+ * pins the orbit's position along itself. Solving this by Newton finds the
+ * cycle AND its period T directly, so it follows unstable cycles and folds of
+ * cycles (unlike a simulate-and-measure approach). Continuation steps the
+ * parameter and re-solves, producing the cycle's period and amplitude vs the
+ * parameter. */
+struct CycleSample {
+  double p = 0.0;          /* parameter value                              */
+  double period = 0.0;     /* orbit period T                               */
+  double amplitude = 0.0;  /* peak-to-peak of the first state over a cycle */
+  double min0 = 0.0, max0 = 0.0; /* min/max of first state along the orbit */
+  bool stable = false;     /* nontrivial Floquet multipliers inside unit circle */
+  double fold_test = 0.0;  /* fold-of-cycles (LPC) test function value      */
+  bool is_fold = false;    /* an LPC (cycle fold) was bracketed at this sample */
+  /* Floquet multipliers of the cycle (the monodromy matrix eigenvalues). One
+   * multiplier is always ~1 (the trivial one, along the flow); the rest govern
+   * stability. Populated when compute_floquet is on. */
+  std::vector<double> floquet_re, floquet_im;
+  double max_nontrivial_mult = 0.0; /* |largest non-trivial multiplier|     */
+  bool is_pd = false;      /* period-doubling (a multiplier passed -1)      */
+  bool is_ns = false;      /* Neimark-Sacker / torus (complex pair hit |.|=1)*/
+};
+struct CycleBranch {
+  std::vector<CycleSample> samples;
+  std::string message;
+  bool ok = false;
+  bool turned = false;     /* true if arclength continuation went around a fold */
+};
+struct CycleSettings {
+  int mesh = 60;                 /* collocation points around the orbit     */
+  double p_min = -1e9, p_max = 1e9;
+  double dp = 0.02;              /* parameter step (monotone mode)          */
+  int max_steps = 400;
+  int newton_iters = 30;
+  double newton_tol = 1e-8;
+  bool arclength = true;         /* pseudo-arclength (follows folds of cycles) */
+  double ds = 0.05;              /* arclength step size                      */
+  bool compute_floquet = true;   /* compute Floquet multipliers per sample   */
+  bool adaptive_mesh = true;     /* redistribute mesh by arclength (stiff cycles) */
+};
+
+/* Trace a branch of periodic orbits starting from an initial guess (a set of
+ * `mesh` points around one loop and an initial period guess), continuing in
+ * the parameter from p0. The initial guess is typically taken from a simulated
+ * cycle; this solver then refines it exactly and follows it. */
+CycleBranch continue_limit_cycle(const Model &m,
+                                 const std::vector<std::vector<double>> &guess_points,
+                                 double period_guess, double p0,
+                                 const CycleSettings &settings);
+
+/* Two-parameter fold-of-cycles (LPC) curve: traces, in the (p,q) plane, the
+ * locus where a limit cycle folds (a saddle-node of cycles; a nontrivial
+ * Floquet multiplier passes +1). For each q it continues the cycle in p and
+ * records where the fold-of-cycles test changes sign. Seeded from a cycle
+ * guess + period at (p0,q0). */
+LPCCurve lpc_curve(const Model2 &m,
+                   const std::vector<std::vector<double>> &guess_points,
+                   double period_guess, double p0, double q0,
+                   const TwoParamSettings &settings, const CycleSettings &cyc);
 
 }  // namespace dynsys::analysis

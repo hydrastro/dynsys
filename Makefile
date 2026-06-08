@@ -134,7 +134,7 @@ endif
 CFLAGS ?=
 CFLAGS += $(CSTD) $(WARNINGS_C)
 CXXFLAGS ?=
-CXXFLAGS += $(CXXSTD) $(WARNINGS_CXX)
+CXXFLAGS += $(CXXSTD) $(WARNINGS_CXX) -pthread
 LDFLAGS ?=
 LDLIBS ?=
 
@@ -150,7 +150,7 @@ ifeq ($(WINDOWS_BUILD),1)
     LDFLAGS += -static -static-libgcc -static-libstdc++
   endif
 else
-  LDLIBS += $(PKG_LIBS) -lGL -ldl -lm
+  LDLIBS += $(PKG_LIBS) -lGL -ldl -lm -pthread
 endif
 
 ifeq ($(MODE),release)
@@ -201,6 +201,7 @@ endif
 IR_TEST_C_OBJS := $(patsubst %.c,$(TEST_OBJ_DIR)/%.o,$(C_SRCS))
 IR_TEST_OBJS := $(IR_TEST_CPP_OBJS) $(IR_TEST_C_OBJS)
 PARAMSYNC_OBJS := $(TEST_OBJ_DIR)/test/paramsync_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
+ESHADOW_OBJS := $(TEST_OBJ_DIR)/test/e_shadow_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
 IFSLIT_OBJS := $(TEST_OBJ_DIR)/test/ifslit_smoke.o $(IR_TEST_C_OBJS) $(TEST_OBJ_DIR)/src/expr_ir.o
 BOXDIM_TEST_TARGET := $(BUILD_DIR)/boxdim_smoke$(EXEEXT)
 IFS_TEST_TARGET := $(BUILD_DIR)/ifs_smoke$(EXEEXT)
@@ -222,7 +223,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -315,14 +316,14 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-lpccurve test-eshadow test-bridgealign test-projsolid
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
 
 $(ANALYSIS_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/analysis_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/analysis_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/analysis_smoke.cpp -o $@ -lm
 
 test-nullcline: $(NULLCLINE_TEST_TARGET)
 	./$(NULLCLINE_TEST_TARGET)
@@ -343,14 +344,14 @@ test-fp: $(FP_TEST_TARGET)
 
 $(FP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/fixedpoints_smoke.cpp -o $@ -lm
 
 test-lyap: $(LYAP_TEST_TARGET)
 	./$(LYAP_TEST_TARGET)
 
 $(LYAP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/lyapunov_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/lyapunov_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/lyapunov_smoke.cpp -o $@ -lm
 
 test-fractal: $(FRACTAL_TEST_TARGET)
 	./$(FRACTAL_TEST_TARGET)
@@ -362,6 +363,13 @@ $(FRACTAL_TEST_TARGET): test/fractal_smoke.cpp
 test-bridge: $(BRIDGE_TEST_TARGET)
 	./$(BRIDGE_TEST_TARGET)
 
+test-bridgefamily: $(BUILD_DIR)/bridge_family_smoke$(EXEEXT)
+	./$(BUILD_DIR)/bridge_family_smoke$(EXEEXT)
+
+$(BUILD_DIR)/bridge_family_smoke$(EXEEXT): test/bridge_family_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/bridge_family_smoke.cpp -o $@ -lm
+
 $(BRIDGE_TEST_TARGET): test/bridge_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/bridge_smoke.cpp -o $@ -lm
@@ -371,7 +379,7 @@ test-basin: $(BASIN_TEST_TARGET)
 
 $(BASIN_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/basin_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/basin_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/basin_smoke.cpp -o $@ -lm
 
 test-solver: $(SOLVER_TEST_TARGET)
 	./$(SOLVER_TEST_TARGET)
@@ -406,21 +414,21 @@ test-basinchaos: $(BASINCHAOS_TEST_TARGET)
 
 $(BASINCHAOS_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/basinchaos_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/basinchaos_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/basinchaos_smoke.cpp -o $@ -lm
 
 test-continuation: $(CONT_TEST_TARGET)
 	./$(CONT_TEST_TARGET)
 
 $(CONT_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/continuation_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/continuation_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/continuation_smoke.cpp -o $@ -lm
 
 test-png: $(PNG_TEST_TARGET)
 	./$(PNG_TEST_TARGET)
 
 $(PNG_TEST_TARGET): test/png_smoke.cpp $(SRC_DIR)/png_writer.h
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) test/png_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/png_smoke.cpp -o $@ -lm
 
 test-period: $(PERIOD_TEST_TARGET)
 	./$(PERIOD_TEST_TARGET)
@@ -553,47 +561,59 @@ $(PARAMSYNC_TEST_TARGET): $(PARAMSYNC_OBJS)
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) -o $@ $(PARAMSYNC_OBJS) -lm
 
+ESHADOW_TEST_TARGET := $(BUILD_DIR)/e_shadow_smoke$(EXEEXT)
+test-eshadow: $(ESHADOW_TEST_TARGET)
+	./$(ESHADOW_TEST_TARGET)
+
+$(TEST_OBJ_DIR)/test/e_shadow_smoke.o: test/e_shadow_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds -c test/e_shadow_smoke.cpp -o $@
+
+$(ESHADOW_TEST_TARGET): $(ESHADOW_OBJS)
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) -o $@ $(ESHADOW_OBJS) -lm
+
 test-boxdim: $(BOXDIM_TEST_TARGET)
 	./$(BOXDIM_TEST_TARGET)
 
 $(BOXDIM_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/boxdim_smoke.cpp -o $@ -lm
 
 test-ifs: $(IFS_TEST_TARGET)
 	./$(IFS_TEST_TARGET)
 
 $(IFS_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifs_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifs_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifs_smoke.cpp -o $@ -lm
 
 test-limitcycle: $(LC_TEST_TARGET)
 	./$(LC_TEST_TARGET)
 
 $(LC_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/limitcycle_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/limitcycle_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/limitcycle_smoke.cpp -o $@ -lm
 
 test-lcsweep: $(LCSWEEP_TEST_TARGET)
 	./$(LCSWEEP_TEST_TARGET)
 
 $(LCSWEEP_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/lcsweep_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/lcsweep_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/lcsweep_smoke.cpp -o $@ -lm
 
 test-ifsmodel: $(IFSMODEL_TEST_TARGET)
 	./$(IFSMODEL_TEST_TARGET)
 
 $(IFSMODEL_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifsmodel_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsmodel_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsmodel_smoke.cpp -o $@ -lm
 
 test-ifsparam: $(IFSPARAM_TEST_TARGET)
 	./$(IFSPARAM_TEST_TARGET)
 
 $(IFSPARAM_TEST_TARGET): $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) $(SRC_DIR)/analysis.cpp test/ifsparam_smoke.cpp -o $@ -lm
 
 test-ifslit: $(IFSLIT_TEST_TARGET)
 	./$(IFSLIT_TEST_TARGET)
@@ -618,7 +638,7 @@ test-hopfl1: $(HOPFL1_TEST_TARGET)
 
 $(HOPFL1_TEST_TARGET): test/hopf_l1_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) test/hopf_l1_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/hopf_l1_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
 
 FOLDNF_TEST_TARGET := $(BUILD_DIR)/fold_nf_smoke$(EXEEXT)
 test-foldnf: $(FOLDNF_TEST_TARGET)
@@ -626,5 +646,126 @@ test-foldnf: $(FOLDNF_TEST_TARGET)
 
 $(FOLDNF_TEST_TARGET): test/fold_nf_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -I$(SRC_DIR) test/fold_nf_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/fold_nf_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+CODIM2_TEST_TARGET := $(BUILD_DIR)/codim2_smoke$(EXEEXT)
+test-codim2: $(CODIM2_TEST_TARGET)
+	./$(CODIM2_TEST_TARGET)
+
+$(CODIM2_TEST_TARGET): test/codim2_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/codim2_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+TWOPARAM_TEST_TARGET := $(BUILD_DIR)/twoparam_smoke$(EXEEXT)
+test-twoparam: $(TWOPARAM_TEST_TARGET)
+	./$(TWOPARAM_TEST_TARGET)
+
+$(TWOPARAM_TEST_TARGET): test/twoparam_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/twoparam_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+LCCOLLOC_TEST_TARGET := $(BUILD_DIR)/lc_colloc_smoke$(EXEEXT)
+test-lccolloc: $(LCCOLLOC_TEST_TARGET)
+	./$(LCCOLLOC_TEST_TARGET)
+
+$(LCCOLLOC_TEST_TARGET): test/lc_colloc_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/lc_colloc_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+TPC2_TEST_TARGET := $(BUILD_DIR)/twoparam_codim2_smoke$(EXEEXT)
+test-tpc2: $(TPC2_TEST_TARGET)
+	./$(TPC2_TEST_TARGET)
+
+$(TPC2_TEST_TARGET): test/twoparam_codim2_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/twoparam_codim2_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+LPC_TEST_TARGET := $(BUILD_DIR)/lpc_smoke$(EXEEXT)
+test-lpc: $(LPC_TEST_TARGET)
+	./$(LPC_TEST_TARGET)
+
+$(LPC_TEST_TARGET): test/lpc_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/lpc_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+LPCARC_TEST_TARGET := $(BUILD_DIR)/lpc_arclength_smoke$(EXEEXT)
+test-lpcarc: $(LPCARC_TEST_TARGET)
+	./$(LPCARC_TEST_TARGET)
+
+$(LPCARC_TEST_TARGET): test/lpc_arclength_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/lpc_arclength_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+BRANCHSW_TEST_TARGET := $(BUILD_DIR)/branch_switch_smoke$(EXEEXT)
+test-branchsw: $(BRANCHSW_TEST_TARGET)
+	./$(BRANCHSW_TEST_TARGET)
+
+$(BRANCHSW_TEST_TARGET): test/branch_switch_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/branch_switch_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+BTCODIM2_TEST_TARGET := $(BUILD_DIR)/bt_codim2_smoke$(EXEEXT)
+test-btcodim2: $(BTCODIM2_TEST_TARGET)
+	./$(BTCODIM2_TEST_TARGET)
+
+$(BTCODIM2_TEST_TARGET): test/bt_codim2_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/bt_codim2_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+BASINSMT_TEST_TARGET := $(BUILD_DIR)/basins_mt_smoke$(EXEEXT)
+test-basinsmt: $(BASINSMT_TEST_TARGET)
+	./$(BASINSMT_TEST_TARGET)
+
+$(BASINSMT_TEST_TARGET): test/basins_mt_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/basins_mt_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+HOMOCLINIC_TEST_TARGET := $(BUILD_DIR)/homoclinic_smoke$(EXEEXT)
+test-homoclinic: $(HOMOCLINIC_TEST_TARGET)
+	./$(HOMOCLINIC_TEST_TARGET)
+
+$(HOMOCLINIC_TEST_TARGET): test/homoclinic_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/homoclinic_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+HOMOCONT_TEST_TARGET := $(BUILD_DIR)/homoclinic_cont_smoke$(EXEEXT)
+test-homocont: $(HOMOCONT_TEST_TARGET)
+	./$(HOMOCONT_TEST_TARGET)
+
+$(HOMOCONT_TEST_TARGET): test/homoclinic_cont_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/homoclinic_cont_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+VALIDATION_TEST_TARGET := $(BUILD_DIR)/validation_smoke$(EXEEXT)
+test-validation: $(VALIDATION_TEST_TARGET)
+	./$(VALIDATION_TEST_TARGET)
+
+$(VALIDATION_TEST_TARGET): test/validation_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/validation_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+
+LPCCURVE_TEST_TARGET := $(BUILD_DIR)/lpc_curve_smoke$(EXEEXT)
+test-lpccurve: $(LPCCURVE_TEST_TARGET)
+	./$(LPCCURVE_TEST_TARGET)
+
+$(LPCCURVE_TEST_TARGET): test/lpc_curve_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/lpc_curve_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+BRIDGEALIGN_TEST_TARGET := $(BUILD_DIR)/bridge_align_smoke$(EXEEXT)
+test-bridgealign: $(BRIDGEALIGN_TEST_TARGET)
+	./$(BRIDGEALIGN_TEST_TARGET)
+
+PROJSOLID_TEST_TARGET := $(BUILD_DIR)/projsolid_smoke$(EXEEXT)
+test-projsolid: $(PROJSOLID_TEST_TARGET)
+	./$(PROJSOLID_TEST_TARGET)
+
+$(PROJSOLID_TEST_TARGET): test/projsolid_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/projsolid_smoke.cpp -o $@ -lm
+
+$(BRIDGEALIGN_TEST_TARGET): test/bridge_align_smoke.cpp
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/bridge_align_smoke.cpp -o $@ -lm
 

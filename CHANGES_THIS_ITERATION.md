@@ -1,54 +1,56 @@
-# dynsys — 3D bridge reset bug fixed, + two MatCont normal-form coefficients
+# dynsys — three fronts: 2-parameter homoclinic continuation, parallel fractals, analytic validation suite
 
-Unzip at repo root, `make clean && make && make run`.
+Unzip at repo root, `make clean && make && make run`. CAS features need
+LIZARD + SANGAKU_ROOT (or the Nix dev shell). Verified by new regression tests
+against analytic results, forced-concurrency pixel-identity checks, and by
+building/running the real GUI.
 
-## 1. The 3D bridge (and other caches) now reset on EVERY system (re)compile
-You were right: the bridge could keep showing a previous system. The reset was
-gated on the variable/parameter NAMES changing — so loading a different system
-that happened to reuse the same names (e.g. both use x,y and a parameter a, but
-different equations) would NOT clear the bridge, bifurcation diagram, fractal,
-basin, or scan caches. Now those stale-data invalidations run unconditionally
-on every successful compile (the name-gated block still handles only the
-name-structural defaults like the bifurcation parameter range/observable).
-Concretely, each recompile now clears: the bifurcation point cloud, the 3D
-bridge geometry, and marks the fractal/basin/scan images dirty, plus the
-certified-eigenvalue and Hopf/fold classifications.
+## 1. Two-parameter homoclinic CONTINUATION (completes HomCont)
+The previous release solved a single homoclinic orbit (truncated BVP +
+projection BCs). A homoclinic connection is codim-1, so in a (p,q) plane it
+traces a CURVE. `analysis::continue_homoclinic` now follows it: it steps the
+secondary parameter q and, at each q, finds the primary parameter p where the
+connection closes (BVP residual -> 0), re-using the previous converged orbit as
+the seed (natural/warm-started continuation), tracing both directions.
+  - In the GUI (Continuation view): after "Find homoclinic orbit", a "Continue
+    homoclinic curve" button traces the locus in (cont_param vs twopar_p2) and
+    plots it (primary param vs secondary).
+  - VALIDATED (new test homoclinic_cont_smoke): on x'=y, y'=q*x-x^2+p*y the
+    traced locus matches the conservative line p=0 with peak amplitude 1.5*q at
+    every q across 25 points, residuals ~1e-12.
+  - Honest limit: warm-started natural continuation following p(q); it relies on
+    a good starting homoclinic (the inner solve's seeding). Very stiff / large
+    BT-type loops need a better seed than the simple GUI excursion provides.
 
-## 2. MatCont normal-form coefficients at equilibria
-Two codim-1 normal-form quantities MatCont reports and most teaching tools
-don't — both computed from finite differences of the vector field, so they
-work for ANY system, and both verified against textbook normal forms:
+## 2. Parallel FRACTAL / escape-time rendering (multi-core)
+After the basins parallelisation, the escape-time fractal (the other hotspot) is
+now multi-threaded too. Each worker thread owns a private ThreadStepper (its own
+IR eval scratch AND its own parameter snapshot), so PARAMETER-space fractals --
+which vary parameters per pixel -- are now thread-safe (each thread overrides
+parameters only in its private copy). Rows are distributed across
+hardware_concurrency() threads; the AST-fallback evaluator keeps the serial
+path.
+  - VERIFIED bit-identical: with the parallel path FORCED on (sandbox is single
+    core), the rendered Mandelbrot is pixel-for-pixel identical to the serial
+    render (max pixel difference 0 across 1.28M pixels).
+  - Speedup is realised on multi-core machines; correctness (identical output)
+    is what was checked here.
 
-- Hopf FIRST LYAPUNOV COEFFICIENT l1 (this had been implemented but never
-  shipped). At a Hopf point: l1<0 supercritical (a stable limit cycle is
-  born), l1>0 subcritical (hard loss of stability), l1~0 degenerate (Bautin /
-  generalized-Hopf codim-2). Button: "Classify Hopf (first Lyapunov coeff)".
-
-- Fold (limit point) NORMAL-FORM COEFFICIENT a (new this round): a = (1/2)
-  <p,B(q,q)>/<p,q> from the right/left null vectors at the fold. a != 0 is the
-  genuine quadratic-fold condition; a ~ 0 signals a CUSP (codim-2). Button:
-  "Classify fold (normal-form coeff a)". It self-checks for a near-zero
-  eigenvalue and tells you when the equilibrium isn't actually at a fold.
-
-Both appear in the Analysis tab's fixed-point block once an equilibrium is in
-hand. Verification (headless, under ASan/UBSan):
-- fold x'=p+x^2 at the fold -> a = 1 exactly; planar saddle-node -> |a| = 1;
-  cubic x'=p+x^3 -> a ~ 0 (correctly flags the cusp).
-- supercritical Hopf normal form -> l1 < 0; subcritical -> l1 > 0.
-
-These join the existing equilibrium continuation with fold/Hopf detection, so
-dynsys now both DETECTS codim-1 points on a branch and CLASSIFIES their
-criticality the way MatCont does.
+## 3. Analytic VALIDATION suite (head-to-head ground truth)
+A new `validation_smoke` test runs dynsys's analysis core against systems with
+KNOWN analytic answers -- the kind of comparison one runs against MatCont:
+  - Lorenz origin eigenvalues: 11.8277 and -22.8277 (exact). PASS.
+  - Supercritical Hopf normal form: first Lyapunov coefficient l1 < 0 (correctly
+    supercritical), frequency omega = 1. PASS.
+  - Van der Pol (mu=1): largest Lyapunov exponent ~ 0 (on the limit cycle). PASS.
+  - Homoclinic x'=y,y'=x-x^2: peak amplitude 1.4996 (analytic 1.5). PASS.
+  6/6 checks pass. (If you supply a specific system + parameters, the same kind
+  of check can be run head-to-head against your MatCont output.)
 
 ## Verification
-- All 4 C++ TUs compile with ZERO warnings (-O2 -Wall -Wextra).
-- Brace/tab structure balanced after edits.
-- make test: 27 groups (added test-foldnf) + graceful CAS skip.
-- New fold coefficient + Hopf l1 verified against known normal forms under
-  AddressSanitizer + UBSan.
-
-## Still pending toward fuller MatCont parity (not in this build)
-Codim-2 point detection ON a branch (Bogdanov-Takens, cusp, generalized Hopf
-located automatically during continuation), branch switching at branch points,
-and limit-cycle continuation by collocation. Exact equilibria via the CAS
-(solve-poly / Groebner) also remain as the next CAS slice.
+- All 4 C++ TUs compile ZERO warnings; the REAL GLFW/OpenGL binary builds/runs.
+- Full suite passes (incl. homoclinic_cont_smoke, validation_smoke,
+  homoclinic_smoke, basins_mt_smoke, bt_codim2_smoke, branch_switch_smoke,
+  lpc_arclength_smoke, bridge_family_smoke); CAS green.
+- Parallel fractal proven pixel-identical to serial under forced concurrency;
+  fractal + continuation views run headless without crashing.

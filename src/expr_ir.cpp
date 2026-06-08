@@ -254,8 +254,10 @@ bool lower_node(const node_t *ast, const LowerContext &ctx,
             return true;
         }
         if (std::strcmp(name, "t")  == 0) { emit(out, Op::PushT);  return true; }
-        if (std::strcmp(name, "pi") == 0) { emit(out, Op::PushPi); return true; }
-        if (std::strcmp(name, "e")  == 0) { emit(out, Op::PushE);  return true; }
+        /* User parameters and definitions shadow the math constants pi and e,
+         * matching the tree-walking evaluator, so a system may name a
+         * parameter `e` (common for attractors) without colliding with
+         * Euler's number. `t` above stays reserved. */
         if (int i = param_index(ctx, name); i >= 0) {
             emit(out, Op::PushParam, static_cast<uint16_t>(i));
             return true;
@@ -264,6 +266,8 @@ bool lower_node(const node_t *ast, const LowerContext &ctx,
             emit(out, Op::CallDef, static_cast<uint16_t>(i), 0);
             return true;
         }
+        if (std::strcmp(name, "pi") == 0) { emit(out, Op::PushPi); return true; }
+        if (std::strcmp(name, "e")  == 0) { emit(out, Op::PushE);  return true; }
         set_err(err, "unknown variable: %s", name);
         return false;
     }
