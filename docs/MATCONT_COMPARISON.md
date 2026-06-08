@@ -94,12 +94,12 @@ dynsys does not claim parity there.
 | Hopf first Lyapunov coefficient | ● | ● |
 | Fold normal-form coefficient | ● | ● |
 | Two-parameter fold / Hopf curves | ● | ● |
-| Branch points + branch switching | ● | ◐ |
-| Limit-cycle continuation | ● (adaptive + arclength) | ◐ (monotone param, no arclength) |
-| LPC (fold of cycles) curve | ● | ◐ |
-| Codim-2 (BT, GH, cusp) | ● (+ ZH, HH) | ◐ (BT, GH, cusp; first coeffs) |
+| Branch points + branch switching | ● | ● (detect + switch_branch, tested) |
+| Limit-cycle continuation | ● (adaptive + arclength) | ● (collocation + pseudo-arclength + adaptive mesh; self-seeds by simulation) |
+| LPC (fold of cycles) curve | ● | ● (arclength fold-of-cycles, tested) |
+| Codim-2 (BT, GH, cusp, ZH, HH) | ● | ● (BT a,b; cusp cubic c exact; GH l2 sign; ZH + HH detected) |
 | Homoclinic continuation | ● | ◐ (truncated-BVP locus, tangent predictor; Lin's method experimental) |
-| Floquet multipliers | ● | ◐ |
+| Floquet multipliers | ● | ● (variational monodromy; PD/NS classified) |
 | Period / amplitude vs parameter | ● | ● |
 | Live phase portrait / 3-D attractor | ○ | ● |
 | Lyapunov spectrum + dimension | ○ | ● |
@@ -113,12 +113,16 @@ dynsys does not claim parity there.
 
 ## How to read this
 
-dynsys is **not** a MatCont replacement for serious continuation work — the
-limit-cycle solver alone (monotone parameter, no pseudo-arclength) means it
-cannot follow cycle folds the way MatCont does, and MatCont has far more codim-2
-machinery and validation. Where dynsys is genuinely differentiated is the
-**exact symbolic / proof-carrying** path and the breadth of *interactive*
-dynamics + fractals in one zero-setup tool.
+dynsys now covers most of MatCont's single- and two-parameter continuation
+core: equilibrium and cycle continuation (collocation + pseudo-arclength +
+adaptive mesh), LPC fold-of-cycles, branch switching, Floquet multipliers via
+the variational monodromy, the full planar codim-2 set (BT, GH, cusp, zero-Hopf,
+Hopf-Hopf) with normal-form coefficients, and homoclinic continuation. The
+remaining gaps versus MatCont are the cycle-bifurcation CONTINUATION curves
+(period-doubling, Neimark-Sacker/torus), heteroclinic and saddle-node-homoclinic
+connections, and a fully robust Lin's method for stiff homoclinics. Where dynsys
+is genuinely differentiated is the **exact symbolic / proof-carrying** path and
+the breadth of *interactive* dynamics + fractals in one zero-setup tool.
 
 A fair one-liner: *MatCont is the specialist's continuation engine; dynsys is an
 interactive dynamics workbench that adds exact symbolic certificates and a

@@ -662,6 +662,11 @@ struct AppState {
   dynsys::analysis::LPCCurve lpc_curve_data{};
   bool lpc_ready = false;
   std::string lpc_msg;
+  /* PD / NS (period-doubling, Neimark-Sacker) two-parameter bifurcation curves */
+  dynsys::analysis::CycleBifCurve pd_curve_data{};
+  dynsys::analysis::CycleBifCurve ns_curve_data{};
+  bool pd_curve_ready = false, ns_curve_ready = false;
+  std::string pdns_curve_msg;
   /* Collocation periodic-orbit continuation (period/amplitude vs parameter). */
   dynsys::analysis::CycleBranch cycle_branch{};
   bool cycle_ready = false;
@@ -8272,6 +8277,75 @@ void run_lpc_curve(AppState &app) {
   app.analysis_message = app.lpc_msg;
 }
 
+/* Seed a cycle at the current parameters by simulation and return the mesh
+ * guess + period (shared by the PD/NS curve runners). Mirrors run_lpc_curve's
+ * seeding. Returns false (with a message in app.pdns_curve_msg) on failure. */
+static bool seed_cycle_for_curve(AppState &app, dynsys::analysis::Model2 *model_out,
+                                 dynsys::analysis::TwoParamSettings *s2_out,
+                                 std::vector<std::vector<double>> *guess_out,
+                                 double *period_out, int *mesh_out,
+                                 double *p0_out, double *q0_out) {
+  if (app.mode != SystemMode::ODE) { app.pdns_curve_msg = "cycle-bifurcation curves are for ODE systems"; return false; }
+  AppState::Param *pp = find_param(app, app.cont_param);
+  AppState::Param *qp = find_param(app, app.twopar_p2);
+  if (pp == nullptr || qp == nullptr || pp == qp) { app.pdns_curve_msg = "pick two distinct parameters"; return false; }
+  const size_t n = app.state_names.size();
+  if (n < 2) { app.pdns_curve_msg = "need at least 2 state variables"; return false; }
+  const Integrator saved = app.integrator;
+  if (app.integrator == Integrator::RKF45 || app.integrator == Integrator::DOPRI45) app.integrator = Integrator::RK4;
+  const double dt = app.dt > 0 ? app.dt : 0.01;
+  char err[256] = {0};
+  State s = app.start; resize_state(s, n); bool ok = true;
+  for (int j = 0; j < 40000; ++j) { State nx{}; if (!step_ode_state(app, s, &nx, err, sizeof(err))) { ok=false; break; } s = nx; }
+  std::vector<std::vector<double>> traj; double mean0 = 0;
+  if (ok) { State t = s; for (int j = 0; j < 60000; ++j) { State nx{}; if (!step_ode_state(app, t, &nx, err, sizeof(err))) { ok=false; break; }
+      std::vector<double> row(n); for (size_t i=0;i<n;i++) row[i]=state_at(nx,i); traj.push_back(row); mean0+=row[0]; t=nx; } }
+  if (!ok || traj.size() < 100) { app.integrator = saved; app.pdns_curve_msg = "could not seed a cycle at the current parameters"; return false; }
+  mean0 /= (double)traj.size();
+  int c1=-1,c2=-1;
+  for (size_t j=1;j<traj.size();++j) if (traj[j-1][0]<mean0 && traj[j][0]>=mean0) { if(c1<0)c1=(int)j; else {c2=(int)j; break;} }
+  if (c1<0||c2<0||c2<=c1) { app.integrator = saved; app.pdns_curve_msg = "no clean cycle at the current parameters"; return false; }
+  const double period_guess = (c2-c1)*dt;
+  const int mesh = 50;
+  std::vector<std::vector<double>> guess(mesh, std::vector<double>(n,0.0));
+  for (int k=0;k<mesh;k++){ const int idx=c1+(int)std::floor((double)k/mesh*(c2-c1)); guess[(size_t)k]=traj[(size_t)std::min(idx,(int)traj.size()-1)]; }
+  app.integrator = saved;
+  dynsys::analysis::TwoParamSettings s2;
+  if (pp->has_range) { s2.p_min=pp->min_value; s2.p_max=pp->max_value; } else { s2.p_min=pp->value-3.0; s2.p_max=pp->value+3.0; }
+  if (qp->has_range) { s2.q_min=qp->min_value; s2.q_max=qp->max_value; } else { s2.q_min=qp->value-3.0; s2.q_max=qp->value+3.0; }
+  s2.max_points = 40;
+  *model_out = build_model2(app, pp, qp);
+  *s2_out = s2; *guess_out = guess; *period_out = period_guess; *mesh_out = mesh;
+  *p0_out = pp->value; *q0_out = qp->value;
+  return true;
+}
+
+void run_pd_curve(AppState &app) {
+  app.pd_curve_ready = false;
+  dynsys::analysis::Model2 model; dynsys::analysis::TwoParamSettings s2;
+  std::vector<std::vector<double>> guess; double per=0; int mesh=50; double p0=0,q0=0;
+  if (!seed_cycle_for_curve(app, &model, &s2, &guess, &per, &mesh, &p0, &q0)) { app.analysis_message = app.pdns_curve_msg; return; }
+  dynsys::analysis::CycleSettings cs; cs.mesh=mesh; cs.max_steps=200; cs.compute_floquet=true; cs.adaptive_mesh=true;
+  app.pd_curve_data = dynsys::analysis::pd_curve(model, guess, per, p0, q0, s2, cs);
+  app.pd_curve_ready = app.pd_curve_data.ok;
+  sync_param_values(app);
+  app.pdns_curve_msg = "period-doubling curve: " + app.pd_curve_data.message;
+  app.analysis_message = app.pdns_curve_msg;
+}
+
+void run_ns_curve(AppState &app) {
+  app.ns_curve_ready = false;
+  dynsys::analysis::Model2 model; dynsys::analysis::TwoParamSettings s2;
+  std::vector<std::vector<double>> guess; double per=0; int mesh=50; double p0=0,q0=0;
+  if (!seed_cycle_for_curve(app, &model, &s2, &guess, &per, &mesh, &p0, &q0)) { app.analysis_message = app.pdns_curve_msg; return; }
+  dynsys::analysis::CycleSettings cs; cs.mesh=mesh; cs.max_steps=200; cs.compute_floquet=true; cs.adaptive_mesh=true;
+  app.ns_curve_data = dynsys::analysis::ns_curve(model, guess, per, p0, q0, s2, cs);
+  app.ns_curve_ready = app.ns_curve_data.ok;
+  sync_param_values(app);
+  app.pdns_curve_msg = "Neimark-Sacker curve: " + app.ns_curve_data.message;
+  app.analysis_message = app.pdns_curve_msg;
+}
+
 /* PHASE E: exact equilibria via the CAS. Extract each state equation's RHS
  * text from the system source, substitute current parameter values as exact
  * rationals, and ask Sangaku to solve f(x)=0 exactly (solve-poly in 1-D,
@@ -10358,6 +10432,14 @@ void draw_gui(AppState &app) {
         ImGui::TextDisabled("(x: %s, y: %s)", app.cont_param, app.twopar_p2[0]?app.twopar_p2:"pick 2nd param above");
         if (app.lpc_ready && !app.lpc_msg.empty()) ImGui::TextWrapped("%s", app.lpc_msg.c_str());
         else if (!app.lpc_ready && !app.lpc_msg.empty()) ImGui::TextDisabled("%s", app.lpc_msg.c_str());
+        /* PD / NS two-parameter bifurcation curves (same framework). */
+        if (ImGui::Button("Trace period-doubling curve")) run_pd_curve(app);
+        ImGui::SameLine();
+        if (ImGui::Button("Trace Neimark-Sacker curve")) run_ns_curve(app);
+        if (!app.pdns_curve_msg.empty()) {
+          if (app.pd_curve_ready || app.ns_curve_ready) ImGui::TextWrapped("%s", app.pdns_curve_msg.c_str());
+          else ImGui::TextDisabled("%s", app.pdns_curve_msg.c_str());
+        }
         if (app.lpc_ready && app.lpc_curve_data.points.size() > 1) {
           ImDrawList *dl = ImGui::GetWindowDrawList();
           ImVec2 o = ImGui::GetCursorScreenPos();

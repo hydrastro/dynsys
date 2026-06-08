@@ -1665,6 +1665,83 @@ bool cyc_residual_p(CycleCtx c, const std::vector<double> &V,
   return cyc_residual(c, U, Fout);
 }
 
+/* BRANCH-POINT-OF-CYCLES (BPC) test function.
+ *
+ * At a regular point of a cycle branch the extended Jacobian F_V = dF/d(U,p)
+ * (N rows over N+1 unknowns) has a unique null vector = the branch tangent. At a
+ * FOLD (LPC) that is still true (the tangent just becomes p-orthogonal). At a
+ * BRANCH POINT two solution branches cross, so F_V has a TWO-dimensional null
+ * space and the bordered matrix
+ *     B = [ F_V        ]      (N+1 rows: N residual rows + the tangent row)
+ *         [ tangent^T  ]
+ * becomes singular -> det(B) changes sign through the branch point, while it
+ * stays bounded away from zero through a fold. We return det(B) (row-normalized
+ * so it doesn't under/overflow), the signed BPC test whose zero brackets a BPC.
+ *
+ * `V` is the extended state (U,p) of length Ulen+1; `tangent` is the branch
+ * tangent in that same extended space (length Ulen+1). */
+double cycle_bp_test(CycleCtx c, const std::vector<double> &V, std::size_t Ulen,
+                     const std::vector<double> &tangent) {
+  const std::size_t NF = c.mesh * c.n + 1;   /* residual rows                  */
+  const std::size_t NV = Ulen + 1;           /* unknowns incl. p (== NF here)  */
+  if (tangent.size() != NV) return std::nan("");
+  std::vector<double> F0, Fp;
+  if (!cyc_residual_p(c, V, Ulen, &F0)) return std::nan("");
+  /* extended Jacobian F_V : NF x NV by forward differences in every unknown */
+  std::vector<double> B((NF + 1) * NV, 0.0);
+  std::vector<double> Vt = V;
+  for (std::size_t j = 0; j < NV; ++j) {
+    const double save = Vt[j]; const double dh = 1e-7 * (std::fabs(save) + 1.0);
+    Vt[j] = save + dh;
+    if (!cyc_residual_p(c, Vt, Ulen, &Fp)) return std::nan("");
+    for (std::size_t i = 0; i < NF; ++i) B[i * NV + j] = (Fp[i] - F0[i]) / dh;
+    Vt[j] = save;
+  }
+  /* last row = branch tangent (the bordering vector). Its overall SIGN is a
+   * gauge choice (the two-direction continuation negates it), which would flip
+   * the bordered determinant spuriously. Fix the gauge: orient the tangent so
+   * its parameter component (last entry) is non-negative; if that is ~0, fall
+   * back to the first sizable component. This makes bp_test's sign depend only
+   * on the branch geometry, so a sign change marks a genuine branch point. */
+  std::vector<double> tg = tangent;
+  double gauge = tg[NV-1];
+  if (std::fabs(gauge) < 1e-12) { for (std::size_t j=0;j<NV;++j) if (std::fabs(tg[j])>1e-9) { gauge = tg[j]; break; } }
+  if (gauge < 0) for (double &v : tg) v = -v;
+  for (std::size_t j = 0; j < NV; ++j) B[NF * NV + j] = tg[j];
+  /* row-normalize (square (NF+1)x(NV), NV==NF+1) so each row is unit norm; then
+   * return the SIGNED geometric-mean determinant  sign(det)*|det|^(1/Nsq).
+   * The raw determinant of a ~200x200 matrix underflows to ~1e-27 even when
+   * well-conditioned (product of ~200 sub-unity pivots), which destroys the
+   * sign signal; the geometric mean stays O(1) and preserves the sign, so a
+   * genuine sign change at a branch point is detectable above noise. */
+  const std::size_t Nsq = NF + 1;
+  for (std::size_t i = 0; i < Nsq; ++i) {
+    double s = 0; for (std::size_t j = 0; j < NV; ++j) s += B[i*NV+j]*B[i*NV+j];
+    s = std::sqrt(s); if (s < 1e-300) s = 1.0;
+    for (std::size_t j = 0; j < NV; ++j) B[i*NV+j] /= s;
+  }
+  /* signed geometric-mean determinant via LU with pivot-sign tracking */
+  std::vector<double> mm(B);
+  double sign = 1.0, logabs = 0.0; bool singular = false;
+  for (std::size_t col = 0; col < Nsq && !singular; ++col) {
+    std::size_t piv = col;
+    for (std::size_t r = col+1; r < Nsq; ++r)
+      if (std::fabs(mm[r*NV+col]) > std::fabs(mm[piv*NV+col])) piv = r;
+    if (std::fabs(mm[piv*NV+col]) < 1e-300) { singular = true; break; }
+    if (piv != col) { for (std::size_t c=0;c<NV;++c) std::swap(mm[piv*NV+c], mm[col*NV+c]); sign = -sign; }
+    const double d = mm[col*NV+col];
+    if (d < 0) sign = -sign;
+    logabs += std::log(std::fabs(d));
+    const double inv = 1.0/d;
+    for (std::size_t r = col+1; r < Nsq; ++r) {
+      const double f = mm[r*NV+col]*inv;
+      if (f != 0.0) for (std::size_t c=col;c<NV;++c) mm[r*NV+c] -= f*mm[col*NV+c];
+    }
+  }
+  if (singular) return 0.0;
+  return sign * std::exp(logabs / (double)Nsq);   /* signed geometric mean */
+}
+
 }  // namespace
 
 /* Classify a sample's Floquet multipliers into stability + bifurcation flags.
@@ -1679,12 +1756,20 @@ static void classify_floquet(const std::vector<Complex> &mult, CycleSample *s) {
     if (d < best) { best = d; triv = i; }
   }
   double maxmag = 0.0; bool pd = false, ns = false;
+  /* signed PD test: product of (mu_i + 1) over non-trivial multipliers. A real
+   * multiplier crossing -1 flips its (mu+1) factor sign, so the product changes
+   * sign exactly at a period-doubling. NS test: largest non-trivial |mu| that
+   * belongs to a complex pair, minus 1 (crosses 0 when the pair hits the unit
+   * circle). */
+  double pd_prod = 1.0; double ns_maxmag_cplx = 0.0;
   for (std::size_t i = 0; i < mult.size(); ++i) {
     s->floquet_re.push_back(mult[i].real());
     s->floquet_im.push_back(mult[i].imag());
     if (i == triv) continue;
     const double mag = std::hypot(mult[i].real(), mult[i].imag());
     if (mag > maxmag) maxmag = mag;
+    pd_prod *= (mult[i].real() + 1.0);            /* signed PD test factor */
+    if (std::fabs(mult[i].imag()) > 1e-6 && mag > ns_maxmag_cplx) ns_maxmag_cplx = mag;
     if (mult[i].real() < -1.0 + 0.02 && std::fabs(mult[i].imag()) < 0.02) pd = true;
     if (std::fabs(mult[i].imag()) > 0.02 && std::fabs(mag - 1.0) < 0.03) ns = true;
   }
@@ -1692,6 +1777,8 @@ static void classify_floquet(const std::vector<Complex> &mult, CycleSample *s) {
   s->stable = (maxmag < 1.0 + 1e-3);
   s->is_pd = pd;
   s->is_ns = ns;
+  s->pd_test = pd_prod;
+  s->ns_test = (ns_maxmag_cplx > 0.0) ? (ns_maxmag_cplx - 1.0) : std::nan("");
 }
 
 /* Refine a rough periodic-orbit guess by SIMULATION: integrate the ODE from a
@@ -1873,6 +1960,11 @@ static CycleBranch continue_limit_cycle_arclength(
     cyc_amp(U, n, M, &s.amplitude, &s.min0, &s.max0);
     CycleCtx cf = c; cf.p = Vc[Ulen];
     s.fold_test = cycle_fold_test(cf, U);
+    /* branch-point-of-cycles test: bordered determinant using the current
+     * branch tangent (skipped on the very first record, before a tangent
+     * exists; tangent has length NV = Ulen+1 once computed). */
+    if (tangent.size() == Ulen + 1) s.bp_test = cycle_bp_test(cf, Vc, Ulen, tangent);
+    else s.bp_test = std::nan("");
     if (settings.compute_floquet) {
       std::vector<Complex> mult; cycle_floquet(cf, U, &mult); classify_floquet(mult, &s);
     }
@@ -1960,11 +2052,76 @@ static CycleBranch continue_limit_cycle_arclength(
   out.turned = turned;
   std::sort(out.samples.begin(), out.samples.end(),
             [](const CycleSample &a, const CycleSample &b){ return a.p < b.p; });
-  /* also flag LPC by fold-test sign change (belt and suspenders) */
-  for (std::size_t i = 1; i < out.samples.size(); ++i) {
-    const double a = out.samples[i-1].fold_test, b = out.samples[i].fold_test;
-    if (std::isfinite(a) && std::isfinite(b) && a * b < 0.0)
-      out.samples[std::fabs(a) < std::fabs(b) ? i-1 : i].is_fold = true;
+  /* also flag LPC by fold-test sign change -- but ONLY when the parameter has a
+   * local extremum (a true turning point) at that interval. A branch point of
+   * cycles ALSO makes the cycle determinant vanish (a second multiplier hits
+   * +1), so a bare fold-test sign change is ambiguous; requiring a p-turn keeps
+   * this flag meaning LPC (fold) and lets the BPC pass below own the crossings
+   * where p passes straight through. */
+  for (std::size_t i = 1; i + 1 < out.samples.size(); ++i) {
+    const double a = out.samples[i-1].fold_test, b = out.samples[i+1].fold_test;
+    if (!(std::isfinite(a) && std::isfinite(b)) || a * b >= 0.0) continue;
+    const double pm1 = out.samples[i-1].p, p0 = out.samples[i].p, pp1 = out.samples[i+1].p;
+    const bool p_turns = (p0 - pm1) * (pp1 - p0) < 0.0;   /* local extremum in p */
+    if (p_turns) out.samples[i].is_fold = true;
+  }
+  out.turned = out.turned || false;
+  /* PERIOD-DOUBLING and NEIMARK-SACKER by sign change of their test functions
+   * across consecutive samples, with the bifurcation parameter refined by
+   * linear interpolation of the (signed) test function to its zero. This turns
+   * the coarse per-sample flags into BRACKETED, located codim-1 points (PD: a
+   * real multiplier crosses -1; NS: a complex pair crosses the unit circle). */
+  if (settings.compute_floquet) {
+    /* clear the coarse per-sample flags; we re-set them ONLY where a sign
+     * change brackets a genuine crossing (with a refined parameter). */
+    for (auto &s : out.samples) { s.is_pd = false; s.is_ns = false; s.pd_p = 0; s.ns_p = 0; }
+    for (std::size_t i = 1; i < out.samples.size(); ++i) {
+      CycleSample &s0 = out.samples[i-1], &s1 = out.samples[i];
+      /* PD */
+      const double a = s0.pd_test, b = s1.pd_test;
+      if (std::isfinite(a) && std::isfinite(b) && a * b < 0.0) {
+        const double t = a / (a - b);                 /* zero of the line a->b */
+        const double pp = s0.p + t * (s1.p - s0.p);
+        CycleSample &tgt = (std::fabs(a) < std::fabs(b)) ? s0 : s1;
+        tgt.is_pd = true; tgt.pd_p = pp;
+      }
+      /* NS */
+      const double c = s0.ns_test, d = s1.ns_test;
+      if (std::isfinite(c) && std::isfinite(d) && c * d < 0.0) {
+        const double t = c / (c - d);
+        const double pp = s0.p + t * (s1.p - s0.p);
+        CycleSample &tgt = (std::fabs(c) < std::fabs(d)) ? s0 : s1;
+        tgt.is_ns = true; tgt.ns_p = pp;
+      }
+    }
+  }
+  /* BRANCH POINT OF CYCLES (BPC): where two cycle branches cross. The bordered
+   * BPC determinant changes sign at a branch point. We bracket sign changes of
+   * bp_test. A FOLD (LPC) also makes the plain cycle determinant (and hence,
+   * indirectly, bp_test) vanish -- but at a fold the branch TURNS in the
+   * parameter, while at a genuine BPC two branches cross transversally and the
+   * branch passes straight through. So we accept a BPC bracket only where the
+   * parameter is locally MONOTONIC (no turning point in a small neighborhood),
+   * which excludes folds. (Sorting is by p, so a turn shows up as a near-zero
+   * or reversed p-step around the interval.) */
+  {
+    /* mark samples adjacent to a genuine p-turn (fold) to exclude them */
+    std::vector<char> near_turn(out.samples.size(), 0);
+    for (std::size_t i = 0; i < out.samples.size(); ++i)
+      if (out.samples[i].is_fold) {
+        if (i > 0) near_turn[i-1] = 1;
+        near_turn[i] = 1;
+        if (i+1 < out.samples.size()) near_turn[i+1] = 1;
+      }
+    for (std::size_t i = 1; i < out.samples.size(); ++i) {
+      const double a = out.samples[i-1].bp_test, b = out.samples[i].bp_test;
+      if (!(std::isfinite(a) && std::isfinite(b)) || a * b >= 0.0) continue;
+      if (near_turn[i-1] || near_turn[i]) continue;     /* that's an LPC, skip */
+      const double t = a / (a - b);
+      const double pp = out.samples[i-1].p + t * (out.samples[i].p - out.samples[i-1].p);
+      CycleSample &tgt = (std::fabs(a) < std::fabs(b)) ? out.samples[i-1] : out.samples[i];
+      tgt.is_bp = true; tgt.bp_p = pp;
+    }
   }
   out.ok = out.samples.size() > 1;
   out.message = out.ok ? ("traced " + std::to_string(out.samples.size()) + " cycles" +
@@ -2133,6 +2290,67 @@ LPCCurve lpc_curve(const Model2 &m,
   out.message = out.ok ? ("traced " + std::to_string(out.points.size()) + " LPC points")
                        : "no fold-of-cycles found in this (p,q) window (the cycle may not fold here)";
   return out;
+}
+
+/* Shared engine for the PD and NS two-parameter curves: scan q, continue the
+ * cycle in p at each q with Floquet on, and collect the bracketed PD (want_pd)
+ * or NS (want_ns) sample. Mirrors lpc_curve. */
+static CycleBifCurve cycle_bif_curve(const Model2 &m,
+                                     const std::vector<std::vector<double>> &guess_points,
+                                     double period_guess, double p0, double q0,
+                                     const TwoParamSettings &settings,
+                                     const CycleSettings &cyc, bool want_pd) {
+  CycleBifCurve out;
+  const std::size_t n = m.n;
+  if (n < 2 || guess_points.size() < 4) { out.message = "need a 2+ D system and a cycle guess"; return out; }
+  const int nq = std::max(8, std::min(settings.max_points, 80));
+  std::vector<std::vector<double>> guess = guess_points;
+  double per = period_guess;
+  (void)q0;
+  auto model_at_q = [&](double qfix) {
+    Model mm; mm.n = n;
+    mm.vector_field = [&m, qfix](const double *xx, double pp, double *fo, std::string *er) {
+      return m.vector_field(xx, pp, qfix, fo, er);
+    };
+    return mm;
+  };
+  for (int iq = 0; iq <= nq; ++iq) {
+    const double q = settings.q_min + (settings.q_max - settings.q_min) * (double)iq / nq;
+    Model mm = model_at_q(q);
+    CycleSettings cs = cyc;
+    cs.p_min = settings.p_min; cs.p_max = settings.p_max;
+    cs.compute_floquet = true;                 /* required for PD/NS detection */
+    CycleBranch br = continue_limit_cycle(mm, guess, per, p0, cs);
+    if (!br.ok || br.samples.empty()) continue;
+    for (const auto &smp : br.samples) {
+      const bool hit = want_pd ? smp.is_pd : smp.is_ns;
+      if (hit) {
+        CycleBifPoint pt;
+        pt.p = want_pd ? smp.pd_p : smp.ns_p;  /* the refined bifurcation param */
+        pt.q = q; pt.period = smp.period; pt.amplitude = smp.amplitude;
+        out.points.push_back(pt);
+        break;
+      }
+    }
+    const CycleSample &mid = br.samples[br.samples.size()/2];
+    per = mid.period; p0 = mid.p;
+  }
+  out.ok = out.points.size() >= 2;
+  const char *what = want_pd ? "PD" : "NS";
+  out.message = out.ok ? ("traced " + std::to_string(out.points.size()) + std::string(" ") + what + " points")
+                       : (std::string("no ") + what + " bifurcation found in this (p,q) window");
+  return out;
+}
+
+CycleBifCurve pd_curve(const Model2 &m, const std::vector<std::vector<double>> &guess_points,
+                       double period_guess, double p0, double q0,
+                       const TwoParamSettings &settings, const CycleSettings &cyc) {
+  return cycle_bif_curve(m, guess_points, period_guess, p0, q0, settings, cyc, /*want_pd=*/true);
+}
+CycleBifCurve ns_curve(const Model2 &m, const std::vector<std::vector<double>> &guess_points,
+                       double period_guess, double p0, double q0,
+                       const TwoParamSettings &settings, const CycleSettings &cyc) {
+  return cycle_bif_curve(m, guess_points, period_guess, p0, q0, settings, cyc, /*want_pd=*/false);
 }
 
 /* ---- Hopf first Lyapunov coefficient ------------------------------------ */
@@ -3389,6 +3607,105 @@ HomoclinicResult solve_homoclinic(const Model &m,
   R.ok = (resn < 1e-5);
   R.message = R.ok ? ("converged homoclinic orbit (residual " + std::to_string(resn) + ", T=" + std::to_string(R.T) + ")")
                    : ("did not fully converge (residual " + std::to_string(resn) + ")");
+  return R;
+}
+
+HeteroclinicResult solve_heteroclinic(const Model &m,
+                                      const std::vector<double> &x0_guess,
+                                      const std::vector<double> &x1_guess, double p,
+                                      const std::vector<std::vector<double>> &seed_orbit,
+                                      const HomoclinicSettings &settings) {
+  HeteroclinicResult R;
+  const std::size_t n = m.n;
+  const int M = std::max(8, settings.mesh);
+  if (x0_guess.size()!=n || x1_guess.size()!=n || seed_orbit.size()<4) { R.message="bad input to solve_heteroclinic"; return R; }
+
+  /* 1. refine BOTH saddles + their left subspaces */
+  std::vector<double> x0=x0_guess, x1=x1_guess; std::string err;
+  if (!correct_equilibrium(m,&x0,p,60,1e-11,&err)) { R.message="saddle 0 did not converge: "+err; return R; }
+  if (!correct_equilibrium(m,&x1,p,60,1e-11,&err)) { R.message="saddle 1 did not converge: "+err; return R; }
+  { double d=0; for(std::size_t k=0;k<n;k++){double dd=x0[k]-x1[k]; d+=dd*dd;} if (std::sqrt(d)<1e-6) { R.message="the two saddles coincide (use solve_homoclinic)"; return R; } }
+  std::vector<double> A0, A1;
+  if (!finite_diff_jacobian(m,x0.data(),p,&A0,&err,1e-7)) { R.message="Jacobian failed at saddle 0"; return R; }
+  if (!finite_diff_jacobian(m,x1.data(),p,&A1,&err,1e-7)) { R.message="Jacobian failed at saddle 1"; return R; }
+  std::vector<std::vector<double>> Ls0,Lu0,Ls1,Lu1; int nu0=0,nu1=0;
+  if (!saddle_left_subspaces(A0,n,&Ls0,&Lu0,&nu0,&err)) { R.message="saddle 0: "+err; return R; }
+  if (!saddle_left_subspaces(A1,n,&Ls1,&Lu1,&nu1,&err)) { R.message="saddle 1: "+err; return R; }
+  R.saddle0=x0; R.saddle1=x1; R.n_unstable0=nu0; R.n_stable1=(int)n-nu1;
+  if (nu0==0) { R.message="saddle 0 has no unstable directions (no outgoing connection)"; return R; }
+  if (nu1==(int)n) { R.message="saddle 1 has no stable directions (no incoming connection)"; return R; }
+
+  /* 2. seed: resample onto M+1 points */
+  const int Np=(int)seed_orbit.size();
+  std::vector<double> U((size_t)(M+1)*n+1, 0.0);
+  auto resample=[&](double s, std::vector<double>&xo){ double f=s*(Np-1); int i=(int)std::floor(f); if(i>Np-2)i=Np-2; if(i<0)i=0; double t=f-i; xo.resize(n); for(std::size_t k=0;k<n;k++) xo[k]=(1-t)*seed_orbit[i][k]+t*seed_orbit[i+1][k]; };
+  std::vector<double> xtmp(n);
+  for (int j=0;j<=M;j++){ resample((double)j/M,xtmp); for(std::size_t k=0;k<n;k++) U[(size_t)j*n+k]=xtmp[k]; }
+  double L=0; for(int i=1;i<Np;i++){double d=0;for(std::size_t k=0;k<n;k++){double dd=seed_orbit[i][k]-seed_orbit[i-1][k];d+=dd*dd;}L+=std::sqrt(d);}
+  double Tguess=settings.T; if(Tguess<=0) Tguess=std::max(1.0,0.5*L);
+  U[(size_t)(M+1)*n]=Tguess;
+
+  /* phase condition at the midpoint (pins time translation) */
+  std::vector<double> xmidseed(n); resample(0.5,xmidseed);
+  std::vector<double> phase_normal(n); { std::string e; m.vector_field(xmidseed.data(),p,phase_normal.data(),&e); }
+  std::vector<double> phase_ref=xmidseed;
+
+  auto field=[&](const double*x,std::vector<double>&f)->bool{ f.resize(n); std::string e; return m.vector_field(x,p,f.data(),&e); };
+  /* left BC: (x(0)-x0) in x0's UNSTABLE subspace  => orthogonal to x0 stable left-eigvecs Ls0
+   * right BC: (x(1)-x1) in x1's STABLE subspace   => orthogonal to x1 unstable left-eigvecs Lu1 */
+  const int n_s0=(int)Ls0.size(), n_u1=(int)Lu1.size();
+  const int NF = M*(int)n + n_s0 + n_u1 + 1;
+  const int NV = (M+1)*(int)n + 1;
+  auto residual=[&](const std::vector<double>&Uv, std::vector<double>*Fo)->bool{
+    Fo->assign(NF,0.0);
+    const double T=Uv[(size_t)(M+1)*n];
+    std::vector<double> fi(n),fj(n),xi(n),xj(n);
+    for (int i=0;i<M;i++){
+      for(std::size_t k=0;k<n;k++){ xi[k]=Uv[(size_t)i*n+k]; xj[k]=Uv[(size_t)(i+1)*n+k]; }
+      if(!field(xi.data(),fi)) return false;
+      if(!field(xj.data(),fj)) return false;
+      const double h=1.0/(double)M;
+      for(std::size_t k=0;k<n;k++) (*Fo)[(size_t)i*n+k]=xj[k]-xi[k]-h*T*(fi[k]+fj[k]);
+    }
+    int row=M*(int)n;
+    for (int r=0;r<n_s0;r++){ double s=0; for(std::size_t k=0;k<n;k++) s+=(Uv[k]-x0[k])*Ls0[r][k]; (*Fo)[row++]=s; }
+    for (int r=0;r<n_u1;r++){ double s=0; for(std::size_t k=0;k<n;k++) s+=(Uv[(size_t)M*n+k]-x1[k])*Lu1[r][k]; (*Fo)[row++]=s; }
+    { double s=0; for(std::size_t k=0;k<n;k++) s+=(Uv[(size_t)(M/2)*n+k]-phase_ref[k])*phase_normal[k]; (*Fo)[row++]=s; }
+    return true;
+  };
+
+  std::vector<double> F(NF), Uv=U; double resn=0; int step=0;
+  for (; step<settings.newton_iters; ++step) {
+    if(!residual(Uv,&F)){ R.message="field eval failed during Newton"; return R; }
+    resn=0; for(double f:F) resn+=f*f; resn=std::sqrt(resn);
+    if(resn<settings.newton_tol) break;
+    std::vector<double> J((size_t)NF*NV,0.0), F2(NF), Up=Uv;
+    for (int c=0;c<NV;c++){ const double save=Up[c]; const double dh=1e-7*(std::fabs(save)+1e-3);
+      Up[c]=save+dh; if(!residual(Up,&F2)){Up[c]=save;continue;} Up[c]=save;
+      for(int r=0;r<NF;r++) J[(size_t)r*NV+c]=(F2[r]-F[r])/dh; }
+    if(!settings.free_T) for(int r=0;r<NF;r++) J[(size_t)r*NV+(NV-1)]=0.0;
+    std::vector<double> JTJ((size_t)NV*NV,0.0), JTF(NV,0.0);
+    for (int a=0;a<NV;a++){ double g=0; for(int r=0;r<NF;r++) g+=J[(size_t)r*NV+a]*F[r]; JTF[a]=g;
+      for(int b=0;b<NV;b++){ double s=0; for(int r=0;r<NF;r++) s+=J[(size_t)r*NV+a]*J[(size_t)r*NV+b]; JTJ[(size_t)a*NV+b]=s; } }
+    for (int a=0;a<NV;a++) JTJ[(size_t)a*NV+a]+=1e-9;
+    std::vector<double> dU, rhs(NV); for(int a=0;a<NV;a++) rhs[a]=-JTF[a];
+    if(!solve_linear(JTJ,rhs,&dU)){ R.message="Newton linear solve failed"; break; }
+    double dn=0; for(double v:dU) dn+=v*v; dn=std::sqrt(dn);
+    double damp= dn>0.5?0.5/dn:1.0;
+    for(int a=0;a<NV;a++) Uv[a]+=damp*dU[a];
+    if(Uv[(size_t)(M+1)*n]<1e-3) Uv[(size_t)(M+1)*n]=1e-3;
+  }
+
+  R.newton_residual=resn; R.newton_steps=step; R.T=Uv[(size_t)(M+1)*n];
+  R.orbit.assign(M+1,std::vector<double>(n)); R.tau.assign(M+1,0.0);
+  double len=0; std::vector<double> prev;
+  for (int j=0;j<=M;j++){ R.tau[j]=(double)j/M; std::vector<double> pt(n);
+    for(std::size_t k=0;k<n;k++){ pt[k]=Uv[(size_t)j*n+k]; R.orbit[j][k]=pt[k]; }
+    if(j>0){ double d=0; for(std::size_t k=0;k<n;k++){double dd=pt[k]-prev[k];d+=dd*dd;} len+=std::sqrt(d);} prev=pt; }
+  R.length=len;
+  R.ok=(resn<1e-5);
+  R.message = R.ok ? ("converged heteroclinic orbit (residual "+std::to_string(resn)+", T="+std::to_string(R.T)+")")
+                   : ("did not fully converge (residual "+std::to_string(resn)+")");
   return R;
 }
 

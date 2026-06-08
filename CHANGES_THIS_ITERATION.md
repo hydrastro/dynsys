@@ -1,51 +1,45 @@
-# dynsys — robust limit-cycle & homoclinic continuation; Lin's-method progress
+# dynsys — branch point of cycles (BPC) detection
 
 Unzip at repo root, `make clean && make && make run`. CAS features need
-LIZARD + SANGAKU_ROOT (or the Nix dev shell). Verified by regression tests and
-by building/running the real GUI.
+LIZARD + SANGAKU_ROOT (or the Nix dev shell).
 
-## 1. Limit-cycle continuation: simulation-based self-seeding  [NEW, the headline]
-continue_limit_cycle previously REQUIRED the caller to supply a near-converged
-cycle: a crude guess (e.g. a circle) failed Newton for far-from-circular cycles
-like the van der Pol relaxation oscillation. It now SELF-SEEDS: if the initial
-collocation Newton fails, it integrates the ODE to settle onto the attracting
-cycle, detects one period via a Poincare-section return, resamples that loop to
-the mesh, and retries. Both the arclength and monotone paths use it.
-  - VALIDATED (new test lc_selfseed_smoke): van der Pol continued from a crude
-    CIRCLE across mu in [1.0, 2.67] (81 cycles); period grows correctly with mu
-    (relaxation regime) and the trivial Floquet multiplier stays within 0.04 of
-    1 on the stiffening orbit. Previously this guess failed outright.
+## Branch point of cycles (BPC)  [NEW — roadmap item B]
+continue_limit_cycle now DETECTS branch points of cycles -- parameter values
+where two periodic-orbit branches cross (e.g. a symmetry-breaking / transcritical
+bifurcation of cycles, the multiplier signature being a SECOND Floquet multiplier
+passing through +1 while the branch does not fold).
 
-## 2. Homoclinic continuation: tangent predictor  [IMPROVED]
-continue_homoclinic now uses a TANGENT PREDICTOR (extrapolate the primary
-parameter p along the curve from the last two accepted points) plus a robust
-seed handoff and a one-retry fallback, instead of reusing the last p. This holds
-the curve over a wide secondary-parameter range and tolerates gentle folds.
-  - VALIDATED: on the conservative family x'=y, y'=q x - x^2 + p y it traces 36
-    points across q in [0.25, 2.00] with p-drift 0 from the locus p=0 and
-    amplitude error ~0.15%.
+Method: a signed bordered-determinant test function (cycle_bp_test). The
+extended cycle Jacobian dF/d(U,p) (N rows, N+1 unknowns) is bordered with the
+branch tangent as the last row; the determinant of that square matrix changes
+sign at a branch point. Two numerical points were essential:
+  - the raw determinant of a ~200x200 matrix underflows to ~1e-27 even when
+    well-conditioned, so we return the SIGNED GEOMETRIC-MEAN determinant
+    sign(det)*|det|^(1/N), which stays O(1) and preserves the sign;
+  - the bordering tangent's overall sign is a gauge (the two-direction
+    continuation negates it), so we fix the gauge (orient the tangent's
+    parameter component non-negative) -- otherwise the sign flips spuriously.
+Distinguishing BPC from LPC: a fold ALSO makes the cycle determinant vanish, so
+a bare sign change is ambiguous. A genuine BPC has the branch passing straight
+through (parameter locally monotonic) whereas a fold turns in the parameter; the
+detector accepts a BPC bracket only where there is no p-turn, and the fold flag
+itself was tightened to require a local extremum in p. Each CycleSample carries
+bp_test and, when bracketed, is_bp / bp_p (the refined branch-point parameter).
 
-## 3. Lin's method for the BT homoclinic  [EXPERIMENTAL, improved but not reliable]
-lin_homoclinic's test function was rebuilt: it now relocates the saddle at each
-p, integrates the unstable manifold (choosing the bounded-return orientation),
-finds the closest return to the saddle AFTER the excursion peak, and measures
-the SIGNED distance along the stable left-eigenvector (covector normal to the
-stable manifold). A coarse-scan + golden-section minimizer drives |gap| toward
-its dip.
-  - HONEST STATUS: the signed gap genuinely DIPS near the true Bogdanov-Takens
-    homoclinic (visible in a parameter sweep), and the orbits are now real
-    returning loops. But the automated locator does NOT robustly pin the stiff
-    BT homoclinic: the one-sided manifold return leaves a residual the secant
-    can't bracket, and amplitude/sign confounds make a clean minimum elusive.
-    The routine now REPORTS "homoclinic not robustly located" and points to
-    solve_homoclinic / continue_homoclinic, rather than emitting a false
-    positive (a spurious tiny-loop "pass" was caught and removed). It is marked
-    EXPERIMENTAL in the header. The genuinely unsolved piece is a two-sided Lin
-    gap (forward unstable + backward stable on a shared section) for a true sign
-    change -- deferred.
+### Validation (new test bpc_smoke), two cases:
+  - van der Pol (a clean branch, NO branch point): bp_test stays one sign across
+    the whole branch -> ZERO BPCs reported (no false positives).
+  - A constructed transcritical-of-cycles  x'=-y+x(1-r^2), y'=x+y(1-r^2),
+    z'=(mu - x^2) z  has its transverse Floquet multiplier pass through +1 at
+    mu=1/2 (since <x^2> = 1/2 on the unit cycle). The detector brackets the BPC
+    at mu=0.4950, matching the analytic 0.5 to within 0.005.
+
+## Roadmap status (docs/ROADMAP_MATCONT_PARITY.md)
+A heteroclinic connections (prior iteration) and B branch-point-of-cycles
+(this iteration) are now DONE. Remaining: C codim-2 points on cycle-bifurcation
+curves, D a fully robust Lin's method for the stiff Bogdanov-Takens homoclinic.
 
 ## Verification
-- All 4 C++ TUs compile ZERO warnings; the REAL GLFW/OpenGL binary builds and
-  runs the LimitCycle and Continuation views headless.
-- New lc_selfseed_smoke passes; lc_colloc, lpc_arclength, lpccurve,
-  branch_switch, homoclinic_cont all pass; CAS green.
+- All 4 C++ TUs compile ZERO warnings; the REAL GLFW/OpenGL binary builds + runs.
+- New bpc_smoke passes; lpc_arclength, lpccurve, pd_curve, lc_selfseed,
+  heteroclinic all pass; CAS green.

@@ -325,6 +325,30 @@ HomoclinicResult solve_homoclinic(const Model &m,
                                   const std::vector<std::vector<double>> &seed_orbit,
                                   const HomoclinicSettings &settings);
 
+/* Heteroclinic connection: an orbit from saddle x0 (leaving along its UNSTABLE
+ * manifold) to a DIFFERENT saddle x1 (arriving along x1's STABLE manifold),
+ * solved as a truncated BVP with projection boundary conditions split between
+ * the two equilibria. Generalizes solve_homoclinic (which is the x1 == x0
+ * case). seed_orbit is an ordered guess of the connecting trajectory (e.g. from
+ * integrating x0's unstable manifold until it nears x1). */
+struct HeteroclinicResult {
+  bool ok = false;
+  std::string message;
+  std::vector<double> saddle0, saddle1;       /* the two equilibria          */
+  std::vector<std::vector<double>> orbit;     /* mesh+1 points, each length n */
+  std::vector<double> tau;                    /* mesh+1 values in [0,1]      */
+  double T = 0.0;                             /* converged half-time         */
+  double length = 0.0;                        /* arclength of the connection  */
+  int n_unstable0 = 0, n_stable1 = 0;
+  double newton_residual = 0.0;
+  int newton_steps = 0;
+};
+HeteroclinicResult solve_heteroclinic(const Model &m,
+                                      const std::vector<double> &x0_guess,
+                                      const std::vector<double> &x1_guess, double p,
+                                      const std::vector<std::vector<double>> &seed_orbit,
+                                      const HomoclinicSettings &settings);
+
 /* Build a homoclinic SEED by integrating the unstable manifold: nudge a point
  * off the saddle along its dominant unstable eigenvector and integrate forward
  * with RK4 (trying both orientations) until the trajectory returns near the
@@ -414,6 +438,18 @@ LinResult lin_homoclinic(const Model2 &m2, const std::vector<double> &saddle_gue
 struct LPCPoint { double p = 0.0, q = 0.0; double period = 0.0; double amplitude = 0.0; };
 struct LPCCurve {
   std::vector<LPCPoint> points;
+  std::string message;
+  bool ok = false;
+};
+
+/* Two-parameter loci of cycle codim-1 bifurcations: period-doubling (PD, a real
+ * Floquet multiplier = -1) and Neimark-Sacker (NS, a complex multiplier pair on
+ * the unit circle). Same point type as LPC. Traced by scanning the secondary
+ * parameter q, continuing the cycle in p at each q (with Floquet on), and
+ * picking the bracketed PD / NS sample on that branch. */
+struct CycleBifPoint { double p = 0.0, q = 0.0; double period = 0.0; double amplitude = 0.0; };
+struct CycleBifCurve {
+  std::vector<CycleBifPoint> points;
   std::string message;
   bool ok = false;
 };
@@ -624,6 +660,18 @@ struct CycleSample {
   double max_nontrivial_mult = 0.0; /* |largest non-trivial multiplier|     */
   bool is_pd = false;      /* period-doubling (a multiplier passed -1)      */
   bool is_ns = false;      /* Neimark-Sacker / torus (complex pair hit |.|=1)*/
+  /* SIGNED test functions whose sign change between samples brackets the
+   * bifurcation (refined by bisection, like the fold test):
+   *  pd_test = prod over non-trivial multipliers of (mu_i + 1)  -> 0 at PD
+   *  ns_test = (max non-trivial |mu| of a COMPLEX pair) - 1     -> 0 at NS  */
+  double pd_test = 0.0, ns_test = 0.0;
+  double pd_p = 0.0, ns_p = 0.0;  /* refined parameter at the PD / NS point  */
+  /* Branch point of cycles (BPC): where two periodic-orbit branches cross. The
+   * signed bp_test (a bordered determinant) changes sign at a BPC; is_bp/bp_p
+   * are set when a sign change brackets one. */
+  double bp_test = 0.0;
+  bool is_bp = false;
+  double bp_p = 0.0;
 };
 struct CycleBranch {
   std::vector<CycleSample> samples;
@@ -662,5 +710,17 @@ LPCCurve lpc_curve(const Model2 &m,
                    const std::vector<std::vector<double>> &guess_points,
                    double period_guess, double p0, double q0,
                    const TwoParamSettings &settings, const CycleSettings &cyc);
+
+/* Period-doubling (PD) curve in two parameters. */
+CycleBifCurve pd_curve(const Model2 &m,
+                       const std::vector<std::vector<double>> &guess_points,
+                       double period_guess, double p0, double q0,
+                       const TwoParamSettings &settings, const CycleSettings &cyc);
+
+/* Neimark-Sacker (NS / torus) curve in two parameters. */
+CycleBifCurve ns_curve(const Model2 &m,
+                       const std::vector<std::vector<double>> &guess_points,
+                       double period_guess, double p0, double q0,
+                       const TwoParamSettings &settings, const CycleSettings &cyc);
 
 }  // namespace dynsys::analysis
