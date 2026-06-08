@@ -8083,46 +8083,12 @@ void run_homoclinic(AppState &app) {
   int n_pos = 0; for (auto &z : ev) if (z.real() > 1e-7) ++n_pos;
   if (n_pos == 0 || n_pos == (int)n) { app.homoclinic_msg = "equilibrium is not a saddle (no homoclinic possible)"; return; }
 
-  /* crude unstable direction: power-iterate J to get the dominant eigvec */
-  std::vector<double> d(n, 0.0); d[0] = 1.0;
-  for (int it = 0; it < 200; ++it) {
-    std::vector<double> nd(n, 0.0);
-    for (size_t i = 0; i < n; ++i) for (size_t j = 0; j < n; ++j) nd[i] += J[i*n+j]*d[j];
-    double nr = 0; for (double v : nd) nr += v*v; nr = std::sqrt(nr);
-    if (nr < 1e-300) break;
-    for (double &v : nd) v /= nr;
-    d = nd;
-  }
-
-  /* 2. integrate forward from x0 + eps*d with RK4 to trace one excursion. We
-   * stop when the orbit returns close to the saddle after having left it. */
-  const double eps = 1e-4;
-  std::vector<double> x(n);
-  for (size_t i = 0; i < n; ++i) x[i] = x0[i] + eps*d[i];
+  /* 2. seed by integrating the unstable manifold (robust helper: tries both
+   * orientations, keeps the excursion that returns nearest the saddle). */
   const double dt = (app.dt > 0 ? app.dt : 0.01);
   std::vector<std::vector<double>> seed;
-  seed.reserve(20000);
-  auto fld = [&](const std::vector<double> &xx, std::vector<double> &ff) {
-    ff.assign(n, 0.0); std::string er; return model.vector_field(xx.data(), pval, ff.data(), &er);
-  };
-  double maxdev = 0.0; bool left = false; int steps = 0; const int maxsteps = 200000;
-  std::vector<double> k1(n),k2(n),k3(n),k4(n),tmp(n);
-  for (; steps < maxsteps; ++steps) {
-    seed.push_back(x);
-    double dev = 0; for (size_t i = 0; i < n; ++i){ double dd=x[i]-x0[i]; dev+=dd*dd; } dev = std::sqrt(dev);
-    maxdev = std::max(maxdev, dev);
-    if (dev > 5.0*eps) left = true;
-    if (left && dev < 5.0*eps && seed.size() > 50) break; /* returned near saddle */
-    if (dev > 1e6 || !std::isfinite(dev)) break;          /* diverged: not homoclinic */
-    /* RK4 */
-    if (!fld(x,k1)) break;
-    for (size_t i=0;i<n;i++){ tmp[i]=x[i]+0.5*dt*k1[i]; }
-    if(!fld(tmp,k2)) break;
-    for (size_t i=0;i<n;i++){ tmp[i]=x[i]+0.5*dt*k2[i]; }
-    if(!fld(tmp,k3)) break;
-    for (size_t i=0;i<n;i++){ tmp[i]=x[i]+dt*k3[i]; }
-    if(!fld(tmp,k4)) break;
-    for (size_t i=0;i<n;i++) x[i]+=dt*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6.0;
+  if (!dynsys::analysis::seed_homoclinic_by_integration(model, x0, pval, dt, 2000.0*dt, &seed, &e)) {
+    app.homoclinic_msg = std::string("homoclinic seeding failed: ") + e; return;
   }
   if (seed.size() < 20) { app.homoclinic_msg = "could not trace an excursion off the saddle"; return; }
 
@@ -10201,6 +10167,13 @@ void draw_gui(AppState &app) {
           if (sp.special==dynsys::analysis::SpecialPointKind::BogdanovTakens && sp.has_codim2_nf)
             ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  BT normal form: a=%.4g, b=%.4g  (a,b != 0 => non-degenerate)",
                               kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.bt_a, sp.bt_b);
+          else if (sp.special==dynsys::analysis::SpecialPointKind::Cusp && sp.has_codim2_nf)
+            ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  cusp cubic coefficient c=%.4g  (c != 0 => non-degenerate)",
+                              kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.cusp_c);
+          else if (sp.special==dynsys::analysis::SpecialPointKind::GeneralizedHopf && sp.has_codim2_nf)
+            ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  2nd Lyapunov coeff l2=%.4g (sign %s => fold-of-cycles opens %s)",
+                              kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.gh_l2,
+                              sp.gh_l2 < 0 ? "-" : "+", sp.gh_l2 < 0 ? "supercritically" : "subcritically");
           else
             ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  [refined]",
                               kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2);

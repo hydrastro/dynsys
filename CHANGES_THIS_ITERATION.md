@@ -1,56 +1,58 @@
-# dynsys — three fronts: 2-parameter homoclinic continuation, parallel fractals, analytic validation suite
+# dynsys — codim-2 depth (cusp cubic + generalized-Hopf l2) and homoclinic seeding
 
 Unzip at repo root, `make clean && make && make run`. CAS features need
 LIZARD + SANGAKU_ROOT (or the Nix dev shell). Verified by new regression tests
-against analytic results, forced-concurrency pixel-identity checks, and by
-building/running the real GUI.
+against analytic results and by building/running the real GUI.
 
-## 1. Two-parameter homoclinic CONTINUATION (completes HomCont)
-The previous release solved a single homoclinic orbit (truncated BVP +
-projection BCs). A homoclinic connection is codim-1, so in a (p,q) plane it
-traces a CURVE. `analysis::continue_homoclinic` now follows it: it steps the
-secondary parameter q and, at each q, finds the primary parameter p where the
-connection closes (BVP residual -> 0), re-using the previous converged orbit as
-the seed (natural/warm-started continuation), tracing both directions.
-  - In the GUI (Continuation view): after "Find homoclinic orbit", a "Continue
-    homoclinic curve" button traces the locus in (cont_param vs twopar_p2) and
-    plots it (primary param vs secondary).
-  - VALIDATED (new test homoclinic_cont_smoke): on x'=y, y'=q*x-x^2+p*y the
-    traced locus matches the conservative line p=0 with peak amplitude 1.5*q at
-    every q across 25 points, residuals ~1e-12.
-  - Honest limit: warm-started natural continuation following p(q); it relies on
-    a good starting homoclinic (the inner solve's seeding). Very stiff / large
-    BT-type loops need a better seed than the simple GUI excursion provides.
+## 1. Cusp normal-form coefficient c (codim-2)
+On a fold curve, where the quadratic fold coefficient a -> 0, the cusp is
+classified by the CUBIC coefficient c of the reduced dynamics y' = c y^3 + ...:
+  c = (1/6) <p, C(q,q,q) - 3 B(q,h2)>,  A h2 = -(B(q,q) - <p,B(q,q)> q),
+with A singular (Govaerts bordered solve). New analysis::cusp_normal_form.
+  - EXACT on the normal form: x'=2x^3 -> c=2.0000, x'=-0.5x^3 -> c=-0.5000,
+    2-D x'=x^3 (stable y) -> c=1.0000.
 
-## 2. Parallel FRACTAL / escape-time rendering (multi-core)
-After the basins parallelisation, the escape-time fractal (the other hotspot) is
-now multi-threaded too. Each worker thread owns a private ThreadStepper (its own
-IR eval scratch AND its own parameter snapshot), so PARAMETER-space fractals --
-which vary parameters per pixel -- are now thread-safe (each thread overrides
-parameters only in its private copy). Rows are distributed across
-hardware_concurrency() threads; the AST-fallback evaluator keeps the serial
-path.
-  - VERIFIED bit-identical: with the parallel path FORCED on (sandbox is single
-    core), the rendered Mandelbrot is pixel-for-pixel identical to the serial
-    render (max pixel difference 0 across 1.28M pixels).
-  - Speedup is realised on multi-core machines; correctness (identical output)
-    is what was checked here.
+## 2. Generalized-Hopf (Bautin) second Lyapunov coefficient l2 (codim-2)
+On a Hopf curve, where the first Lyapunov coefficient l1 -> 0, the Bautin point
+is classified by l2. New analysis::gh_second_lyapunov implements Kuznetsov's
+invariant Re<p,...> combination at 5th order on the critical eigenspace, with
+new 4th/5th-order directional-derivative stencils, symmetric 4-/5-linear forms
+(D, E) by polarization, and a complex multilinear evaluator. The intermediate
+vectors h20,h11,h30,h21 are solved from (k i w I - A) systems (the singular
+k=+/-1 case by a bordered solve).
+  - Validated on the Bautin normal form x'=-y+L x r^4, y'=x+L y r^4 (l1=0): the
+    SIGN of l2 is correct for L=+1, -1, +2 and the magnitude scales linearly.
+  - HONEST NOTE: l2 leans on 4th/5th finite differences, so the MAGNITUDE
+    carries a convention factor and is approximate. The SIGN -- which is what
+    classifies the Bautin point and the direction the fold-of-cycles curve opens
+    -- is the reliable output, and is reported in the GUI as super/subcritical.
 
-## 3. Analytic VALIDATION suite (head-to-head ground truth)
-A new `validation_smoke` test runs dynsys's analysis core against systems with
-KNOWN analytic answers -- the kind of comparison one runs against MatCont:
-  - Lorenz origin eigenvalues: 11.8277 and -22.8277 (exact). PASS.
-  - Supercritical Hopf normal form: first Lyapunov coefficient l1 < 0 (correctly
-    supercritical), frequency omega = 1. PASS.
-  - Van der Pol (mu=1): largest Lyapunov exponent ~ 0 (on the limit cycle). PASS.
-  - Homoclinic x'=y,y'=x-x^2: peak amplitude 1.4996 (analytic 1.5). PASS.
-  6/6 checks pass. (If you supply a specific system + parameters, the same kind
-  of check can be run head-to-head against your MatCont output.)
+Both coefficients are computed at the corresponding refined codim-2 points
+during two-parameter continuation and printed in the Continuation-view readout
+alongside the existing Bogdanov-Takens a,b.
+
+## 3. Homoclinic seeding hardening
+New analysis::seed_homoclinic_by_integration builds the homoclinic seed by
+integrating the unstable manifold: it nudges off the saddle along the dominant
+unstable eigenvector, tries BOTH orientations, integrates with RK4, and keeps
+the excursion that returns nearest the saddle. This replaces the hand-built
+inline seeding in the GUI homoclinic driver and is a far better initial guess.
+  - On the unforced Duffing oscillator (genuine homoclinic, peak sqrt(2)) it
+    seeds and the BVP converges in 2 Newton steps to residual ~1e-10.
+  - HONEST LIMIT (unchanged, now better understood): this does NOT make the
+    Bogdanov-Takens homoclinic converge. That is not a seeding bug -- a
+    homoclinic is codimension-1, so at an APPROXIMATE BT parameter there is no
+    exact connection to shadow, and the manifold trajectory runs to the time
+    budget without returning. Closing that needs Lin's method (measure the gap,
+    adjust a parameter to close it) -- a substantially larger build, deferred.
+
+## Validation
+- New regression tests: codim2_coeffs_smoke (cusp c exact + GH l2 sign) and
+  homoclinic_seed_smoke (Duffing manifold seed + solve). Both in `make test`.
 
 ## Verification
 - All 4 C++ TUs compile ZERO warnings; the REAL GLFW/OpenGL binary builds/runs.
-- Full suite passes (incl. homoclinic_cont_smoke, validation_smoke,
-  homoclinic_smoke, basins_mt_smoke, bt_codim2_smoke, branch_switch_smoke,
-  lpc_arclength_smoke, bridge_family_smoke); CAS green.
-- Parallel fractal proven pixel-identical to serial under forced concurrency;
-  fractal + continuation views run headless without crashing.
+- Full suite passes (incl. codim2_coeffs_smoke, homoclinic_seed_smoke,
+  homoclinic_smoke, homoclinic_cont_smoke, validation_smoke, basins_mt_smoke);
+  CAS green.
+- Continuation + fractal views run headless without crashing.

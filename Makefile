@@ -223,7 +223,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -316,7 +316,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-lpccurve test-eshadow test-bridgealign test-projsolid
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-lpccurve test-eshadow test-bridgealign test-projsolid
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -743,6 +743,22 @@ test-validation: $(VALIDATION_TEST_TARGET)
 $(VALIDATION_TEST_TARGET): test/validation_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/validation_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+CODIM2COEF_TEST_TARGET := $(BUILD_DIR)/codim2_coeffs_smoke$(EXEEXT)
+test-codim2coef: $(CODIM2COEF_TEST_TARGET)
+	./$(CODIM2COEF_TEST_TARGET)
+
+$(CODIM2COEF_TEST_TARGET): test/codim2_coeffs_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/codim2_coeffs_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+HOMOSEED_TEST_TARGET := $(BUILD_DIR)/homoclinic_seed_smoke$(EXEEXT)
+test-homoseed: $(HOMOSEED_TEST_TARGET)
+	./$(HOMOSEED_TEST_TARGET)
+
+$(HOMOSEED_TEST_TARGET): test/homoclinic_seed_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/homoclinic_seed_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
 
 
 LPCCURVE_TEST_TARGET := $(BUILD_DIR)/lpc_curve_smoke$(EXEEXT)

@@ -195,6 +195,19 @@ bool hopf_first_lyapunov(const Model &m, const std::vector<double> &x, double p,
 bool fold_normal_form(const Model &m, const std::vector<double> &x, double p,
                       double *a, double *lambda0, std::string *err);
 
+/* Cusp normal-form coefficient c (codim-2 on a fold curve where a -> 0). The
+ * center manifold is cubic y' = c y^3 + ...; c != 0 is the non-degeneracy
+ * condition. */
+bool cusp_normal_form(const Model &m, const std::vector<double> &x, double p,
+                      double *c, std::string *err);
+
+/* Generalized-Hopf (Bautin) SECOND Lyapunov coefficient l2 (codim-2 on a Hopf
+ * curve where l1 -> 0). Uses multilinear forms up to 5th order by finite
+ * differences, so it is approximate -- the SIGN is the reliable, classifying
+ * output. Returns false away from a Hopf point. */
+bool gh_second_lyapunov(const Model &m, const std::vector<double> &x, double p,
+                        double *l2, std::string *err);
+
 /* Bogdanov-Takens normal-form coefficients (a, b) at a BT point (double-zero
  * eigenvalue, 2x2 Jordan block). The planar BT normal form is w0'=w1,
  * w1'=a w0^2 + b w0 w1; non-degeneracy needs a != 0 and b != 0. */
@@ -239,6 +252,8 @@ struct TwoParamPoint {
   double p2 = 0.0, q2 = 0.0;
   std::vector<double> x2;
   double bt_a = 0.0, bt_b = 0.0;
+  double cusp_c = 0.0;   /* cusp cubic coefficient (Cusp points)            */
+  double gh_l2 = 0.0;    /* second Lyapunov coefficient (GeneralizedHopf)   */
   bool has_codim2_nf = false;
 };
 struct TwoParamCurve {
@@ -309,6 +324,17 @@ HomoclinicResult solve_homoclinic(const Model &m,
                                   const std::vector<double> &x0_guess, double p,
                                   const std::vector<std::vector<double>> &seed_orbit,
                                   const HomoclinicSettings &settings);
+
+/* Build a homoclinic SEED by integrating the unstable manifold: nudge a point
+ * off the saddle along its dominant unstable eigenvector and integrate forward
+ * with RK4 (trying both orientations) until the trajectory returns near the
+ * saddle. For a system with (or near) a homoclinic this shadows the orbit and
+ * gives a far better initial guess than a hand-built bump. Returns false if no
+ * return is detected within the budget. */
+bool seed_homoclinic_by_integration(const Model &m, const std::vector<double> &saddle,
+                                     double p, double dt, double max_time,
+                                     std::vector<std::vector<double>> *seed_out,
+                                     std::string *err);
 
 /* ---- two-parameter continuation of the HOMOCLINIC locus ----------------- *
  * A homoclinic connection is codimension-1, so in a two-parameter (p,q) plane

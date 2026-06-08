@@ -1267,6 +1267,20 @@ TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
                 curve.points[at].bt_a = a; curve.points[at].bt_b = b;
                 curve.points[at].has_codim2_nf = true;
               }
+            } else if (k == SpecialPointKind::Cusp) {
+              Model mm = model_at_q(best.q);
+              double cc = 0; std::string e;
+              if (cusp_normal_form(mm, best.x, best.p, &cc, &e)) {
+                curve.points[at].cusp_c = cc;
+                curve.points[at].has_codim2_nf = true;
+              }
+            } else if (k == SpecialPointKind::GeneralizedHopf) {
+              Model mm = model_at_q(best.q);
+              double ll2 = 0; std::string e;
+              if (gh_second_lyapunov(mm, best.x, best.p, &ll2, &e)) {
+                curve.points[at].gh_l2 = ll2;
+                curve.points[at].has_codim2_nf = true;
+              }
             }
           } else {
             curve.points[at].p2 = curve.points[at].p;
@@ -2061,6 +2075,49 @@ bool dir_third_real(DerivCtx &c, const std::vector<double> &w, std::vector<doubl
   for (std::size_t i=0;i<n;i++) (*out)[i] = (fp2[i]-2*fp1[i]+2*fm1[i]-fm2[i])/(2*h*h*h);
   return true;
 }
+/* 4th and 5th directional derivatives D^k f(x;w) along a single real direction
+ * w, central stencils. Used (with polarization) to build the symmetric
+ * multilinear forms D(.,.,.,.) and E(.,.,.,.,.) that enter the second Hopf
+ * Lyapunov coefficient. High-order finite differences are noisy (h^k in the
+ * denominator), so a larger step is used for these and l2's SIGN is the
+ * reliable output. */
+bool dir_fourth_real(DerivCtx &c, const std::vector<double> &w, std::vector<double> *out) {
+  const std::size_t n=c.n; const double h=c.h;
+  std::vector<double> fp2(n),fp1(n),f0(n),fm1(n),fm2(n);
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+2*h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fp2.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fp1.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,f0.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fm1.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-2*h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fm2.data(),c.err))return false;
+  out->assign(n,0.0);
+  for (std::size_t i=0;i<n;i++) (*out)[i]=(fp2[i]-4*fp1[i]+6*f0[i]-4*fm1[i]+fm2[i])/(h*h*h*h);
+  return true;
+}
+bool dir_fifth_real(DerivCtx &c, const std::vector<double> &w, std::vector<double> *out) {
+  const std::size_t n=c.n; const double h=c.h;
+  std::vector<double> f3(n),f2(n),f1(n),fm1(n),fm2(n),fm3(n);
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+3*h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,f3.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+2*h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,f2.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]+h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,f1.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fm1.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-2*h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fm2.data(),c.err))return false;
+  for (std::size_t i=0;i<n;i++) c.xt[i]=c.x0[i]-3*h*w[i];
+  if(!c.m->vector_field(c.xt.data(),c.p,fm3.data(),c.err))return false;
+  out->assign(n,0.0);
+  for (std::size_t i=0;i<n;i++) (*out)[i]=(f3[i]-4*f2[i]+5*f1[i]-5*fm1[i]+4*fm2[i]-fm3[i])/(2*h*h*h*h*h);
+  return true;
+}
+
 bool C_real(DerivCtx &c, const std::vector<double> &a, const std::vector<double> &b,
             const std::vector<double> &d, std::vector<double> *out) {
   auto add=[&](const std::vector<double>&u,const std::vector<double>&v,const std::vector<double>&w){
@@ -2079,6 +2136,62 @@ bool C_real(DerivCtx &c, const std::vector<double> &a, const std::vector<double>
     (*out)[i] = (d_abd[i]-d_ab[i]-d_ad[i]-d_bd[i]+d_a[i]+d_b[i]+d_d[i])/6.0;
   return true;
 }
+/* Symmetric 4-linear form D(a,b,d,e) by polarization of the 4th directional
+ * derivative; 24 = 4!. */
+bool D_real(DerivCtx &c, const std::vector<double> &a, const std::vector<double> &b,
+            const std::vector<double> &d, const std::vector<double> &e, std::vector<double> *out) {
+  const std::vector<double>* v[4] = {&a,&b,&d,&e};
+  out->assign(c.n, 0.0);
+  std::vector<double> s(c.n), term;
+  for (int mask=1; mask<16; ++mask) {
+    int cnt=0; for (std::size_t i=0;i<c.n;i++) s[i]=0.0;
+    for (int k=0;k<4;k++) if (mask&(1<<k)) { ++cnt; for (std::size_t i=0;i<c.n;i++) s[i]+=(*v[k])[i]; }
+    if (!dir_fourth_real(c, s, &term)) return false;
+    double sign = ((4-cnt)%2==0)? 1.0 : -1.0;
+    for (std::size_t i=0;i<c.n;i++) (*out)[i] += sign*term[i];
+  }
+  for (std::size_t i=0;i<c.n;i++) (*out)[i] /= 24.0;
+  return true;
+}
+/* Symmetric 5-linear form E by polarization of the 5th directional derivative;
+ * 120 = 5!. */
+bool E_real(DerivCtx &c, const std::vector<double> &a, const std::vector<double> &b,
+            const std::vector<double> &d, const std::vector<double> &e, const std::vector<double> &g,
+            std::vector<double> *out) {
+  const std::vector<double>* v[5] = {&a,&b,&d,&e,&g};
+  out->assign(c.n, 0.0);
+  std::vector<double> s(c.n), term;
+  for (int mask=1; mask<32; ++mask) {
+    int cnt=0; for (std::size_t i=0;i<c.n;i++) s[i]=0.0;
+    for (int k=0;k<5;k++) if (mask&(1<<k)) { ++cnt; for (std::size_t i=0;i<c.n;i++) s[i]+=(*v[k])[i]; }
+    if (!dir_fifth_real(c, s, &term)) return false;
+    double sign = ((5-cnt)%2==0)? 1.0 : -1.0;
+    for (std::size_t i=0;i<c.n;i++) (*out)[i] += sign*term[i];
+  }
+  for (std::size_t i=0;i<c.n;i++) (*out)[i] /= 120.0;
+  return true;
+}
+/* Generic complex multilinear evaluator: expand mform over the 2^k real/imag
+ * choices, each carrying i^(#imag). Used to assemble D/E on combinations of
+ * q, qbar, and real intermediate vectors for l2. */
+template <typename F>
+bool cmultilinear(DerivCtx &c, const std::vector<std::vector<Cplx>> &vs, F mform, std::vector<Cplx> *out) {
+  const std::size_t k = vs.size(), n = c.n;
+  out->assign(n, Cplx(0,0));
+  std::vector<std::vector<double>> re(k, std::vector<double>(n)), im(k, std::vector<double>(n));
+  for (std::size_t j=0;j<k;j++) for (std::size_t i=0;i<n;i++){ re[j][i]=vs[j][i].real(); im[j][i]=vs[j][i].imag(); }
+  std::vector<const std::vector<double>*> args(k);
+  for (int mask=0; mask<(1<<k); ++mask) {
+    int nim=0;
+    for (std::size_t j=0;j<k;j++){ if (mask&(1<<j)){ args[j]=&im[j]; ++nim; } else args[j]=&re[j]; }
+    Cplx coef(1,0); for (int t=0;t<nim;t++) coef*=Cplx(0,1);
+    std::vector<double> term;
+    if (!mform(args, &term)) return false;
+    for (std::size_t i=0;i<n;i++) (*out)[i] += coef*term[i];
+  }
+  return true;
+}
+
 /* complex C(q,q,qbar): expand from parts. With all args built from qr,qi this
  * is most simply assembled by summing real C over the binary expansion. */
 bool C_qqqbar(DerivCtx &c, const std::vector<Cplx> &q, std::vector<Cplx> *out) {
@@ -2379,6 +2492,178 @@ bool fold_normal_form(const Model &m, const std::vector<double> &x, double p,
 
   double val=0; for (std::size_t i=0;i<n;i++) val += pvec[i]*Bqq[i];
   if (a) *a = 0.5 * val;
+  return true;
+}
+
+/* Cusp normal-form coefficient c (codim-2, on a fold curve where a -> 0). The
+ * center-manifold reduction is cubic y' = c y^3 + ...,
+ *   c = (1/6) <p, C(q,q,q) - 3 B(q,h2)>,  A h2 = -(B(q,q) - <p,B(q,q)> q),
+ * with gauge <p,h2>=0 (Govaerts bordered solve, since A is singular).
+ * c != 0 is the cusp non-degeneracy condition. */
+bool cusp_normal_form(const Model &m, const std::vector<double> &x, double p,
+                      double *c_out, std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 1 || x.size() < n) { if (err) *err = "need a 1+ dim system"; return false; }
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+  std::vector<double> JT(n*n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) JT[i*n+j]=J[j*n+i];
+  auto inv_iter_real = [&](const std::vector<double> &Min, std::vector<double> *vec)->bool{
+    std::vector<double> M = Min;
+    for (std::size_t i=0;i<n;i++) M[i*n+i] += 1e-9;
+    std::vector<double> v(n, 1.0/std::sqrt((double)n));
+    for (int it=0; it<120; ++it) {
+      std::vector<double> nv;
+      if (!solve_linear(M, v, &nv)) return false;
+      double nrm=0; for (double z:nv) nrm+=z*z; nrm=std::sqrt(nrm);
+      if (nrm < 1e-300) return false;
+      for (double &z:nv) z/=nrm;
+      v = nv;
+    }
+    *vec = v; return true;
+  };
+  std::vector<double> q, pvec;
+  if (!inv_iter_real(J, &q))  { if (err) *err="cusp: null-vector solve failed"; return false; }
+  if (!inv_iter_real(JT, &pvec)) { if (err) *err="cusp: adjoint null-vector solve failed"; return false; }
+  double qn=0; for (double z:q) qn+=z*z; qn=std::sqrt(qn);
+  if (qn<1e-300){ if(err)*err="cusp: degenerate q"; return false; }
+  for (double &z:q) z/=qn;
+  { std::size_t im=0; for (std::size_t i=1;i<n;i++) if (std::fabs(q[i])>std::fabs(q[im])) im=i; if (q[im]<0) for(double&z:q)z=-z; }
+  double pq=0; for (std::size_t i=0;i<n;i++) pq+=pvec[i]*q[i];
+  if (std::fabs(pq)<1e-300){ if(err)*err="cusp: p,q orthogonal (not a simple fold)"; return false; }
+  for (double &z:pvec) z/=pq;
+
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=1e-3;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+  std::vector<double> Bqq, Cqqq;
+  if (!B_real(c, q, q, &Bqq)) return false;
+  if (!C_real(c, q, q, q, &Cqqq)) return false;
+  double pBqq=0; for (std::size_t i=0;i<n;i++) pBqq += pvec[i]*Bqq[i];
+  std::vector<double> rhs(n);
+  for (std::size_t i=0;i<n;i++) rhs[i] = -(Bqq[i] - pBqq*q[i]);
+  const std::size_t N=n+1;
+  std::vector<double> Mb(N*N,0.0), rb(N,0.0);
+  for (std::size_t i=0;i<n;i++){ for (std::size_t j=0;j<n;j++) Mb[i*N+j]=J[i*n+j];
+    Mb[i*N+n]=q[i]; rb[i]=rhs[i]; }
+  for (std::size_t j=0;j<n;j++) Mb[n*N+j]=pvec[j];
+  Mb[n*N+n]=0.0; rb[n]=0.0;
+  std::vector<double> z;
+  if (!solve_linear(Mb, rb, &z)) { if(err)*err="cusp: bordered solve failed"; return false; }
+  std::vector<double> h2(z.begin(), z.begin()+n);
+  std::vector<double> Bqh2;
+  if (!B_real(c, q, h2, &Bqh2)) return false;
+  double val=0; for (std::size_t i=0;i<n;i++) val += pvec[i]*(Cqqq[i] - 3.0*Bqh2[i]);
+  if (c_out) *c_out = val/6.0;
+  return true;
+}
+
+/* Generalized-Hopf (Bautin) SECOND Lyapunov coefficient l2 (codim-2 on a Hopf
+ * curve, where l1 -> 0). Kuznetsov's invariant Re<p,...> combination at 5th
+ * order on the critical eigenspace. Uses 4th/5th finite differences, so the
+ * MAGNITUDE is approximate; the SIGN (which classifies the Bautin point and the
+ * direction the fold-of-cycles curve opens) is the reliable output. Returns
+ * false away from a Hopf point. */
+bool gh_second_lyapunov(const Model &m, const std::vector<double> &x, double p,
+                        double *l2, std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 2 || x.size() < n) { if (err) *err = "need a 2+ dim system"; return false; }
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+  std::vector<Cplx> ev;
+  if (!eigenvalues(J, n, &ev)) { if (err) *err="eigenvalue failure"; return false; }
+  double w=0; bool found=false;
+  for (const auto &lam : ev)
+    if (lam.imag() > 1e-6 && std::fabs(lam.real()) < 1e-2*(1.0+std::fabs(lam.imag()))) { w=lam.imag(); found=true; break; }
+  if (!found) { if (err) *err="no pure-imaginary pair (not a Hopf point)"; return false; }
+
+  std::vector<Cplx> Jc(n*n), JTc(n*n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++){
+    Jc[i*n+j]  = Cplx(J[i*n+j],0) - ((i==j)?Cplx(0,w):Cplx(0,0));
+    JTc[i*n+j] = Cplx(J[j*n+i],0) + ((i==j)?Cplx(0,w):Cplx(0,0));
+  }
+  auto inv_iter=[&](std::vector<Cplx> M, std::vector<Cplx>*vec)->bool{
+    for (std::size_t i=0;i<n;i++) M[i*n+i]+=Cplx(1e-8,0);
+    std::vector<Cplx> v(n,Cplx(1.0/std::sqrt((double)n),0)); v[0]=Cplx(1,0);
+    for (int it=0;it<80;it++){ std::vector<Cplx> nv; if(!solve_complex(M,v,n,&nv))return false;
+      double nr=0; for(auto&z:nv)nr+=std::norm(z); nr=std::sqrt(nr); if(nr<1e-300)return false;
+      for(auto&z:nv){z/=nr;} v=nv; }
+    *vec=v; return true; };
+  std::vector<Cplx> q,pp;
+  if(!inv_iter(Jc,&q)){ if(err)*err="eigvec failed"; return false; }
+  if(!inv_iter(JTc,&pp)){ if(err)*err="adjoint failed"; return false; }
+  { double qn=0; for(auto&z:q)qn+=std::norm(z); qn=std::sqrt(qn); for(auto&z:q)z/=qn; }
+  Cplx pq=cdot(pp,q,n); if(std::abs(pq)<1e-300){ if(err)*err="degenerate eigvecs"; return false; }
+  for(auto&z:pp)z/=pq;
+  std::vector<Cplx> qbar(n); for(std::size_t i=0;i<n;i++) qbar[i]=std::conj(q[i]);
+
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=2e-2;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+
+  auto solveK=[&](int s, const std::vector<Cplx>&rhs, std::vector<Cplx>*X)->bool{
+    std::vector<Cplx> M(n*n);
+    for(std::size_t i=0;i<n;i++)for(std::size_t j=0;j<n;j++)
+      M[i*n+j]=((i==j)?Cplx(0,(double)s*w):Cplx(0,0))-Cplx(J[i*n+j],0);
+    if (s!=1 && s!=-1) { return solve_complex(M,rhs,n,X); }
+    const std::vector<Cplx>& col = (s==1)? q : qbar;
+    std::vector<Cplx> rowv(n);
+    if (s==1) for(std::size_t i=0;i<n;i++) rowv[i]=std::conj(pp[i]);
+    else      for(std::size_t i=0;i<n;i++) rowv[i]=pp[i];
+    const std::size_t N=n+1;
+    std::vector<Cplx> Mb(N*N,Cplx(0,0)), rb(N,Cplx(0,0));
+    for(std::size_t i=0;i<n;i++){ for(std::size_t j=0;j<n;j++) Mb[i*N+j]=M[i*n+j];
+      Mb[i*N+n]=col[i]; rb[i]=rhs[i]; }
+    for(std::size_t j=0;j<n;j++) Mb[n*N+j]=rowv[j];
+    Mb[n*N+n]=Cplx(0,0); rb[n]=Cplx(0,0);
+    std::vector<Cplx> z;
+    if(!solve_complex(Mb,rb,N,&z)) return false;
+    X->assign(z.begin(), z.begin()+n); return true;
+  };
+
+  std::vector<Cplx> Bqq, Bqqb;
+  if(!B_cplx(c,q,q,&Bqq)) return false;
+  if(!B_cplx(c,q,qbar,&Bqqb)) return false;
+  std::vector<Cplx> h20,h11;
+  if(!solveK(2,Bqq,&h20)){ if(err)*err="solve (2iw-A) failed"; return false; }
+  { std::vector<Cplx> nb(n); for(std::size_t i=0;i<n;i++) nb[i]=Bqqb[i];
+    if(!solveK(0,nb,&h11)){ if(err)*err="solve A failed"; return false; } }
+
+  std::vector<Cplx> Cqqq, Cqqqb, Bqh20, Bqbh20, Bqh11;
+  { std::vector<std::vector<Cplx>> a={q,q,q};
+    if(!cmultilinear(c,a,[&](const std::vector<const std::vector<double>*>&ar,std::vector<double>*o){return C_real(c,*ar[0],*ar[1],*ar[2],o);},&Cqqq)) return false; }
+  if(!C_qqqbar(c,q,&Cqqqb)) return false;
+  if(!B_cplx(c,q,h20,&Bqh20)) return false;
+  if(!B_cplx(c,qbar,h20,&Bqbh20)) return false;
+  if(!B_cplx(c,q,h11,&Bqh11)) return false;
+  std::vector<Cplx> r30(n); for(std::size_t i=0;i<n;i++) r30[i]=Cqqq[i]+3.0*Bqh20[i];
+  std::vector<Cplx> h30; if(!solveK(3,r30,&h30)){ if(err)*err="solve (3iw-A) failed"; return false; }
+  std::vector<Cplx> r21(n);
+  for(std::size_t i=0;i<n;i++) r21[i]=Cqqqb[i]+Bqbh20[i]+2.0*Bqh11[i];
+  Cplx c1=cdot(pp,r21,n);
+  std::vector<Cplx> r21p(n); for(std::size_t i=0;i<n;i++) r21p[i]=r21[i]-c1*q[i];
+  std::vector<Cplx> h21; if(!solveK(1,r21p,&h21)){ if(err)*err="solve (iw-A) bordered failed"; return false; }
+
+  std::vector<Cplx> Eq, Dqqqh, Dqqqbh, Cterm1, Cterm2, Bterm1, Bterm2;
+  { std::vector<std::vector<Cplx>> a={q,q,q,qbar,qbar};
+    if(!cmultilinear(c,a,[&](const std::vector<const std::vector<double>*>&ar,std::vector<double>*o){return E_real(c,*ar[0],*ar[1],*ar[2],*ar[3],*ar[4],o);},&Eq)) return false; }
+  { std::vector<std::vector<Cplx>> a={q,q,q,h11};
+    if(!cmultilinear(c,a,[&](const std::vector<const std::vector<double>*>&ar,std::vector<double>*o){return D_real(c,*ar[0],*ar[1],*ar[2],*ar[3],o);},&Dqqqh)) return false; }
+  { std::vector<std::vector<Cplx>> a={q,q,qbar,h20};
+    if(!cmultilinear(c,a,[&](const std::vector<const std::vector<double>*>&ar,std::vector<double>*o){return D_real(c,*ar[0],*ar[1],*ar[2],*ar[3],o);},&Dqqqbh)) return false; }
+  { std::vector<std::vector<Cplx>> a={q,qbar,h21};
+    if(!cmultilinear(c,a,[&](const std::vector<const std::vector<double>*>&ar,std::vector<double>*o){return C_real(c,*ar[0],*ar[1],*ar[2],o);},&Cterm1)) return false; }
+  { std::vector<std::vector<Cplx>> a={qbar,h20,h11};
+    if(!cmultilinear(c,a,[&](const std::vector<const std::vector<double>*>&ar,std::vector<double>*o){return C_real(c,*ar[0],*ar[1],*ar[2],o);},&Cterm2)) return false; }
+  if(!B_cplx(c,qbar,h30,&Bterm1)) return false;
+  if(!B_cplx(c,h11,h21,&Bterm2)) return false;
+
+  std::vector<Cplx> hsum(n);
+  for(std::size_t i=0;i<n;i++)
+    hsum[i] = Eq[i] + 5.0*Dqqqh[i] + 5.0*Dqqqbh[i]
+            + 6.0*Cterm1[i] + 6.0*Cterm2[i] + 3.0*Bterm1[i] + 6.0*Bterm2[i];
+  Cplx g = cdot(pp, hsum, n);
+  if (l2) *l2 = g.real() / (12.0 * w);
   return true;
 }
 
@@ -2733,6 +3018,62 @@ bool saddle_left_subspaces(const std::vector<double> &A, std::size_t n,
 }
 
 } /* anonymous namespace */
+
+bool seed_homoclinic_by_integration(const Model &m, const std::vector<double> &saddle,
+                                    double p, double dt, double max_time,
+                                    std::vector<std::vector<double>> *seed_out,
+                                    std::string *err) {
+  const std::size_t n = m.n;
+  if (saddle.size() < n || n < 2) { if (err) *err = "bad saddle for seeding"; return false; }
+  if (dt <= 0) dt = 0.01;
+  std::vector<double> A;
+  if (!finite_diff_jacobian(m, saddle.data(), p, &A, err, 1e-7)) return false;
+  std::vector<Cplx> ev; eigenvalues(A, n, &ev);
+  int npos = 0; for (auto &z : ev) if (z.real() > 1e-7) ++npos;
+  if (npos == 0 || npos == (int)n) { if (err) *err = "equilibrium is not a saddle"; return false; }
+  std::vector<double> d(n, 0.0); d[0] = 1.0;
+  for (int it = 0; it < 300; ++it) {
+    std::vector<double> nd(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < n; ++j) nd[i] += A[i*n+j]*d[j];
+    double nr = 0; for (double v : nd) nr += v*v; nr = std::sqrt(nr);
+    if (nr < 1e-300) break;
+    for (double &v : nd) v /= nr;
+    d = nd;
+  }
+  const double eps = 1e-5;
+  auto fld = [&](const std::vector<double> &xx, std::vector<double> &ff) {
+    ff.assign(n, 0.0); std::string e; return m.vector_field(xx.data(), p, ff.data(), &e);
+  };
+  std::vector<std::vector<double>> best; double best_return = 1e300;
+  for (int orient = 0; orient < 2; ++orient) {
+    const double sgn = orient ? -1.0 : 1.0;
+    std::vector<double> x(n); for (std::size_t i = 0; i < n; ++i) x[i] = saddle[i] + sgn*eps*d[i];
+    std::vector<std::vector<double>> traj; traj.reserve(40000);
+    std::vector<double> k1(n),k2(n),k3(n),k4(n),tmp(n);
+    bool left = false; double closest_after_leaving = 1e300;
+    const long maxsteps = (long)(max_time/dt);
+    for (long s = 0; s < maxsteps; ++s) {
+      traj.push_back(x);
+      double dev = 0; for (std::size_t i = 0; i < n; ++i){ double dd=x[i]-saddle[i]; dev+=dd*dd; } dev = std::sqrt(dev);
+      if (dev > 100.0*eps) left = true;
+      if (left) closest_after_leaving = std::min(closest_after_leaving, dev);
+      if (left && dev < 50.0*eps && traj.size() > 50) break;
+      if (dev > 1e6 || !std::isfinite(dev)) break;
+      if (!fld(x,k1)) break;
+      for (std::size_t i=0;i<n;i++){ tmp[i]=x[i]+0.5*dt*k1[i]; }
+      if(!fld(tmp,k2)) break;
+      for (std::size_t i=0;i<n;i++){ tmp[i]=x[i]+0.5*dt*k2[i]; }
+      if(!fld(tmp,k3)) break;
+      for (std::size_t i=0;i<n;i++){ tmp[i]=x[i]+dt*k3[i]; }
+      if(!fld(tmp,k4)) break;
+      for (std::size_t i=0;i<n;i++){ x[i]+=dt*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6.0; }
+    }
+    if (traj.size() > 20 && closest_after_leaving < best_return) { best_return = closest_after_leaving; best = traj; }
+  }
+  if (best.size() < 20) { if (err) *err = "no near-homoclinic excursion off the saddle"; return false; }
+  *seed_out = best;
+  return true;
+}
 
 HomoclinicResult solve_homoclinic(const Model &m,
                                   const std::vector<double> &x0_guess, double p,
