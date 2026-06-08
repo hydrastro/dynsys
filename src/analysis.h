@@ -122,7 +122,7 @@ bool finite_diff_jacobian(const Model &m, const double *x, double p,
  * first Lyapunov coefficient l1 -> 0). BranchPoint = two equilibrium branches
  * cross (the augmented system is singular though the fold test need not be). */
 enum class SpecialPointKind { None, Fold, Hopf, BogdanovTakens, Cusp,
-                              GeneralizedHopf, BranchPoint, EndOfBranch };
+                              GeneralizedHopf, ZeroHopf, HopfHopf, BranchPoint, EndOfBranch };
 
 struct BranchPoint {
   double p = 0.0;               /* parameter value                  */
@@ -369,6 +369,45 @@ HomoclinicCurve continue_homoclinic(const Model2 &m2,
                                     double p0, double q0,
                                     const std::vector<std::vector<double>> &seed_orbit,
                                     const HomoclinicContSettings &settings);
+
+/* ---- Lin's method: locate a homoclinic by closing the Lin gap ----------- *
+ * EXPERIMENTAL / PRELIMINARY. The scaffolding is in place -- it relocates the
+ * saddle at each parameter, computes the dominant stable/unstable directions,
+ * integrates each manifold to a Poincare section, measures an in-section gap,
+ * and runs a secant root-find on the primary parameter. However, robustly
+ * obtaining a SIGNED gap that brackets the homoclinic (so the root-find
+ * converges) requires careful section placement where both manifolds genuinely
+ * cross; for stiff Bogdanov-Takens loops this is not yet reliable. Use
+ * solve_homoclinic / continue_homoclinic for the validated path. This is kept
+ * as a foundation for a future complete Lin's-method implementation.
+ *
+ * For systems where a good orbit seed cannot be obtained by integration alone
+ * (e.g. a Bogdanov-Takens homoclinic, a large slow loop that exists only on an
+ * exact parameter curve), Lin's method splits the connection at a Poincare
+ * section: integrate the UNSTABLE manifold forward to the section (x+) and the
+ * STABLE manifold backward to it (x-), measure the signed in-section gap, and
+ * adjust the PRIMARY parameter p (at fixed secondary q) to drive that gap to
+ * zero. m2 is f(x,p,q); the saddle is relocated at each p. */
+struct LinResult {
+  bool ok = false;
+  std::string message;
+  double p = 0.0;            /* parameter at which the gap closed            */
+  double gap = 0.0;          /* residual Lin gap there (small if converged)  */
+  std::vector<double> saddle;
+  std::vector<std::vector<double>> orbit; /* concatenated u-branch + v-branch */
+  double amplitude = 0.0;
+  int iterations = 0;
+};
+struct LinSettings {
+  double eps = 1e-4;         /* initial displacement along the eigenvectors  */
+  double dt = 0.01;          /* integration step                            */
+  double max_time = 200.0;   /* per-branch integration budget               */
+  double p_lo = -1e9, p_hi = 1e9; /* bracket for the parameter root-find     */
+  int max_iter = 60;
+  double tol = 1e-7;         /* gap tolerance                               */
+};
+LinResult lin_homoclinic(const Model2 &m2, const std::vector<double> &saddle_guess,
+                         double p0, double q, const LinSettings &settings);
 
 /* ---- two-parameter continuation of a FOLD-OF-CYCLES (LPC) curve --------- *
  * Declared after the cycle structs below (it needs CycleSettings). */

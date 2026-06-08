@@ -10163,7 +10163,9 @@ void draw_gui(AppState &app) {
           const auto &sp = app.twopar_curve.points[idx];
           const char *kn = sp.special==dynsys::analysis::SpecialPointKind::BogdanovTakens ? "Bogdanov-Takens"
                          : sp.special==dynsys::analysis::SpecialPointKind::Cusp ? "Cusp"
-                         : sp.special==dynsys::analysis::SpecialPointKind::GeneralizedHopf ? "generalized Hopf" : "codim-2";
+                         : sp.special==dynsys::analysis::SpecialPointKind::GeneralizedHopf ? "generalized Hopf"
+                         : sp.special==dynsys::analysis::SpecialPointKind::ZeroHopf ? "zero-Hopf (fold-Hopf)"
+                         : sp.special==dynsys::analysis::SpecialPointKind::HopfHopf ? "Hopf-Hopf (double-Hopf)" : "codim-2";
           if (sp.special==dynsys::analysis::SpecialPointKind::BogdanovTakens && sp.has_codim2_nf)
             ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  BT normal form: a=%.4g, b=%.4g  (a,b != 0 => non-degenerate)",
                               kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.bt_a, sp.bt_b);

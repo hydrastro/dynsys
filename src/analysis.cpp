@@ -1189,10 +1189,52 @@ TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
         return true;
       }
     };
+    /* Extra codim-2 tests on a HOPF curve for 3+ D systems:
+     *  ZH (zero-Hopf / fold-Hopf): a REAL eigenvalue passes through 0 while the
+     *    pure-imaginary pair persists  -> signed test = that real eigenvalue.
+     *  HH (Hopf-Hopf / double-Hopf): a SECOND pair reaches the imaginary axis
+     *    -> signed test = the real part of the nearest off-axis complex pair.
+     * Both return NaN when not applicable (Fold curve, or n<3, or no clear
+     * Hopf pair), so they simply never trigger there. */
+    auto zhhh_tests = [&](const TwoParamPoint &pt, double *t_zh, double *t_hh) -> bool {
+      *t_zh = std::nan(""); *t_hh = std::nan("");
+      if (kind != TwoParamKind::Hopf || n < 3) return false;
+      Model mm = model_at_q(pt.q);
+      std::vector<double> J; std::string e;
+      if (!finite_diff_jacobian(mm, pt.x.data(), pt.p, &J, &e, 1e-7)) return false;
+      std::vector<std::complex<double>> ev; if (!eigenvalues(J, n, &ev)) return false;
+      /* identify the active Hopf pair: the complex pair with the smallest
+       * |Re|. Exclude it, then look at what remains. */
+      int hopf_i = -1; double hopf_re = 1e300;
+      for (std::size_t k = 0; k < ev.size(); ++k)
+        if (std::fabs(ev[k].imag()) > 1e-6 && std::fabs(ev[k].real()) < hopf_re) { hopf_re = std::fabs(ev[k].real()); hopf_i = (int)k; }
+      if (hopf_i < 0) return false;
+      const double hw = std::fabs(ev[hopf_i].imag());
+      std::vector<bool> used(ev.size(), false);
+      used[hopf_i] = true;
+      for (std::size_t k = 0; k < ev.size(); ++k)   /* mark the conjugate */
+        if (!used[k] && std::fabs(ev[k].imag() + ev[hopf_i].imag()) < 1e-6 && std::fabs(ev[k].real() - ev[hopf_i].real()) < 1e-6) { used[k] = true; break; }
+      /* ZH: smallest-magnitude REAL eigenvalue among the rest (signed) */
+      double zh = std::nan(""); double zh_mag = 1e300;
+      for (std::size_t k = 0; k < ev.size(); ++k)
+        if (!used[k] && std::fabs(ev[k].imag()) < 1e-6 && std::fabs(ev[k].real()) < zh_mag) { zh_mag = std::fabs(ev[k].real()); zh = ev[k].real(); }
+      /* HH: real part of the nearest OTHER complex pair, but only if its
+       * frequency differs from the active pair (a genuinely different pair) */
+      double hh = std::nan(""); double hh_mag = 1e300;
+      for (std::size_t k = 0; k < ev.size(); ++k)
+        if (!used[k] && std::fabs(ev[k].imag()) > 1e-6 && std::fabs(std::fabs(ev[k].imag()) - hw) > 1e-3) {
+          if (std::fabs(ev[k].real()) < hh_mag) { hh_mag = std::fabs(ev[k].real()); hh = ev[k].real(); }
+        }
+      *t_zh = zh; *t_hh = hh;
+      return true;
+    };
     std::vector<double> A(curve.points.size(), std::nan("")), B(curve.points.size(), std::nan(""));
+    std::vector<double> Czh(curve.points.size(), std::nan("")), Dhh(curve.points.size(), std::nan(""));
     for (std::size_t i = 0; i < curve.points.size(); ++i) {
       double a = 0, b = 0;
       if (test_funcs(curve.points[i], &a, &b)) { A[i] = a; B[i] = b; }
+      double cz = 0, dh = 0;
+      if (zhhh_tests(curve.points[i], &cz, &dh)) { Czh[i] = cz; Dhh[i] = dh; }
     }
     for (std::size_t i = 1; i < curve.points.size(); ++i) {
       /* skip the join between the two trace directions (large parameter jump) */
@@ -1215,6 +1257,26 @@ TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
         if (looks_like_zero)
           k = (kind == TwoParamKind::Fold) ? SpecialPointKind::Cusp
                                            : SpecialPointKind::GeneralizedHopf;
+      } else if (std::isfinite(Czh[i-1]) && std::isfinite(Czh[i]) && Czh[i-1] * Czh[i] < 0.0) {
+        /* a real eigenvalue crossed zero with the Hopf pair present -> ZH */
+        const double near = std::min(std::fabs(Czh[i-1]), std::fabs(Czh[i]));
+        if (near < 0.5) k = SpecialPointKind::ZeroHopf;
+      } else if (std::isfinite(Dhh[i-1]) && std::isfinite(Dhh[i]) && Dhh[i-1] * Dhh[i] < 0.0) {
+        /* a second complex pair reached the imaginary axis -> HH */
+        const double near = std::min(std::fabs(Dhh[i-1]), std::fabs(Dhh[i]));
+        if (near < 0.5) k = SpecialPointKind::HopfHopf;
+      } else if (std::isfinite(Dhh[i]) && std::fabs(Dhh[i]) < 0.06 &&
+                 (i + 1 >= curve.points.size() || !std::isfinite(Dhh[i+1])) &&
+                 std::isfinite(Dhh[i-1]) && std::fabs(Dhh[i-1]) > std::fabs(Dhh[i])) {
+        /* HH where the Hopf curve TERMINATES: the second pair's real part is
+         * decreasing toward zero and the curve ends here (the two neutral pairs
+         * make the corrector stall exactly at the double-Hopf). Tag it. */
+        k = SpecialPointKind::HopfHopf;
+      } else if (std::isfinite(Czh[i]) && std::fabs(Czh[i]) < 0.06 &&
+                 (i + 1 >= curve.points.size() || !std::isfinite(Czh[i+1])) &&
+                 std::isfinite(Czh[i-1]) && std::fabs(Czh[i-1]) > std::fabs(Czh[i])) {
+        /* ZH where the curve terminates (real eigenvalue grazing zero). */
+        k = SpecialPointKind::ZeroHopf;
       }
       if (k != SpecialPointKind::None) {
         /* BISECTION refine the codim-2 location along the curve segment
@@ -3335,6 +3397,217 @@ HomoclinicCurve continue_homoclinic(const Model2 &m2,
   C.message = C.ok ? ("traced " + std::to_string(C.points.size()) + " homoclinic points")
                    : "could not trace the homoclinic curve";
   return C;
+}
+
+LinResult lin_homoclinic(const Model2 &m2, const std::vector<double> &saddle_guess,
+                         double p0, double q, const LinSettings &settings) {
+  LinResult R;
+  const std::size_t n = m2.n;
+  if (saddle_guess.size() < n || n < 2) { R.message = "bad input to lin_homoclinic"; return R; }
+  const double dt = settings.dt > 0 ? settings.dt : 0.01;
+
+  /* one-parameter field at fixed q */
+  auto field = [&](const double *x, double p, std::vector<double> &f) -> bool {
+    f.assign(n, 0.0); std::string e; return m2.vector_field(x, p, q, f.data(), &e);
+  };
+  auto fdjac = [&](const std::vector<double> &x, double p, std::vector<double> &J) -> bool {
+    J.assign(n*n, 0.0); std::vector<double> fp(n), fm(n); std::vector<double> xt = x;
+    for (std::size_t j = 0; j < n; ++j) {
+      double h = 1e-7*(std::fabs(x[j])+1e-3);
+      xt[j]=x[j]+h; if(!field(xt.data(),p,fp)) return false;
+      xt[j]=x[j]-h; if(!field(xt.data(),p,fm)) return false;
+      xt[j]=x[j];
+      for (std::size_t i=0;i<n;i++) J[i*n+j]=(fp[i]-fm[i])/(2*h);
+    }
+    return true;
+  };
+  /* Newton-correct the saddle at parameter p, starting from x0 */
+  auto correct = [&](std::vector<double> x0, double p, std::vector<double> *out) -> bool {
+    std::vector<double> x = x0, f(n), J, d;
+    for (int it=0; it<80; ++it) {
+      if (!field(x.data(), p, f)) return false;
+      double fn=0; for(double v:f) fn+=v*v; fn=std::sqrt(fn);
+      if (fn < 1e-12) { *out=x; return true; }
+      if (!fdjac(x, p, J)) return false;
+      std::vector<double> rhs(n); for(std::size_t i=0;i<n;i++) rhs[i]=-f[i];
+      if (!solve_linear(J, rhs, &d)) return false;
+      double dn=0; for(double v:d) dn+=v*v; dn=std::sqrt(dn);
+      double damp = dn>1.0?1.0/dn:1.0;
+      for(std::size_t i=0;i<n;i++) x[i]+=damp*d[i];
+    }
+    std::vector<double> f2; if(!field(x.data(),p,f2)) return false;
+    double fn=0; for(double v:f2) fn+=v*v; fn=std::sqrt(fn);
+    if (fn<1e-8){ *out=x; return true; }
+    return false;
+  };
+  /* dominant real eigenvector of M with eigenvalue of a given sign, via power
+   * iteration on (M - shift I) suitably; here we use: unstable = power iterate
+   * M; stable = power iterate -M (largest of -M = most negative of M). */
+  auto dominant_dir = [&](const std::vector<double> &M, bool unstable, std::vector<double> *d) -> bool {
+    std::vector<double> v(n, 0.0); v[0]=1.0;
+    const double s = unstable ? 1.0 : -1.0;
+    for (int it=0; it<400; ++it) {
+      std::vector<double> nv(n,0.0);
+      for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) nv[i]+=s*M[i*n+j]*v[j];
+      /* shift to keep dominant positive: add large multiple of v */
+      for (std::size_t i=0;i<n;i++) nv[i]+=5.0*v[i];
+      double nr=0; for(double z:nv) nr+=z*z; nr=std::sqrt(nr);
+      if (nr<1e-300) return false;
+      for(double &z:nv) z/=nr;
+      v=nv;
+    }
+    *d=v; return true;
+  };
+
+  /* Build a Poincare section from a reference excursion: integrate the unstable
+   * manifold forward a while to find a "far" point, use the field direction
+   * there as the section normal and that point as the section anchor. */
+  auto integrate = [&](std::vector<double> x, double p, double sgn_time, double tmax,
+                       const std::vector<double> *sect_anchor, const std::vector<double> *sect_normal,
+                       std::vector<double> *hit, std::vector<std::vector<double>> *traj) -> bool {
+    std::vector<double> k1(n),k2(n),k3(n),k4(n),tmp(n);
+    const double h = sgn_time*dt;
+    double prev_sd = 0; bool have_prev=false;
+    std::vector<double> xprev = x;
+    const std::vector<double> start = x;
+    long steps=(long)(tmax/dt);
+    for (long s=0;s<steps;s++) {
+      if (traj) traj->push_back(x);
+      if (sect_anchor && sect_normal) {
+        double sd=0; for(std::size_t i=0;i<n;i++) sd+=(x[i]-(*sect_anchor)[i])*(*sect_normal)[i];
+        /* require the orbit to have travelled away from its start before a
+         * crossing counts (otherwise the very first steps, still near the
+         * saddle, can graze the section). */
+        double moved=0; for(std::size_t i=0;i<n;i++){double dd=x[i]-start[i];moved+=dd*dd;} moved=std::sqrt(moved);
+        if (have_prev && prev_sd*sd<0.0 && moved>1e-2) {  /* genuine crossing */
+          double t = prev_sd/(prev_sd-sd);
+          hit->assign(n,0.0);
+          for(std::size_t i=0;i<n;i++) (*hit)[i]= xprev[i] + t*(x[i]-xprev[i]); /* interpolate */
+          return true;
+        }
+        prev_sd=sd; have_prev=true;
+      }
+      xprev = x;
+      if(!field(x.data(),p,k1)) return false;
+      for(std::size_t i=0;i<n;i++){tmp[i]=x[i]+0.5*h*k1[i];} if(!field(tmp.data(),p,k2))return false;
+      for(std::size_t i=0;i<n;i++){tmp[i]=x[i]+0.5*h*k2[i];} if(!field(tmp.data(),p,k3))return false;
+      for(std::size_t i=0;i<n;i++){tmp[i]=x[i]+h*k3[i];}     if(!field(tmp.data(),p,k4))return false;
+      double dev=0; for(std::size_t i=0;i<n;i++){ x[i]+=h*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6.0; dev+=x[i]*x[i]; }
+      if (!std::isfinite(dev) || dev>1e12) return false;
+    }
+    return false; /* never hit the section */
+  };
+
+  /* The Lin gap as a function of p: relocate saddle, get eigvecs, build the
+   * section from the unstable excursion's far point, then measure (x+ - x-)
+   * projected onto an in-section direction. */
+  std::vector<double> sect_anchor, sect_normal, insec;
+  bool section_built = false;  /* fixed once in phase space; gaps comparable across p */
+  auto lin_gap = [&](double p, double *gap, std::vector<std::vector<double>> *orbit_out) -> bool {
+    std::vector<double> x0;
+    if (!correct(saddle_guess, p, &x0)) return false;
+    std::vector<double> J; if (!fdjac(x0, p, J)) return false;
+    /* check saddle: at least one positive and one negative real part */
+    std::vector<Cplx> ev; eigenvalues(J, n, &ev);
+    int npos=0,nneg=0; for(auto&z:ev){ if(z.real()>1e-7)npos++; if(z.real()<-1e-7)nneg++; }
+    if (npos==0||nneg==0) return false;
+    std::vector<double> du, ds;
+    if (!dominant_dir(J, true, &du)) return false;
+    if (!dominant_dir(J, false, &ds)) return false;
+
+    if (!section_built) {
+      /* integrate the unstable manifold forward to find a far point for the
+       * section. Try BOTH orientations of the unstable direction and keep the
+       * one that makes a bounded excursion (the other may escape to infinity). */
+      std::vector<std::vector<double>> tj; double bestfar = -1.0;
+      for (int orient = 0; orient < 2; ++orient) {
+        const double so = orient ? -1.0 : 1.0;
+        std::vector<double> xs(n); for(std::size_t i=0;i<n;i++) xs[i]=x0[i]+so*settings.eps*du[i];
+        std::vector<std::vector<double>> t2; std::vector<double> dummy;
+        integrate(xs, p, +1.0, settings.max_time, nullptr, nullptr, &dummy, &t2);
+        if (t2.size()<10) continue;
+        /* reject if it blew up (last point huge) */
+        double lastd=0; for(std::size_t i=0;i<n;i++){double dd=t2.back()[i]-x0[i];lastd+=dd*dd;} lastd=std::sqrt(lastd);
+        double fd=0; for(auto&pt:t2){double d=0;for(std::size_t i=0;i<n;i++){double dd=pt[i]-x0[i];d+=dd*dd;}fd=std::max(fd,std::sqrt(d));}
+        if (fd>1e4) continue;                       /* escaped: not the homoclinic side */
+        if (fd>bestfar) { bestfar=fd; tj=t2; }
+      }
+      if (tj.size()<10) return false;
+      std::size_t fi=0; double fd=0;
+      for (std::size_t s=0;s<tj.size();s++){ double d=0; for(std::size_t i=0;i<n;i++){double dd=tj[s][i]-x0[i];d+=dd*dd;} if(d>fd){fd=d;fi=s;} }
+      sect_anchor = tj[fi];
+      std::vector<double> fdir; field(sect_anchor.data(), p, fdir);
+      double fn=0; for(double v:fdir)fn+=v*v; fn=std::sqrt(fn); if(fn<1e-12) return false;
+      for(double&v:fdir){v/=fn;} sect_normal=fdir;
+      /* an in-section direction: pick a coordinate axis least aligned with normal */
+      insec.assign(n,0.0); std::size_t ax=0; double best=1e9;
+      for(std::size_t i=0;i<n;i++){ if(std::fabs(sect_normal[i])<best){best=std::fabs(sect_normal[i]);ax=i;} }
+      insec[ax]=1.0;
+      /* orthogonalize insec against normal */
+      double dot=0; for(std::size_t i=0;i<n;i++) dot+=insec[i]*sect_normal[i];
+      for(std::size_t i=0;i<n;i++) insec[i]-=dot*sect_normal[i];
+      double in=0; for(double v:insec)in+=v*v; in=std::sqrt(in); if(in<1e-12)return false;
+      for(double&v:insec)v/=in;
+      section_built=true;
+    }
+
+    /* forward from unstable, backward from stable, to the section */
+    std::vector<double> xs(n), xss(n);
+    for(std::size_t i=0;i<n;i++){ xs[i]=x0[i]+settings.eps*du[i]; xss[i]=x0[i]+settings.eps*ds[i]; }
+    std::vector<double> hitp, hitm; std::vector<std::vector<double>> tu, tv;
+    if (!integrate(xs,  p, +1.0, settings.max_time, &sect_anchor, &sect_normal, &hitp, &tu)) {
+      /* try other orientation of unstable dir */
+      for(std::size_t i=0;i<n;i++) xs[i]=x0[i]-settings.eps*du[i];
+      tu.clear(); if(!integrate(xs, p, +1.0, settings.max_time, &sect_anchor, &sect_normal, &hitp, &tu)) return false;
+    }
+    if (!integrate(xss, p, -1.0, settings.max_time, &sect_anchor, &sect_normal, &hitm, &tv)) {
+      for(std::size_t i=0;i<n;i++) xss[i]=x0[i]-settings.eps*ds[i];
+      tv.clear(); if(!integrate(xss, p, -1.0, settings.max_time, &sect_anchor, &sect_normal, &hitm, &tv)) return false;
+    }
+    double g=0; for(std::size_t i=0;i<n;i++) g+=(hitp[i]-hitm[i])*insec[i];
+    *gap=g;
+    if (orbit_out) {
+      orbit_out->clear();
+      for (auto &pt : tu) orbit_out->push_back(pt);
+      for (auto it=tv.rbegin(); it!=tv.rend(); ++it) orbit_out->push_back(*it);
+    }
+    return true;
+  };
+
+  /* 1-D root-find on p (secant with bracketing fallback) to close the gap. */
+  double pa = p0, ga;
+  if (!lin_gap(pa, &ga, nullptr)) { R.message = "Lin gap could not be evaluated at p0 (no saddle / no section)"; return R; }
+  double pb = p0 + (settings.eps>0? 0.05 : 0.05)*(std::fabs(p0)+1.0);
+  double gb;
+  if (!lin_gap(pb, &gb, nullptr)) { pb = p0 - 0.05*(std::fabs(p0)+1.0); if(!lin_gap(pb,&gb,nullptr)){ R.message="gap eval failed near p0"; return R; } }
+
+  int it=0; double p=pa, g=ga;
+  for (; it<settings.max_iter; ++it) {
+    if (std::fabs(gb) < settings.tol) { p=pb; g=gb; break; }
+    double denom = (gb-ga);
+    double pn;
+    if (std::fabs(denom) < 1e-300) pn = 0.5*(pa+pb);
+    else pn = pb - gb*(pb-pa)/denom;       /* secant */
+    if (pn < settings.p_lo) pn = settings.p_lo;
+    if (pn > settings.p_hi) pn = settings.p_hi;
+    double gn;
+    if (!lin_gap(pn, &gn, nullptr)) { pn = 0.5*(pa+pb); if(!lin_gap(pn,&gn,nullptr)) break; }
+    pa=pb; ga=gb; pb=pn; gb=gn; p=pn; g=gn;
+    if (std::fabs(g) < settings.tol) break;
+  }
+
+  std::vector<std::vector<double>> orbit;
+  std::vector<double> x0fin;
+  lin_gap(p, &g, &orbit);
+  correct(saddle_guess, p, &x0fin);
+  R.p = p; R.gap = g; R.iterations = it;
+  R.saddle = x0fin; R.orbit = orbit;
+  double amp=0; for (auto &pt : orbit){ double d=0; for(std::size_t i=0;i<n;i++){double dd=pt[i]-(x0fin.empty()?0:x0fin[i]);d+=dd*dd;} amp=std::max(amp,std::sqrt(d)); }
+  R.amplitude = amp;
+  R.ok = std::fabs(g) < 1e-4 && amp > 1e-3;
+  R.message = R.ok ? ("Lin gap closed (gap=" + std::to_string(g) + ", p=" + std::to_string(p) + ")")
+                   : ("Lin gap not closed (gap=" + std::to_string(g) + ")");
+  return R;
 }
 
 /* ---- Basins of attraction ------------------------------------ */
