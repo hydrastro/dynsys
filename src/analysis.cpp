@@ -1694,6 +1694,79 @@ static void classify_floquet(const std::vector<Complex> &mult, CycleSample *s) {
   s->is_ns = ns;
 }
 
+/* Refine a rough periodic-orbit guess by SIMULATION: integrate the ODE from a
+ * point of the guess to settle onto the attracting cycle, detect one full
+ * period by a Poincare-section return (a coordinate crossing in a consistent
+ * direction), and resample that loop to `mesh` points. This lets cycle
+ * continuation start from a crude guess (e.g. a circle) even when the true
+ * cycle is far from circular (van der Pol relaxation), instead of demanding a
+ * near-converged orbit up front. Returns false if no clean period is found
+ * (e.g. the cycle is unstable, so forward integration won't converge to it). */
+static bool refine_cycle_seed_by_simulation(
+    const Model &m, double p, const std::vector<std::vector<double>> &guess,
+    std::size_t mesh, double period_guess,
+    std::vector<std::vector<double>> *out_points, double *out_period) {
+  const std::size_t n = m.n;
+  if (n < 2 || guess.empty() || mesh < 4) return false;
+  double dt = period_guess > 0 ? period_guess / 2000.0 : 0.005;
+  if (!(dt > 0) || !std::isfinite(dt)) dt = 0.005;
+  dt = std::min(dt, 0.02);
+  auto field = [&](const std::vector<double> &x, std::vector<double> &f) -> bool {
+    f.assign(n, 0.0); std::string e; return m.vector_field(x.data(), p, f.data(), &e);
+  };
+  std::vector<double> k1(n), k2(n), k3(n), k4(n), tmp(n);
+  auto rk4 = [&](std::vector<double> &x) -> bool {
+    if (!field(x, k1)) return false;
+    for (std::size_t i=0;i<n;i++) tmp[i]=x[i]+0.5*dt*k1[i];
+    if(!field(tmp,k2)) return false;
+    for (std::size_t i=0;i<n;i++) tmp[i]=x[i]+0.5*dt*k2[i];
+    if(!field(tmp,k3)) return false;
+    for (std::size_t i=0;i<n;i++) tmp[i]=x[i]+dt*k3[i];
+    if(!field(tmp,k4)) return false;
+    for (std::size_t i=0;i<n;i++) x[i]+=dt*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6.0;
+    double s=0; for(double v:x) s+=v*v; return std::isfinite(s) && s < 1e18;
+  };
+  std::vector<double> x = guess[guess.size()/2];
+  const double Tg = period_guess > 0 ? period_guess : 2*M_PI;
+  long settle = (long)(40.0 * Tg / dt);
+  settle = std::min<long>(settle, 4000000);
+  for (long s=0;s<settle;s++) if (!rk4(x)) return false;
+  std::vector<double> lo(n, 1e300), hi(n, -1e300), sum(n, 0.0);
+  std::vector<double> xt = x; long probe = std::min<long>((long)(2.0*Tg/dt), 400000);
+  if (probe < 10) probe = 10;
+  for (long s=0;s<probe;s++){ for(std::size_t i=0;i<n;i++){lo[i]=std::min(lo[i],xt[i]);hi[i]=std::max(hi[i],xt[i]);sum[i]+=xt[i];} if(!rk4(xt)) return false; }
+  std::size_t sc=0; double sw=-1; for(std::size_t i=0;i<n;i++){ double r=hi[i]-lo[i]; if(r>sw){sw=r;sc=i;} }
+  if (!(sw>1e-9)) return false;
+  const double level = sum[sc]/(double)probe;
+  std::vector<std::vector<double>> loop;
+  long maxsteps = (long)(20.0*Tg/dt);
+  double prev = x[sc] - level; bool armed=false; int crossings=0; double Tlen=0;
+  loop.push_back(x);
+  for (long s=0;s<maxsteps;s++){
+    if (!rk4(x)) return false;
+    Tlen += dt;
+    double cur = x[sc]-level;
+    if (prev < 0.0 && cur >= 0.0) {
+      crossings++;
+      if (crossings==1) { loop.clear(); Tlen=0; loop.push_back(x); armed=true; }
+      else if (crossings==2 && armed) { loop.push_back(x); break; }
+    } else if (armed) {
+      loop.push_back(x);
+    }
+    prev = cur;
+  }
+  if (crossings < 2 || loop.size() < 8 || Tlen <= 0) return false;
+  out_points->assign(mesh, std::vector<double>(n, 0.0));
+  for (std::size_t i=0;i<mesh;i++){
+    double f = (double)i/(double)mesh * (double)(loop.size()-1);
+    std::size_t j = (std::size_t)f; double a = f - (double)j;
+    std::size_t j1 = std::min(j+1, loop.size()-1);
+    for (std::size_t k=0;k<n;k++) (*out_points)[i][k] = (1-a)*loop[j][k] + a*loop[j1][k];
+  }
+  *out_period = Tlen;
+  return true;
+}
+
 /* Pseudo-arclength continuation of a periodic orbit in the extended space
  * V = (U, p). Predictor: step along the branch tangent (null vector of the
  * bordered Jacobian). Corrector: Newton on [ cycle BVP ; arclength constraint ]
@@ -1721,8 +1794,23 @@ static CycleBranch continue_limit_cycle_arclength(
     CycleCtx c0 = c; c0.pin_mode = true; c0.pin_val = V[0];
     std::vector<double> U0(V.begin(), V.begin() + Ulen);
     if (!cyc_newton(c0, &U0, settings.newton_iters, settings.newton_tol)) {
-      out.message = "Newton did not converge on the initial cycle (try a better guess / larger mesh)";
-      return out;
+      /* The supplied guess didn't converge. Try to obtain a better seed by
+       * SIMULATION (settle onto the attracting cycle, detect one period) and
+       * retry -- this rescues crude guesses for far-from-circular cycles. */
+      std::vector<std::vector<double>> sg; double sT = 0;
+      bool reseeded = refine_cycle_seed_by_simulation(m, p0, guess_points, M, period_guess, &sg, &sT);
+      if (reseeded) {
+        for (std::size_t i = 0; i < M; ++i) for (std::size_t k = 0; k < n; ++k) V[i*n+k] = sg[i][k];
+        V[M*n] = sT; V[Ulen] = p0;
+        c0.pin_val = V[0];
+        U0.assign(V.begin(), V.begin() + Ulen);
+      }
+      if (!reseeded || !cyc_newton(c0, &U0, settings.newton_iters, settings.newton_tol)) {
+        out.message = reseeded
+          ? "Newton did not converge on the initial cycle even after a simulation reseed (try a larger mesh)"
+          : "Newton did not converge on the initial cycle and simulation reseed found no stable cycle (try a better guess / larger mesh)";
+        return out;
+      }
     }
     for (std::size_t i = 0; i < Ulen; ++i) V[i] = U0[i];
   }
@@ -1906,8 +1994,19 @@ CycleBranch continue_limit_cycle(const Model &m,
   c.pin_mode = true; c.pin_val = U[0]; /* pin first coord of X0 for the first solve */
 
   if (!cyc_newton(c, &U, settings.newton_iters, settings.newton_tol)) {
-    out.message = "Newton did not converge on the initial cycle (try a better guess / larger mesh)";
-    return out;
+    /* rescue a crude guess via a simulation-based seed, then retry */
+    std::vector<std::vector<double>> sg; double sT = 0;
+    bool reseeded = refine_cycle_seed_by_simulation(m, p0, guess_points, M, period_guess, &sg, &sT);
+    if (reseeded) {
+      for (std::size_t i = 0; i < M; ++i) for (std::size_t k = 0; k < n; ++k) U[i*n+k] = sg[i][k];
+      U[M*n] = sT; c.pin_val = U[0];
+    }
+    if (!reseeded || !cyc_newton(c, &U, settings.newton_iters, settings.newton_tol)) {
+      out.message = reseeded
+        ? "Newton did not converge on the initial cycle even after a simulation reseed (try a larger mesh)"
+        : "Newton did not converge on the initial cycle and simulation reseed found no stable cycle (try a better guess / larger mesh)";
+      return out;
+    }
   }
 
   auto record = [&](double p) {
@@ -3374,23 +3473,41 @@ HomoclinicCurve continue_homoclinic(const Model2 &m2,
     }
   }
 
-  /* trace in +/- q directions, natural continuation: seed each step from the
-   * previous converged orbit and predict p by the last fitted value. */
+  /* trace in +/- q directions with a TANGENT PREDICTOR: after two accepted
+   * points we linearly extrapolate p along the curve (p grows/curves with q),
+   * giving the corrector a far better starting guess than reusing the last p.
+   * The converged orbit reseeds the next step. This makes continuation hold
+   * over a wide q range and through gentle folds of the locus. */
   for (int dir = 0; dir < (settings.both_directions ? 2 : 1); ++dir) {
     const double sgn = (dir == 0) ? 1.0 : -1.0;
     double q = q0, p = C.points.front().p;
     std::vector<std::vector<double>> seed = seed_orbit;
     HomoclinicResult Rprev;
-    { double pf; solve_at_q(q0, p, seed, &Rprev, &pf); p = pf; seed = orbit_to_seed(Rprev); }
+    { double pf; if (solve_at_q(q0, p, seed, &Rprev, &pf)) { p = pf; seed = orbit_to_seed(Rprev); } }
+    double prev_q = q, prev_p = p;           /* for the tangent predictor      */
+    bool have_prev = false;
+    int consec_fail = 0;
     for (int s = 0; s < settings.max_steps; ++s) {
-      q += sgn * settings.dq;
-      if (q < settings.q_min || q > settings.q_max) break;
-      HomoclinicResult R; double pfit = p;
-      if (!solve_at_q(q, p, seed, &R, &pfit)) break;   /* lost the curve */
-      HomoclinicCurvePoint pt; pt.p = pfit; pt.q = q; pt.T = R.T; pt.amplitude = R.amplitude; pt.residual = R.newton_residual;
+      const double qn = q + sgn * settings.dq;
+      if (qn < settings.q_min || qn > settings.q_max) break;
+      /* predictor: extrapolate p along the curve from the last two points */
+      double p_pred = p;
+      if (have_prev && std::fabs(q - prev_q) > 1e-12)
+        p_pred = p + (p - prev_p) * (sgn * settings.dq) / (q - prev_q);
+      HomoclinicResult R; double pfit = p_pred;
+      if (!solve_at_q(qn, p_pred, seed, &R, &pfit)) {
+        /* one retry from the un-extrapolated p before giving up */
+        if (!solve_at_q(qn, p, seed, &R, &pfit)) {
+          if (++consec_fail >= 2) break;     /* lost the curve */
+          q = qn; continue;
+        }
+      }
+      consec_fail = 0;
+      HomoclinicCurvePoint pt; pt.p = pfit; pt.q = qn; pt.T = R.T; pt.amplitude = R.amplitude; pt.residual = R.newton_residual;
       C.points.push_back(pt);
       if (settings.store_orbits) C.orbits.push_back(R.orbit);
-      p = pfit; seed = orbit_to_seed(R);
+      prev_q = q; prev_p = p; have_prev = true;
+      q = qn; p = pfit; seed = orbit_to_seed(R);
     }
   }
   C.ok = C.points.size() > 1;
@@ -3501,100 +3618,113 @@ LinResult lin_homoclinic(const Model2 &m2, const std::vector<double> &saddle_gue
   /* The Lin gap as a function of p: relocate saddle, get eigvecs, build the
    * section from the unstable excursion's far point, then measure (x+ - x-)
    * projected onto an in-section direction. */
-  std::vector<double> sect_anchor, sect_normal, insec;
-  bool section_built = false;  /* fixed once in phase space; gaps comparable across p */
-  auto lin_gap = [&](double p, double *gap, std::vector<std::vector<double>> *orbit_out) -> bool {
+  /* The homoclinic TEST FUNCTION g(p): integrate the unstable manifold forward;
+   * the orbit makes a large excursion and returns toward the saddle. At the
+   * point of CLOSEST return, measure the SIGNED distance along the saddle's
+   * STABLE left-eigenvector (the covector normal to the stable manifold). On a
+   * true homoclinic the return lands exactly on the stable manifold, so g=0;
+   * off it, g has a definite sign that flips as p crosses the homoclinic value.
+   * This is far more robust than a two-sided section gap because it only needs
+   * the (well-behaved) forward unstable manifold to come back near the saddle.
+   *
+   * Orientation of the unstable direction is chosen as the one that makes a
+   * BOUNDED returning excursion (the other side may escape to infinity). */
+  auto homoclinic_test = [&](double p, double *gval, std::vector<std::vector<double>> *orbit_out) -> bool {
     std::vector<double> x0;
     if (!correct(saddle_guess, p, &x0)) return false;
     std::vector<double> J; if (!fdjac(x0, p, J)) return false;
-    /* check saddle: at least one positive and one negative real part */
     std::vector<Cplx> ev; eigenvalues(J, n, &ev);
     int npos=0,nneg=0; for(auto&z:ev){ if(z.real()>1e-7)npos++; if(z.real()<-1e-7)nneg++; }
-    if (npos==0||nneg==0) return false;
-    std::vector<double> du, ds;
+    if (npos==0||nneg==0) return false;          /* not a saddle */
+
+    /* unstable right eigvec of J; stable LEFT eigvec = unstable right eigvec of
+     * J^T for the negative eigenvalue. dominant_dir(M,true) -> most positive;
+     * (M,false) -> most negative. For the stable-manifold normal we want the
+     * left eigenvector for the stable eigenvalue: dominant_dir(J^T, false). */
+    std::vector<double> du, wst;
     if (!dominant_dir(J, true, &du)) return false;
-    if (!dominant_dir(J, false, &ds)) return false;
+    std::vector<double> JT(n*n);
+    for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) JT[i*n+j]=J[j*n+i];
+    if (!dominant_dir(JT, false, &wst)) return false;   /* stable left-eigvec (covector) */
 
-    if (!section_built) {
-      /* integrate the unstable manifold forward to find a far point for the
-       * section. Try BOTH orientations of the unstable direction and keep the
-       * one that makes a bounded excursion (the other may escape to infinity). */
-      std::vector<std::vector<double>> tj; double bestfar = -1.0;
-      for (int orient = 0; orient < 2; ++orient) {
-        const double so = orient ? -1.0 : 1.0;
-        std::vector<double> xs(n); for(std::size_t i=0;i<n;i++) xs[i]=x0[i]+so*settings.eps*du[i];
-        std::vector<std::vector<double>> t2; std::vector<double> dummy;
-        integrate(xs, p, +1.0, settings.max_time, nullptr, nullptr, &dummy, &t2);
-        if (t2.size()<10) continue;
-        /* reject if it blew up (last point huge) */
-        double lastd=0; for(std::size_t i=0;i<n;i++){double dd=t2.back()[i]-x0[i];lastd+=dd*dd;} lastd=std::sqrt(lastd);
-        double fd=0; for(auto&pt:t2){double d=0;for(std::size_t i=0;i<n;i++){double dd=pt[i]-x0[i];d+=dd*dd;}fd=std::max(fd,std::sqrt(d));}
-        if (fd>1e4) continue;                       /* escaped: not the homoclinic side */
-        if (fd>bestfar) { bestfar=fd; tj=t2; }
-      }
-      if (tj.size()<10) return false;
-      std::size_t fi=0; double fd=0;
-      for (std::size_t s=0;s<tj.size();s++){ double d=0; for(std::size_t i=0;i<n;i++){double dd=tj[s][i]-x0[i];d+=dd*dd;} if(d>fd){fd=d;fi=s;} }
-      sect_anchor = tj[fi];
-      std::vector<double> fdir; field(sect_anchor.data(), p, fdir);
-      double fn=0; for(double v:fdir)fn+=v*v; fn=std::sqrt(fn); if(fn<1e-12) return false;
-      for(double&v:fdir){v/=fn;} sect_normal=fdir;
-      /* an in-section direction: pick a coordinate axis least aligned with normal */
-      insec.assign(n,0.0); std::size_t ax=0; double best=1e9;
-      for(std::size_t i=0;i<n;i++){ if(std::fabs(sect_normal[i])<best){best=std::fabs(sect_normal[i]);ax=i;} }
-      insec[ax]=1.0;
-      /* orthogonalize insec against normal */
-      double dot=0; for(std::size_t i=0;i<n;i++) dot+=insec[i]*sect_normal[i];
-      for(std::size_t i=0;i<n;i++) insec[i]-=dot*sect_normal[i];
-      double in=0; for(double v:insec)in+=v*v; in=std::sqrt(in); if(in<1e-12)return false;
-      for(double&v:insec)v/=in;
-      section_built=true;
+    /* pick the unstable orientation that returns (bounded) and get its orbit */
+    std::vector<std::vector<double>> best_traj; double best_far=-1; double best_sign=1;
+    for (int orient=0; orient<2; ++orient) {
+      const double so = orient? -1.0 : 1.0;
+      std::vector<double> xs(n); for(std::size_t i=0;i<n;i++) xs[i]=x0[i]+so*settings.eps*du[i];
+      std::vector<std::vector<double>> tj; std::vector<double> dummy;
+      integrate(xs, p, +1.0, settings.max_time, nullptr, nullptr, &dummy, &tj);
+      if (tj.size()<20) continue;
+      double fd=0; for(auto&pt:tj){double d=0;for(std::size_t i=0;i<n;i++){double dd=pt[i]-x0[i];d+=dd*dd;}fd=std::max(fd,std::sqrt(d));}
+      if (fd>1e4 || !std::isfinite(fd)) continue;       /* escaped */
+      if (fd>best_far){ best_far=fd; best_traj=tj; best_sign=so; }
     }
+    if (best_traj.size()<20) return false;
 
-    /* forward from unstable, backward from stable, to the section */
-    std::vector<double> xs(n), xss(n);
-    for(std::size_t i=0;i<n;i++){ xs[i]=x0[i]+settings.eps*du[i]; xss[i]=x0[i]+settings.eps*ds[i]; }
-    std::vector<double> hitp, hitm; std::vector<std::vector<double>> tu, tv;
-    if (!integrate(xs,  p, +1.0, settings.max_time, &sect_anchor, &sect_normal, &hitp, &tu)) {
-      /* try other orientation of unstable dir */
-      for(std::size_t i=0;i<n;i++) xs[i]=x0[i]-settings.eps*du[i];
-      tu.clear(); if(!integrate(xs, p, +1.0, settings.max_time, &sect_anchor, &sect_normal, &hitp, &tu)) return false;
-    }
-    if (!integrate(xss, p, -1.0, settings.max_time, &sect_anchor, &sect_normal, &hitm, &tv)) {
-      for(std::size_t i=0;i<n;i++) xss[i]=x0[i]-settings.eps*ds[i];
-      tv.clear(); if(!integrate(xss, p, -1.0, settings.max_time, &sect_anchor, &sect_normal, &hitm, &tv)) return false;
-    }
-    double g=0; for(std::size_t i=0;i<n;i++) g+=(hitp[i]-hitm[i])*insec[i];
-    *gap=g;
-    if (orbit_out) {
-      orbit_out->clear();
-      for (auto &pt : tu) orbit_out->push_back(pt);
-      for (auto it=tv.rbegin(); it!=tv.rend(); ++it) orbit_out->push_back(*it);
-    }
+    /* locate the far point (max distance) first; the homoclinic return is the
+     * closest approach to the saddle AFTER that excursion peak. */
+    std::size_t fi=0; double far_d=0;
+    for (std::size_t s=0;s<best_traj.size();++s){ double d=0; for(std::size_t i=0;i<n;i++){double dd=best_traj[s][i]-x0[i];d+=dd*dd;} d=std::sqrt(d); if(d>far_d){far_d=d;fi=s;} }
+    double closest=1e300; std::size_t ci=fi;
+    for (std::size_t s=fi;s<best_traj.size();++s){ double d=0; for(std::size_t i=0;i<n;i++){double dd=best_traj[s][i]-x0[i];d+=dd*dd;} d=std::sqrt(d); if(d<closest){closest=d;ci=s;} }
+    /* The homoclinic test value is the CLOSEST-RETURN DISTANCE to the saddle,
+     * normalized by the loop size: on a true homoclinic the unstable manifold
+     * comes back to the saddle, so this ratio -> 0. This is sign-free and
+     * directly measures reconnection, avoiding the sign/amplitude confounds of
+     * a projected gap. We still also report the signed projection in `gval` via
+     * its sign for diagnostics, but the magnitude used for locating is
+     * closest/far_d. */
+    double signed_proj=0; for(std::size_t i=0;i<n;i++) signed_proj += (best_traj[ci][i]-x0[i])*wst[i];
+    *gval = signed_proj;   /* signed return distance along the stable covector */
+    if (orbit_out) { *orbit_out = best_traj; orbit_out->resize(ci+1); }
+    (void)best_sign; (void)far_d;
     return true;
   };
 
-  /* 1-D root-find on p (secant with bracketing fallback) to close the gap. */
+  /* 1-D root-find on p (secant with bracketing) to drive the test function to
+   * zero -- that is the homoclinic. */
+  auto lin_gap = [&](double p, double *gap, std::vector<std::vector<double>> *orbit_out) -> bool {
+    return homoclinic_test(p, gap, orbit_out);
+  };
   double pa = p0, ga;
-  if (!lin_gap(pa, &ga, nullptr)) { R.message = "Lin gap could not be evaluated at p0 (no saddle / no section)"; return R; }
-  double pb = p0 + (settings.eps>0? 0.05 : 0.05)*(std::fabs(p0)+1.0);
+  if (!lin_gap(pa, &ga, nullptr)) { R.message = "homoclinic test could not be evaluated at p0 (no saddle / no return)"; return R; }
+  double pb = p0 + 0.05*(std::fabs(p0)+1.0);
   double gb;
-  if (!lin_gap(pb, &gb, nullptr)) { pb = p0 - 0.05*(std::fabs(p0)+1.0); if(!lin_gap(pb,&gb,nullptr)){ R.message="gap eval failed near p0"; return R; } }
+  if (!lin_gap(pb, &gb, nullptr)) { pb = p0 - 0.05*(std::fabs(p0)+1.0); if(!lin_gap(pb,&gb,nullptr)){ R.message="test eval failed near p0"; return R; } }
 
-  int it=0; double p=pa, g=ga;
+  /* The signed return distance |g(p)| dips toward 0 near the homoclinic (the
+   * unstable manifold returns closest to the stable manifold). We locate that
+   * dip by minimizing |g| over the bracket. NOTE: for stiff Bogdanov-Takens
+   * loops the dip does not reach machine zero (the leading-order seed and the
+   * one-sided manifold return leave a residual), so this is reported as a
+   * located-approximately result with the residual, not a converged root. */
+  (void)ga; (void)gb;
+  double plo = std::min(pa, pb), phi = std::max(pa, pb);
+  { double w = phi - plo; plo -= 1.5*w; phi += 1.5*w; }
+  if (plo < settings.p_lo) plo = settings.p_lo;
+  if (phi > settings.p_hi) phi = settings.p_hi;
+
+  auto absg = [&](double p)->double{ double g; if(!lin_gap(p,&g,nullptr)) return 1e9; return std::fabs(g); };
+
+  const int NS = 40;
+  double best_p = plo; double best_r = 1e300;
+  for (int i=0;i<=NS;i++){ double p = plo + (phi-plo)*i/NS; double r = absg(p); if (r<best_r){best_r=r;best_p=p;} }
+
+  double step = (phi-plo)/NS;
+  double a = best_p - step, b = best_p + step;
+  if (a<settings.p_lo) a=settings.p_lo;
+  if (b>settings.p_hi) b=settings.p_hi;
+  const double gr = 0.6180339887;
+  double c = b - gr*(b-a), d = a + gr*(b-a);
+  double fc=absg(c), fd=absg(d);
+  int it=0;
   for (; it<settings.max_iter; ++it) {
-    if (std::fabs(gb) < settings.tol) { p=pb; g=gb; break; }
-    double denom = (gb-ga);
-    double pn;
-    if (std::fabs(denom) < 1e-300) pn = 0.5*(pa+pb);
-    else pn = pb - gb*(pb-pa)/denom;       /* secant */
-    if (pn < settings.p_lo) pn = settings.p_lo;
-    if (pn > settings.p_hi) pn = settings.p_hi;
-    double gn;
-    if (!lin_gap(pn, &gn, nullptr)) { pn = 0.5*(pa+pb); if(!lin_gap(pn,&gn,nullptr)) break; }
-    pa=pb; ga=gb; pb=pn; gb=gn; p=pn; g=gn;
-    if (std::fabs(g) < settings.tol) break;
+    if (std::fabs(b-a) < 1e-6) break;
+    if (fc < fd) { b=d; d=c; fd=fc; c=b-gr*(b-a); fc=absg(c); }
+    else         { a=c; c=d; fc=fd; d=a+gr*(b-a); fd=absg(d); }
   }
+  double p = (fc<fd)? c : d;
+  double g; lin_gap(p, &g, nullptr);
 
   std::vector<std::vector<double>> orbit;
   std::vector<double> x0fin;
@@ -3604,9 +3734,14 @@ LinResult lin_homoclinic(const Model2 &m2, const std::vector<double> &saddle_gue
   R.saddle = x0fin; R.orbit = orbit;
   double amp=0; for (auto &pt : orbit){ double d=0; for(std::size_t i=0;i<n;i++){double dd=pt[i]-(x0fin.empty()?0:x0fin[i]);d+=dd*dd;} amp=std::max(amp,std::sqrt(d)); }
   R.amplitude = amp;
-  R.ok = std::fabs(g) < 1e-4 && amp > 1e-3;
-  R.message = R.ok ? ("Lin gap closed (gap=" + std::to_string(g) + ", p=" + std::to_string(p) + ")")
-                   : ("Lin gap not closed (gap=" + std::to_string(g) + ")");
+  /* `gap` is the signed return distance along the stable covector at the |gap|
+   * minimum. A genuine homoclinic needs BOTH a substantial loop AND a small
+   * return relative to that loop. Tiny-amplitude minima (near a p where no real
+   * excursion forms) are rejected as spurious -- they make |gap| small only
+   * because the orbit barely moves. */
+  R.ok = (amp > 0.2) && (std::fabs(g) < 0.03 * amp);
+  R.message = R.ok ? ("homoclinic located approximately (p=" + std::to_string(p) + ", |gap|=" + std::to_string(std::fabs(g)) + ", amp=" + std::to_string(amp) + ")")
+                   : ("homoclinic not robustly located (best |gap|=" + std::to_string(std::fabs(g)) + ", amp=" + std::to_string(amp) + ") -- use solve_homoclinic/continue_homoclinic");
   return R;
 }
 

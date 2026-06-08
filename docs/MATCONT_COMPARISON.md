@@ -34,8 +34,8 @@ is to tell you which tool to reach for, not to win an argument.
 |---|---|---|---|
 | Limit-cycle continuation | Orthogonal collocation, **adaptive mesh + arclength**, Floquet multipliers | Collocation cycle solver, but **steps the parameter monotonically (no pseudo-arclength)** | dynsys can't go around folds of cycles robustly; MatCont can |
 | Codim-1 curve continuation | Pseudo-arclength, handles folds in the curve, very long runs | Equilibrium branch + fold/Hopf detection; two-parameter fold/Hopf curves | MatCont's continuation is far more robust on hard curves |
-| Codim-2 (BT, GH, cusp, ZH, HH) | ● (+ ZH, HH) | ◐ (BT a,b + bisection; cusp cubic c exact; GH l2 sign; ZH+HH detected) |
-| Homoclinic/heteroclinic | Dedicated continuation (HomCont) | Not available | genuine missing feature |
+| Codim-2 points | BT, GH, ZH, HH, cusp with validated normal-form coefficients | BT / cusp / generalized-Hopf detection + first normal-form coefficients | MatCont covers more types and is better validated |
+| Homoclinic continuation | ● | ◐ (truncated-BVP locus, tangent predictor; Lin's method experimental) |
 | Floquet / monodromy | Yes, full | Partial (period & amplitude; not full Floquet) | gap |
 | Track record | 15+ years, thousands of papers | new | trust/validation |
 | Ecosystem | MATLAB: plotting, export, scripting, community | self-contained, no scripting language | MATLAB integration |
@@ -97,8 +97,8 @@ dynsys does not claim parity there.
 | Branch points + branch switching | ● | ◐ |
 | Limit-cycle continuation | ● (adaptive + arclength) | ◐ (monotone param, no arclength) |
 | LPC (fold of cycles) curve | ● | ◐ |
-| Codim-2 (BT, GH, cusp, ZH, HH) | ● (+ ZH, HH) | ◐ (BT a,b + bisection; cusp cubic c exact; GH l2 sign; ZH+HH detected) |
-| Homoclinic continuation | ● | ○ |
+| Codim-2 (BT, GH, cusp) | ● (+ ZH, HH) | ◐ (BT, GH, cusp; first coeffs) |
+| Homoclinic continuation | ● | ◐ (truncated-BVP locus, tangent predictor; Lin's method experimental) |
 | Floquet multipliers | ● | ◐ |
 | Period / amplitude vs parameter | ● | ● |
 | Live phase portrait / 3-D attractor | ○ | ● |
