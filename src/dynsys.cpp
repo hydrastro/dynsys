@@ -4467,6 +4467,21 @@ void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
   ImGui::Checkbox("auto bounds", &app.phase_auto_bounds); ImGui::SameLine();
   ImGui::Checkbox("normalized vectors", &app.phase_normalize_vectors); ImGui::SameLine();
   ImGui::SliderInt("grid", &app.phase_grid, 8, 40);
+  /* Explicit zoom controls (guaranteed to work regardless of mouse-wheel /
+   * trackpad quirks): zoom out enlarges the span about the current view centre,
+   * zoom in shrinks it, reset re-fits to the data. These set MANUAL bounds so
+   * the auto-fit (which only grows) can't fight a deliberate zoom-out. */
+  {
+    const size_t zix = app.state_names.empty() ? 0 : (size_t)std::max(0, std::min(app.phase_x_index, (int)app.state_names.size()-1));
+    const size_t ziy = app.state_names.empty() ? 0 : (size_t)std::max(0, std::min(app.phase_y_index, (int)app.state_names.size()-1));
+    PlotBounds zb = current_phase_bounds(app, zix, ziy);
+    const Point2 ctr{0.5*(zb.xmin+zb.xmax), 0.5*(zb.ymin+zb.ymax)};
+    if (ImGui::SmallButton("zoom out")) zoom_phase_bounds(app, zb, ctr, 1.40);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("zoom in"))  zoom_phase_bounds(app, zb, ctr, 0.71);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("reset view")) { app.phase_auto_bounds = true; app.phase_bounds_valid = false; }
+  }
   if (app.phase_auto_fixed_points && app.mode == SystemMode::ODE) {
     ImGui::TextDisabled("equilibria in view: %zu (auto-found & classified)",
                         app.phase_fixed_points.size());
@@ -4496,7 +4511,7 @@ void draw_auto_fixed_points(AppState &app, ImDrawList *draw,
   /* PHASE6-UI: auto-find every equilibrium in the current view. */
   maybe_rescan_fixed_points(app, bounds, ix, iy);
 
-  ImGui::TextDisabled("L-click: restart orbit | shift+L: add orbit | R-drag: pan | wheel or +/-: zoom | dbl-click: auto-fit");
+  ImGui::TextDisabled("L-click: restart orbit | shift+L: add orbit | R-drag: pan | wheel or +/- or buttons: zoom | dbl-click or 'reset view': auto-fit");
   ImGui::InvisibleButton("phase_canvas", ImVec2(w, h), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
   const bool hovered = ImGui::IsItemHovered();
   const bool active = ImGui::IsItemActive();

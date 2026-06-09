@@ -41,6 +41,15 @@ The single parameter **K** (predator conversion efficiency) sweeps 0 -> 5.
   drops to ~55-80 for K>=1.1: the period-doublings accumulate near a HOMOCLINIC
   connection (hence the diverging period) -- a genuine, non-textbook stress test
   of the long-period collocation/Floquet path.
+- Investigated the source of the diverging period with find_homoclinic: it is
+  NOT a simple homoclinic to an interior saddle (the reduced predator-prey
+  subsystem has no positive coexistence fixed point at these parameters, and
+  the finder correctly reports no same-saddle excursion off the prey-only
+  equilibrium). The slow-down is consistent with a near-BOUNDARY heteroclinic
+  cycle -- the trajectory lingers near the axial/boundary equilibria where one
+  species is rare -- which is a well-known mechanism in tritrophic food chains.
+  (This is the honest outcome: find_homoclinic distinguishes "no same-saddle
+  homoclinic here" from a false positive.)
 
 ## Notes
 Verified headless: the preset loads, renders, and the limit-cycle continuation
