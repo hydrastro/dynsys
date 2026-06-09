@@ -223,7 +223,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-codim2cyc test-lindiag test-findhomo test-zhnf test-hhnf test-btlocate debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-codim2cyc test-lindiag test-findhomo test-zhnf test-hhnf test-btlocate test-btcurve test-zhcurve debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -316,7 +316,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-codim2cyc test-lindiag test-findhomo test-zhnf test-hhnf test-btlocate test-lpccurve test-eshadow test-bridgealign test-projsolid
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-codim2cyc test-lindiag test-findhomo test-zhnf test-hhnf test-btlocate test-btcurve test-zhcurve test-lpccurve test-eshadow test-bridgealign test-projsolid
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -855,6 +855,22 @@ test-btlocate: $(BTLOCATE_TEST_TARGET)
 $(BTLOCATE_TEST_TARGET): test/bt_locate_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/bt_locate_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+BTCURVE_TEST_TARGET := $(BUILD_DIR)/bt_curve_smoke$(EXEEXT)
+test-btcurve: $(BTCURVE_TEST_TARGET)
+	./$(BTCURVE_TEST_TARGET)
+
+$(BTCURVE_TEST_TARGET): test/bt_curve_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/bt_curve_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+ZHCURVE_TEST_TARGET := $(BUILD_DIR)/zh_curve_smoke$(EXEEXT)
+test-zhcurve: $(ZHCURVE_TEST_TARGET)
+	./$(ZHCURVE_TEST_TARGET)
+
+$(ZHCURVE_TEST_TARGET): test/zh_curve_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/zh_curve_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
 
 
 LPCCURVE_TEST_TARGET := $(BUILD_DIR)/lpc_curve_smoke$(EXEEXT)

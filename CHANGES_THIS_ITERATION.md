@@ -1,51 +1,36 @@
-# dynsys — Bogdanov-Takens point location (final gap-closer) + full checkup
+# dynsys — zero-Hopf CURVE continuation (codim-2 curves beyond BT)
 
 Unzip at repo root, `make clean && make && make run`. CAS features need
 LIZARD + SANGAKU_ROOT (or the Nix dev shell).
 
-## Bogdanov-Takens point location by defining-system Newton  [NEW]
-Previously dynsys DETECTED Bogdanov-Takens (BT) points along a fold/Hopf curve
-(eigenvalue-test bracketing + bisection). It now also LOCATES a BT point
-directly, the way MatCont's BT initialization does: Newton on the defining
-system
-    { f(x,p,q) = 0  (n eqns) ;  mu_prod = 0 ;  mu_sum = 0 }
-where mu_prod is the product and mu_sum the sum of the real parts of the two
-smallest-magnitude eigenvalues -- both vanish at the double-zero. This is a
-square (n+2)x(n+2) Newton in the full (x, p, q) space with Levenberg damping,
-pinning the equilibrium AND both parameters to machine precision. On success the
-BT normal-form coefficients a,b are computed at the located point.
+## Zero-Hopf (fold-Hopf) curve continuation in 3 parameters  [NEW]
+The codim-2 *curve continuation* gap was partly closed already (bt_curve
+continues a Bogdanov-Takens point as a curve in (x,p,q,r)). This iteration adds
+the ZERO-HOPF locus: zh_curve traces the fold-Hopf point as a curve in three
+parameters by pseudo-arclength on the defining system
+    { f = 0 (n eqns) ; Re(real eigenvalue) = 0 ; Re(complex pair) = 0 },
+i.e. a fold and a Hopf pinned simultaneously, over the unknowns (x,p,q,r).
+Same predictor/corrector scheme as bt_curve; reuses BTCurve/BTCurveSettings (the
+point's a,b fields carry the zero-Hopf b and Re(c)). So BOTH Bogdanov-Takens and
+zero-Hopf codim-2 points now continue as curves.
 
-analysis::locate_bogdanov_takens(model2, x0, p0, q0) -> Codim2Point.
-This is the prerequisite for the next rung (continuing codim-2 points as curves
-in a third parameter).
-
-### Validation (new test bt_locate_smoke)
-On the Bogdanov-Takens normal form x'=y, y'=b1+b2*y+x^2+x*y -- whose BT point is
-known EXACTLY at (b1,b2)=(0,0) with equilibrium (0,0) -- starting from a nearby
-guess the locator converges in 8 iterations to the exact point: residual
-2.7e-15, x=(0,0), b1=0, b2=0, and the BT normal form a=b=1.
+### Validation (new test zh_curve_smoke)
+On a 3-parameter system with an ANALYTIC zero-Hopf locus
+  x' = (p + 0.3 r) x - x^2     (fold: zero eigenvalue at p = -0.3 r)
+  y' = -(1+0.2 r) z + q y      (Hopf pair at q = 0)
+  z' =  (1+0.2 r) y + q z
+the locus is exactly { p = -0.3 r, q = 0 }. zh_curve traces 86 points with
+r spanning [-4.08, 4.08], both defining conditions satisfied to 3e-10, and the
+zero-Hopf coefficient b = -2 recovered correctly all along the curve.
 
 ## Refreshed MATCONT_COMPARISON.md
-Marked BT point location as done; the codim-2 row is now "≈ parity on
-coefficients + BT point location". The remaining continuation gap is narrowed to
-continuing codim-2 points as curves in a third parameter.
+Codim-2 curve continuation now lists BT + zero-Hopf as done; the remaining
+curve-continuation sub-gap is the cusp / Hopf-Hopf / Bautin loci.
 
 ## Final checkup (this iteration)
-- All 4 C++ TUs (dynsys, expr_ir, analysis, expr_ir_ad) compile with ZERO
-  warnings under -Wall -Wextra; brace check passes.
-- The REAL GLFW/OpenGL binary builds (~12 MB) and renders the food-chain preset.
-- CAS (exact symbolic Routh-Hurwitz path) green: === PASS ===.
-- The full codim-2 suite passes: bt_locate, hopf_hopf_nf, zero_hopf_nf,
-  codim2_coeffs, bt_codim2 -- all "all checks pass".
-- Full `make test` run: 0 failures (see below).
-
-## State at finish
-dynsys now has the complete planar codim-2 normal-form set (BT, cusp, GH, ZH,
-HH) with validated coefficients, direct BT point location, two-parameter
-fold/Hopf and cycle-bifurcation (LPC/PD/NS) curves with codim-2 detection,
-branch-point-of-cycles, full Floquet via the variational monodromy, arclength
-limit-cycle continuation, homoclinic + heteroclinic solving/continuation + a
-one-call homoclinic locator, plus the exact-symbolic (CAS) differentiator.
-Remaining honest gaps: a fully general parameter-as-unknown homoclinic BVP,
-continuation of codim-2 points as curves in a 3rd parameter, and 15 years of
-robustness/track record.
+- All 4 C++ TUs compile ZERO warnings under -Wall -Wextra; brace check passes.
+- The REAL GLFW/OpenGL binary builds (~12 MB).
+- CAS green: === PASS ===.
+- Codim-2 curve + normal-form tests all pass: zh_curve, bt_curve, bt_locate,
+  hopf_hopf_nf, zero_hopf_nf.
+- Full `make test`: 0 failures (see below).

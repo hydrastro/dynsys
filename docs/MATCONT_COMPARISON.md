@@ -56,10 +56,13 @@ suite, not that it matches MatCont's 15-year robustness on pathological inputs.
    degeneracies that defeat the naive version are documented in the roadmap.)
 2. **Continuation of codim-2 points as curves in a third parameter.** dynsys
    now LOCATES a Bogdanov-Takens point directly (defining-system Newton in
-   (x,p,q), matching MatCont's BT init) and computes its normal form, but does
-   not yet continue it as a curve when a third parameter is freed. That step
-   (and detection of higher codim-2 cycle points beyond the three implemented)
-   remains.
+   (x,p,q)) AND CONTINUES it as a curve when a third parameter is freed
+   (bt_curve: pseudo-arclength on the BT defining system in (x,p,q,r),
+   validated on a system with an analytic BT locus). The ZERO-HOPF (fold-Hopf)
+   locus is likewise continued as a curve (zh_curve, validated on an analytic
+   fold-Hopf locus). Continuation of the REMAINING codim-2 loci (cusp,
+   Hopf-Hopf, Bautin/generalized-Hopf) as curves, and detection of higher
+   codim-2 cycle points beyond the three implemented, remain.
 3. **Robustness and track record.** MatCont has 15 years of hardening on
    pathological systems and a large validation corpus; dynsys validates each
    feature against analytic ground truth but is new.

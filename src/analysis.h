@@ -357,6 +357,57 @@ struct Codim2Point {
 Codim2Point locate_bogdanov_takens(const Model2 &m, const std::vector<double> &x0,
                                    double p0, double q0);
 
+/* ---- CODIM-2 CURVE CONTINUATION (a codim-2 point in 3 parameters) -------- *
+ * A Bogdanov-Takens point is codim-2 (two defining conditions). With a THIRD
+ * free parameter its solution set is a 1-D CURVE in (p,q,r) space. We continue
+ * it by pseudo-arclength on the defining system
+ *   { f(x,p,q,r) = 0  (n eqns) ;  mu_prod = 0 ;  mu_sum = 0 }
+ * which is n+2 equations in the n+3 unknowns (x, p, q, r). This is MatCont's
+ * "BT curve" (a codim-2 locus continued in three parameters). */
+struct Model3 {
+  std::size_t n = 0;
+  /* f(x, p, q, r) -> f_out (length n). */
+  std::function<bool(const double *x, double p, double q, double r, double *f_out, std::string *err)>
+      vector_field;
+};
+
+struct BTCurvePoint {
+  std::vector<double> x;          /* equilibrium */
+  double p = 0.0, q = 0.0, r = 0.0; /* the three parameters */
+  double a = 0.0, b = 0.0;        /* BT normal-form coefficients here */
+  double residual = 0.0;
+};
+
+struct BTCurve {
+  std::vector<BTCurvePoint> points;
+  std::string message;
+  bool ok = false;
+};
+
+struct BTCurveSettings {
+  double ds = 0.02;          /* pseudo-arclength step in (x,p,q,r) space */
+  int max_points = 300;      /* per direction */
+  int max_corrector_iters = 25;
+  double corrector_tol = 1e-9;
+  /* optional box to stop the curve when it leaves the region of interest */
+  double p_min = -1e9, p_max = 1e9, q_min = -1e9, q_max = 1e9, r_min = -1e9, r_max = 1e9;
+};
+
+/* Continue a Bogdanov-Takens curve in three parameters, starting from a point
+ * (x0,p0,q0,r0) on it (e.g. refined first by locate_bogdanov_takens on the
+ * (p,q) slice at the chosen r0). Traces both directions from the start. */
+BTCurve bt_curve(const Model3 &m, const std::vector<double> &x0,
+                 double p0, double q0, double r0, const BTCurveSettings &settings);
+
+/* Continue a ZERO-HOPF (fold-Hopf) point as a curve in three parameters.
+ * The zero-Hopf defining conditions are: one real eigenvalue = 0 AND one
+ * complex-conjugate pair on the imaginary axis (Re = 0). Over the unknowns
+ * (x,p,q,r) this is n+2 equations -> a 1-D locus, traced by the same
+ * pseudo-arclength scheme as bt_curve. Reuses BTCurve/BTCurveSettings (the
+ * BTCurvePoint a,b fields carry the zero-Hopf b and Re(c) here). */
+BTCurve zh_curve(const Model3 &m, const std::vector<double> &x0,
+                 double p0, double q0, double r0, const BTCurveSettings &settings);
+
 /* ---- HOMOCLINIC ORBITS (connection to a saddle) ------------------------- *
  * A homoclinic orbit leaves a saddle equilibrium along its unstable manifold
  * and returns to the SAME saddle along its stable manifold, so x(t) -> x0 as

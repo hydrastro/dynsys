@@ -1454,6 +1454,265 @@ Codim2Point locate_bogdanov_takens(const Model2 &m, const std::vector<double> &x
   return R;
 }
 
+BTCurve bt_curve(const Model3 &m, const std::vector<double> &x0,
+                 double p0, double q0, double r0, const BTCurveSettings &settings) {
+  BTCurve C;
+  const std::size_t n = m.n;
+  if (n < 2 || x0.size() < n) { C.message = "BT curve needs a 2+ dim system"; return C; }
+  const std::size_t NU = n + 3;        /* unknowns: x[0..n-1], p, q, r */
+  const std::size_t NE = n + 2;        /* equations: f=0 (n), mu_prod=0, mu_sum=0 */
+
+  /* defining-system residual G(U), length NE */
+  auto eval_G = [&](const std::vector<double> &U, std::vector<double> *G) -> bool {
+    std::vector<double> x(U.begin(), U.begin()+n); double p=U[n], q=U[n+1], r=U[n+2];
+    Model mm; mm.n=n;
+    mm.vector_field = [&m,q,r](const double*xx,double pp,double*fo,std::string*er){ return m.vector_field(xx,pp,q,r,fo,er); };
+    std::vector<double> f(n); std::string e;
+    if (!mm.vector_field(x.data(), p, f.data(), &e)) return false;
+    std::vector<double> A; if (!finite_diff_jacobian(mm, x.data(), p, &A, &e, 1e-7)) return false;
+    std::vector<Complex> ev; if (!eigenvalues(A, n, &ev)) return false;
+    std::sort(ev.begin(), ev.end(), [](const Complex&a,const Complex&b){ return std::abs(a) < std::abs(b); });
+    const Complex l1=ev[0], l2=(ev.size()>1?ev[1]:Complex(0,0));
+    G->assign(NE, 0.0);
+    for (std::size_t i=0;i<n;i++) (*G)[i]=f[i];
+    (*G)[n]   = (l1*l2).real();
+    (*G)[n+1] = l1.real()+l2.real();
+    return true;
+  };
+  /* (NE x NU) finite-difference Jacobian of G */
+  auto eval_Jac = [&](const std::vector<double> &U, std::vector<double> *Jg) -> bool {
+    std::vector<double> G0; if (!eval_G(U, &G0)) return false;
+    Jg->assign(NE*NU, 0.0); std::vector<double> Up=U, Gp;
+    for (std::size_t c=0;c<NU;c++){ const double sv=Up[c]; const double dh=1e-7*(std::fabs(sv)+1e-3);
+      Up[c]=sv+dh; if(!eval_G(Up,&Gp)){Up[c]=sv;return false;} Up[c]=sv;
+      for (std::size_t rr=0;rr<NE;rr++) (*Jg)[rr*NU+c]=(Gp[rr]-G0[rr])/dh; }
+    return true;
+  };
+  /* null vector of the (NE x NU) Jacobian (the curve tangent): NU=NE+1, so the
+   * nullspace is 1-D. Find it by solving the square system formed by appending
+   * a normalization row, taking the direction of largest response. */
+  auto tangent = [&](const std::vector<double> &U, std::vector<double> *t) -> bool {
+    std::vector<double> Jg; if (!eval_Jac(U,&Jg)) return false;
+    /* Build (NU x NU): NE Jacobian rows + 1 row that picks an index; solve for
+     * each candidate index and keep the best-conditioned. Simpler: append a row
+     * e_k and rhs e_k; solve; that yields a vector with t_k=1 in the nullspace
+     * direction if k is not orthogonal to it. Try all k, keep max-norm result. */
+    double best=-1; std::vector<double> bestv(NU,0.0);
+    for (std::size_t k=0;k<NU;k++){
+      std::vector<double> M(NU*NU,0.0), rhs(NU,0.0);
+      for (std::size_t rr=0;rr<NE;rr++) for(std::size_t cc=0;cc<NU;cc++) M[rr*NU+cc]=Jg[rr*NU+cc];
+      M[NE*NU+k]=1.0; rhs[NE]=1.0;
+      std::vector<double> v;
+      if (!solve_linear(M, rhs, &v)) continue;
+      double nrm=0; for(double z:v) nrm+=z*z; nrm=std::sqrt(nrm);
+      if (nrm>best){ best=nrm; bestv=v; }
+    }
+    if (best<=0) return false;
+    for(double&z:bestv) z/=best;
+    *t=bestv; return true;
+  };
+
+  /* refine the start with a Newton on G (no arclength row) to land on the curve */
+  std::vector<double> U(NU,0.0);
+  for (std::size_t i=0;i<n;i++) U[i]=x0[i];
+  U[n]=p0; U[n+1]=q0; U[n+2]=r0;
+  {
+    std::vector<double> G; 
+    for (int it=0; it<60; ++it) {
+      if (!eval_G(U,&G)) { C.message="BT curve: start eval failed"; return C; }
+      double rn=0; for(double g:G) rn+=g*g; rn=std::sqrt(rn); if (rn<1e-10) break;
+      std::vector<double> Jg; if(!eval_Jac(U,&Jg)){ C.message="BT curve: start Jac failed"; return C; }
+      /* least-squares Newton: solve (J^T J) dU = -J^T G with damping */
+      std::vector<double> JtJ(NU*NU,0.0), Jtb(NU,0.0);
+      for(std::size_t a=0;a<NU;a++){ double s=0; for(std::size_t rr=0;rr<NE;rr++) s+=Jg[rr*NU+a]*G[rr]; Jtb[a]=-s;
+        for(std::size_t b2=0;b2<NU;b2++){ double t=0; for(std::size_t rr=0;rr<NE;rr++) t+=Jg[rr*NU+a]*Jg[rr*NU+b2]; JtJ[a*NU+b2]=t; } }
+      for(std::size_t a=0;a<NU;a++) JtJ[a*NU+a]+=1e-10;
+      std::vector<double> dU; if(!solve_linear(JtJ,Jtb,&dU)) break;
+      double dn=0; for(double v:dU) dn+=v*v; dn=std::sqrt(dn);
+      double damp = dn>0.5?0.5/dn:1.0;
+      for(std::size_t a=0;a<NU;a++) U[a]+=damp*dU[a];
+    }
+  }
+
+  auto record = [&](const std::vector<double> &U) {
+    BTCurvePoint P; P.x.assign(U.begin(), U.begin()+n); P.p=U[n]; P.q=U[n+1]; P.r=U[n+2];
+    std::vector<double> G; if (eval_G(U,&G)){ double rn=0; for(double g:G) rn+=g*g; P.residual=std::sqrt(rn); }
+    Model mm; mm.n=n; double q=P.q, r=P.r;
+    mm.vector_field=[&m,q,r](const double*xx,double pp,double*fo,std::string*er){ return m.vector_field(xx,pp,q,r,fo,er); };
+    double a=0,b=0; std::string e; if (bt_normal_form(mm,P.x,P.p,&a,&b,&e)){ P.a=a; P.b=b; }
+    C.points.push_back(P);
+  };
+
+  /* initial tangent */
+  std::vector<double> t0; if (!tangent(U,&t0)) { C.message="BT curve: could not find a tangent at the start"; return C; }
+
+  for (int dir=0; dir<2; ++dir) {
+    std::vector<double> Uc=U, tc=t0;
+    if (dir==1) for(double&z:tc) z=-z;
+    if (dir==0) record(Uc);
+    std::vector<double> tprev=tc;
+    for (int step=0; step<settings.max_points; ++step) {
+      /* predictor */
+      std::vector<double> Up(NU); for(std::size_t i=0;i<NU;i++) Up[i]=Uc[i]+settings.ds*tprev[i];
+      /* corrector: Newton on [ G(U) ; <U-Up, tprev> = 0 ] (NU x NU square) */
+      bool conv=false;
+      for (int it=0; it<settings.max_corrector_iters; ++it) {
+        std::vector<double> G; if(!eval_G(Up,&G)) break;
+        double arc=0; for(std::size_t i=0;i<NU;i++) arc+=(Up[i]-( Uc[i]+settings.ds*tprev[i]))*tprev[i];
+        double rn=0; for(double g:G) rn+=g*g; rn=std::sqrt(rn+arc*arc);
+        if (rn<settings.corrector_tol) { conv=true; break; }
+        std::vector<double> Jg; if(!eval_Jac(Up,&Jg)) break;
+        std::vector<double> M(NU*NU,0.0), rhs(NU,0.0);
+        for(std::size_t rr=0;rr<NE;rr++){ for(std::size_t cc=0;cc<NU;cc++) M[rr*NU+cc]=Jg[rr*NU+cc]; rhs[rr]=-G[rr]; }
+        for(std::size_t cc=0;cc<NU;cc++) M[NE*NU+cc]=tprev[cc];
+        rhs[NE]=-arc;
+        std::vector<double> dU; if(!solve_linear(M,rhs,&dU)) break;
+        for(std::size_t i=0;i<NU;i++) Up[i]+=dU[i];
+      }
+      if (!conv) break;
+      /* box check */
+      if (Up[n]<settings.p_min||Up[n]>settings.p_max||Up[n+1]<settings.q_min||Up[n+1]>settings.q_max||
+          Up[n+2]<settings.r_min||Up[n+2]>settings.r_max) { record(Up); break; }
+      record(Up);
+      /* new tangent, oriented consistently with the previous step */
+      std::vector<double> tnew; if (!tangent(Up,&tnew)) break;
+      double dotp=0; for(std::size_t i=0;i<NU;i++) dotp+=tnew[i]*tprev[i];
+      if (dotp<0) for(double&z:tnew) z=-z;
+      Uc=Up; tprev=tnew;
+    }
+  }
+  C.ok = C.points.size() >= 2;
+  C.message = C.ok ? ("traced BT curve: "+std::to_string(C.points.size())+" points")
+                   : "could not trace a BT curve from this start";
+  return C;
+}
+
+BTCurve zh_curve(const Model3 &m, const std::vector<double> &x0,
+                 double p0, double q0, double r0, const BTCurveSettings &settings) {
+  BTCurve C;
+  const std::size_t n = m.n;
+  if (n < 3 || x0.size() < n) { C.message = "zero-Hopf curve needs a 3+ dim system"; return C; }
+  const std::size_t NU = n + 3;        /* unknowns: x[0..n-1], p, q, r */
+  const std::size_t NE = n + 2;        /* equations: f=0 (n), Re(real eig)=0, Re(complex pair)=0 */
+
+  /* defining-system residual G(U): n equilibrium eqns plus
+   *   G[n]   = real part of the smallest-|Re| REAL eigenvalue   (-> 0 at fold)
+   *   G[n+1] = real part of the least-damped COMPLEX pair        (-> 0 at Hopf)
+   * Together these pin a fold and a Hopf simultaneously = zero-Hopf. */
+  auto eval_G = [&](const std::vector<double> &U, std::vector<double> *G) -> bool {
+    std::vector<double> x(U.begin(), U.begin()+n); double p=U[n], q=U[n+1], r=U[n+2];
+    Model mm; mm.n=n;
+    mm.vector_field = [&m,q,r](const double*xx,double pp,double*fo,std::string*er){ return m.vector_field(xx,pp,q,r,fo,er); };
+    std::vector<double> f(n); std::string e;
+    if (!mm.vector_field(x.data(), p, f.data(), &e)) return false;
+    std::vector<double> A; if (!finite_diff_jacobian(mm, x.data(), p, &A, &e, 1e-7)) return false;
+    std::vector<Complex> ev; if (!eigenvalues(A, n, &ev)) return false;
+    /* smallest-|Re| real eigenvalue (imag ~ 0) and least-damped complex pair */
+    bool have_real=false, have_cplx=false; double g_real=0, g_cplx=0; double best_real=1e300, best_cplx=1e300;
+    for (const auto &lam : ev) {
+      if (std::fabs(lam.imag()) < 1e-6) { if (std::fabs(lam.real()) < best_real) { best_real=std::fabs(lam.real()); g_real=lam.real(); have_real=true; } }
+      else if (lam.imag() > 0)         { if (std::fabs(lam.real()) < best_cplx) { best_cplx=std::fabs(lam.real()); g_cplx=lam.real(); have_cplx=true; } }
+    }
+    if (!have_real) g_real = ev[0].real();   /* fallbacks keep G well-defined off-target */
+    if (!have_cplx) { /* no complex pair: use the next-smallest real as a proxy so Newton still moves */
+      double b2=1e300; for (const auto&lam:ev){ double d=std::fabs(lam.real()); if (std::fabs(lam.imag())<1e-6 && d<b2 && lam.real()!=g_real){b2=d; g_cplx=lam.real();} } }
+    G->assign(NE, 0.0);
+    for (std::size_t i=0;i<n;i++) (*G)[i]=f[i];
+    (*G)[n]   = g_real;
+    (*G)[n+1] = g_cplx;
+    return true;
+  };
+  auto eval_Jac = [&](const std::vector<double> &U, std::vector<double> *Jg) -> bool {
+    std::vector<double> G0; if (!eval_G(U, &G0)) return false;
+    Jg->assign(NE*NU, 0.0); std::vector<double> Up=U, Gp;
+    for (std::size_t c=0;c<NU;c++){ const double sv=Up[c]; const double dh=1e-7*(std::fabs(sv)+1e-3);
+      Up[c]=sv+dh; if(!eval_G(Up,&Gp)){Up[c]=sv;return false;} Up[c]=sv;
+      for (std::size_t rr=0;rr<NE;rr++) (*Jg)[rr*NU+c]=(Gp[rr]-G0[rr])/dh; }
+    return true;
+  };
+  auto tangent = [&](const std::vector<double> &U, std::vector<double> *t) -> bool {
+    std::vector<double> Jg; if (!eval_Jac(U,&Jg)) return false;
+    double best=-1; std::vector<double> bestv(NU,0.0);
+    for (std::size_t k=0;k<NU;k++){
+      std::vector<double> M(NU*NU,0.0), rhs(NU,0.0);
+      for (std::size_t rr=0;rr<NE;rr++) for(std::size_t cc=0;cc<NU;cc++) M[rr*NU+cc]=Jg[rr*NU+cc];
+      M[NE*NU+k]=1.0; rhs[NE]=1.0;
+      std::vector<double> v; if (!solve_linear(M, rhs, &v)) continue;
+      double nrm=0; for(double z:v) nrm+=z*z; nrm=std::sqrt(nrm);
+      if (nrm>best){ best=nrm; bestv=v; }
+    }
+    if (best<=0) return false;
+    for(double&z:bestv) z/=best;
+    *t=bestv; return true;
+  };
+
+  std::vector<double> U(NU,0.0);
+  for (std::size_t i=0;i<n;i++) U[i]=x0[i];
+  U[n]=p0; U[n+1]=q0; U[n+2]=r0;
+  { std::vector<double> G;
+    for (int it=0; it<60; ++it) {
+      if (!eval_G(U,&G)) { C.message="zero-Hopf curve: start eval failed"; return C; }
+      double rn=0; for(double g:G) rn+=g*g; rn=std::sqrt(rn); if (rn<1e-10) break;
+      std::vector<double> Jg; if(!eval_Jac(U,&Jg)){ C.message="zero-Hopf curve: start Jac failed"; return C; }
+      std::vector<double> JtJ(NU*NU,0.0), Jtb(NU,0.0);
+      for(std::size_t a=0;a<NU;a++){ double s=0; for(std::size_t rr=0;rr<NE;rr++) s+=Jg[rr*NU+a]*G[rr]; Jtb[a]=-s;
+        for(std::size_t b2=0;b2<NU;b2++){ double t=0; for(std::size_t rr=0;rr<NE;rr++) t+=Jg[rr*NU+a]*Jg[rr*NU+b2]; JtJ[a*NU+b2]=t; } }
+      for(std::size_t a=0;a<NU;a++) JtJ[a*NU+a]+=1e-10;
+      std::vector<double> dU; if(!solve_linear(JtJ,Jtb,&dU)) break;
+      double dn=0; for(double v:dU) dn+=v*v; dn=std::sqrt(dn);
+      double damp = dn>0.5?0.5/dn:1.0;
+      for(std::size_t a=0;a<NU;a++) U[a]+=damp*dU[a];
+    }
+  }
+
+  auto record = [&](const std::vector<double> &Uv){
+    BTCurvePoint P; P.x.assign(Uv.begin(), Uv.begin()+n); P.p=Uv[n]; P.q=Uv[n+1]; P.r=Uv[n+2];
+    std::vector<double> G; if (eval_G(Uv,&G)) { double rn=0; for(double g:G) rn+=g*g; P.residual=std::sqrt(rn); }
+    Model mm; mm.n=n; double q=P.q, r=P.r;
+    mm.vector_field=[&m,q,r](const double*xx,double pp,double*fo,std::string*er){ return m.vector_field(xx,pp,q,r,fo,er); };
+    double b=0,recc=0,om=0,s=0; std::string e;
+    if (zero_hopf_normal_form(mm,P.x,P.p,&b,&recc,&om,&s,&e)) { P.a=b; P.b=recc; }  /* a<-b, b<-Re(c) */
+    C.points.push_back(P);
+  };
+
+  std::vector<double> t0; if (!tangent(U,&t0)) { C.message="zero-Hopf curve: could not find a tangent at the start"; return C; }
+  for (int dir=0; dir<2; ++dir) {
+    std::vector<double> Uc=U, tc=t0;
+    if (dir==1) for(double&z:tc) z=-z;
+    if (dir==0) record(Uc);
+    std::vector<double> tprev=tc;
+    for (int step=0; step<settings.max_points; ++step) {
+      std::vector<double> Up(NU); for(std::size_t i=0;i<NU;i++) Up[i]=Uc[i]+settings.ds*tprev[i];
+      bool conv=false;
+      for (int it=0; it<settings.max_corrector_iters; ++it) {
+        std::vector<double> G; if(!eval_G(Up,&G)) break;
+        double arc=0; for(std::size_t i=0;i<NU;i++) arc+=(Up[i]-( Uc[i]+settings.ds*tprev[i]))*tprev[i];
+        double rn=0; for(double g:G) rn+=g*g; rn=std::sqrt(rn+arc*arc);
+        if (rn<settings.corrector_tol) { conv=true; break; }
+        std::vector<double> Jg; if(!eval_Jac(Up,&Jg)) break;
+        std::vector<double> M(NU*NU,0.0), rhs(NU,0.0);
+        for(std::size_t rr=0;rr<NE;rr++){ for(std::size_t cc=0;cc<NU;cc++) M[rr*NU+cc]=Jg[rr*NU+cc]; rhs[rr]=-G[rr]; }
+        for(std::size_t cc=0;cc<NU;cc++) M[NE*NU+cc]=tprev[cc];
+        rhs[NE]=-arc;
+        std::vector<double> dU; if(!solve_linear(M,rhs,&dU)) break;
+        for(std::size_t i=0;i<NU;i++) Up[i]+=dU[i];
+      }
+      if (!conv) break;
+      if (Up[n]<settings.p_min||Up[n]>settings.p_max||Up[n+1]<settings.q_min||Up[n+1]>settings.q_max||
+          Up[n+2]<settings.r_min||Up[n+2]>settings.r_max) { record(Up); break; }
+      record(Up);
+      std::vector<double> tnew; if (!tangent(Up,&tnew)) break;
+      double dotp=0; for(std::size_t i=0;i<NU;i++) dotp+=tnew[i]*tprev[i];
+      if (dotp<0) for(double&z:tnew) z=-z;
+      Uc=Up; tprev=tnew;
+    }
+  }
+  C.ok = C.points.size() >= 2;
+  C.message = C.ok ? ("traced zero-Hopf curve: "+std::to_string(C.points.size())+" points")
+                   : "could not trace a zero-Hopf curve from this start";
+  return C;
+}
+
 /* ---- periodic-orbit continuation by collocation ------------------------- */
 namespace {
 
