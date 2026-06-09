@@ -408,6 +408,23 @@ BTCurve bt_curve(const Model3 &m, const std::vector<double> &x0,
 BTCurve zh_curve(const Model3 &m, const std::vector<double> &x0,
                  double p0, double q0, double r0, const BTCurveSettings &settings);
 
+/* Continue a CUSP point as a curve in three parameters. A cusp sits on the fold
+ * curve where the fold (saddle-node) normal-form coefficient a vanishes. The
+ * defining conditions over (x,p,q,r) are: one real eigenvalue = 0 (fold) AND
+ * the cusp coefficient a = 0. Traced by the same pseudo-arclength scheme as
+ * bt_curve. The BTCurvePoint a,b fields carry the cusp coefficient c (a) and the
+ * fold-eigenvalue residual (b). */
+BTCurve cusp_curve(const Model3 &m, const std::vector<double> &x0,
+                   double p0, double q0, double r0, const BTCurveSettings &settings);
+
+/* Continue a HOPF-HOPF (double-Hopf) point as a curve in three parameters. The
+ * defining conditions are: TWO distinct complex-conjugate pairs simultaneously
+ * on the imaginary axis (both Re = 0). Over (x,p,q,r) this is n+2 equations ->
+ * a 1-D locus, traced by the same scheme. The BTCurvePoint a,b fields carry the
+ * two frequencies omega1, omega2 at each point. */
+BTCurve hh_curve(const Model3 &m, const std::vector<double> &x0,
+                 double p0, double q0, double r0, const BTCurveSettings &settings);
+
 /* ---- HOMOCLINIC ORBITS (connection to a saddle) ------------------------- *
  * A homoclinic orbit leaves a saddle equilibrium along its unstable manifold
  * and returns to the SAME saddle along its stable manifold, so x(t) -> x0 as

@@ -1,36 +1,41 @@
-# dynsys — zero-Hopf CURVE continuation (codim-2 curves beyond BT)
+# dynsys — cusp + Hopf-Hopf curve continuation (codim-2 curves COMPLETE)
 
 Unzip at repo root, `make clean && make && make run`. CAS features need
 LIZARD + SANGAKU_ROOT (or the Nix dev shell).
 
-## Zero-Hopf (fold-Hopf) curve continuation in 3 parameters  [NEW]
-The codim-2 *curve continuation* gap was partly closed already (bt_curve
-continues a Bogdanov-Takens point as a curve in (x,p,q,r)). This iteration adds
-the ZERO-HOPF locus: zh_curve traces the fold-Hopf point as a curve in three
-parameters by pseudo-arclength on the defining system
-    { f = 0 (n eqns) ; Re(real eigenvalue) = 0 ; Re(complex pair) = 0 },
-i.e. a fold and a Hopf pinned simultaneously, over the unknowns (x,p,q,r).
-Same predictor/corrector scheme as bt_curve; reuses BTCurve/BTCurveSettings (the
-point's a,b fields carry the zero-Hopf b and Re(c)). So BOTH Bogdanov-Takens and
-zero-Hopf codim-2 points now continue as curves.
+## Cusp and Hopf-Hopf curve continuation in 3 parameters  [NEW]
+Previous iterations added continuation of Bogdanov-Takens (bt_curve) and
+zero-Hopf (zh_curve) codim-2 points as curves. This iteration adds the last two
+planar codim-2 loci, so ALL FOUR now continue as curves in three parameters:
 
-### Validation (new test zh_curve_smoke)
-On a 3-parameter system with an ANALYTIC zero-Hopf locus
-  x' = (p + 0.3 r) x - x^2     (fold: zero eigenvalue at p = -0.3 r)
-  y' = -(1+0.2 r) z + q y      (Hopf pair at q = 0)
-  z' =  (1+0.2 r) y + q z
-the locus is exactly { p = -0.3 r, q = 0 }. zh_curve traces 86 points with
-r spanning [-4.08, 4.08], both defining conditions satisfied to 3e-10, and the
-zero-Hopf coefficient b = -2 recovered correctly all along the curve.
+- cusp_curve: continues the CUSP locus -- fold (one real eigenvalue = 0) AND the
+  fold normal-form coefficient a = 0 -- over the unknowns (x,p,q,r).
+- hh_curve: continues the HOPF-HOPF locus -- TWO distinct complex-conjugate
+  pairs simultaneously on the imaginary axis (both Re = 0).
+
+Both are built on a shared pseudo-arclength codim-2 curve tracer
+(trace_codim2_curve) refactored out of bt_curve/zh_curve, so all four
+continuations share one validated predictor/corrector core, parameterized only
+by their two defining conditions and a per-point normal-form recorder.
+
+### Validation (new tests cusp_curve_smoke, hh_curve_smoke)
+On systems with ANALYTIC codim-2 loci:
+- cusp: x' = p + (q + 0.5 r) x - x^3 has its cusp locus exactly { p=0, q=-0.5 r }.
+  cusp_curve traces 91 points on it, cusp coefficient c=-1 recovered all along,
+  r in [-4.0, 4.0], both defining conditions to 2e-10.
+- Hopf-Hopf: two oscillators with dampings p and (q+0.4 r) and frequencies 1 and
+  2.3 give the locus { p=0, q=-0.4 r }. hh_curve traces 89 points on it, both
+  frequencies (1.0, 2.3) recovered, r in [-4.1, 4.1], conditions to 4e-10.
 
 ## Refreshed MATCONT_COMPARISON.md
-Codim-2 curve continuation now lists BT + zero-Hopf as done; the remaining
-curve-continuation sub-gap is the cusp / Hopf-Hopf / Bautin loci.
+Codim-2 curve continuation is now marked DONE for all four planar loci
+(BT/ZH/cusp/HH). The remaining codim-2 sub-gap is narrowed to codim-2 CYCLE
+points (on limit-cycle bifurcation curves) and continuing those as curves.
 
 ## Final checkup (this iteration)
 - All 4 C++ TUs compile ZERO warnings under -Wall -Wextra; brace check passes.
-- The REAL GLFW/OpenGL binary builds (~12 MB).
+- The REAL GLFW/OpenGL binary builds (~12.6 MB).
 - CAS green: === PASS ===.
-- Codim-2 curve + normal-form tests all pass: zh_curve, bt_curve, bt_locate,
-  hopf_hopf_nf, zero_hopf_nf.
+- All codim-2 curve + locator tests pass: bt_curve, zh_curve, cusp_curve,
+  hh_curve, bt_locate.
 - Full `make test`: 0 failures (see below).
