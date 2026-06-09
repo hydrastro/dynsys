@@ -1,45 +1,38 @@
-# dynsys — branch point of cycles (BPC) detection
+# dynsys — food-chain two-parameter study (codim-2 roadmap exercise)
 
-Unzip at repo root, `make clean && make && make run`. CAS features need
-LIZARD + SANGAKU_ROOT (or the Nix dev shell).
+Unzip at repo root, `make clean && make && make run`. (git re-initialized after a
+sandbox reset; work recovered intact from the shipped zip.)
 
-## Branch point of cycles (BPC)  [NEW — roadmap item B]
-continue_limit_cycle now DETECTS branch points of cycles -- parameter values
-where two periodic-orbit branches cross (e.g. a symmetry-breaking / transcritical
-bifurcation of cycles, the multiplier signature being a SECOND Floquet multiplier
-passing through +1 while the branch does not fold).
+## Food chain now has a SECOND parameter (enables the two-parameter tools)
+The "Food chain (3 species)" preset previously exposed only K. It now also
+exposes **d** = predator death rate (default 0.4, range [0.1, 1.2]). With two
+parameters the cycle-bifurcation CURVE tools become usable on this system:
+seed a cycle and use "Trace period-doubling curve" / "Trace Neimark-Sacker
+curve" to follow the locus in the (K, d) plane, with codim-2 detection
+(fold-flip / PD-NS / cusp) along it. (No collision between the parameter `d` and
+the dx1/dx2/dx3 derivative prefixes -- verified the preset still parses and
+renders.)
 
-Method: a signed bordered-determinant test function (cycle_bp_test). The
-extended cycle Jacobian dF/d(U,p) (N rows, N+1 unknowns) is bordered with the
-branch tangent as the last row; the determinant of that square matrix changes
-sign at a branch point. Two numerical points were essential:
-  - the raw determinant of a ~200x200 matrix underflows to ~1e-27 even when
-    well-conditioned, so we return the SIGNED GEOMETRIC-MEAN determinant
-    sign(det)*|det|^(1/N), which stays O(1) and preserves the sign;
-  - the bordering tangent's overall sign is a gauge (the two-direction
-    continuation negates it), so we fix the gauge (orient the tangent's
-    parameter component non-negative) -- otherwise the sign flips spuriously.
-Distinguishing BPC from LPC: a fold ALSO makes the cycle determinant vanish, so
-a bare sign change is ambiguous. A genuine BPC has the branch passing straight
-through (parameter locally monotonic) whereas a fold turns in the parameter; the
-detector accepts a BPC bracket only where there is no p-turn, and the fold flag
-itself was tightened to require a local extremum in p. Each CycleSample carries
-bp_test and, when bracketed, is_bp / bp_p (the refined branch-point parameter).
+## Two-parameter study results (verified headless)
+- pd_curve traces the period-doubling locus in (K, d): e.g. from
+  (K=0.70, d=0.42) to (K=0.64, d=0.44). The codim-2 detector runs cleanly with
+  NO false positives on that segment.
+- A 2-parameter sweep maps the period-doubling BUBBLE: it shifts to higher K as
+  d increases (first-PD-K ~0.50 at d=0.30 -> ~0.92 at d=0.54) with width ~0.4;
+  the two PD branches run roughly parallel over d in [0.3, 1.0], so the codim-2
+  cusp where they would meet lies outside that window. Toward LOW d the cascade
+  deepens (period 5 -> 6 -> 8 -> 10+) toward chaos.
+- The cycle period is very long inside the bubble (~300 near K=0.7-0.9), dropping
+  to ~55-80 for K>=1.1: the period-doublings accumulate near a HOMOCLINIC
+  connection, which is why the period diverges there. This makes the food chain
+  a genuine, non-textbook stress test of the long-period collocation/Floquet
+  path (which traced it correctly).
 
-### Validation (new test bpc_smoke), two cases:
-  - van der Pol (a clean branch, NO branch point): bp_test stays one sign across
-    the whole branch -> ZERO BPCs reported (no false positives).
-  - A constructed transcritical-of-cycles  x'=-y+x(1-r^2), y'=x+y(1-r^2),
-    z'=(mu - x^2) z  has its transverse Floquet multiplier pass through +1 at
-    mu=1/2 (since <x^2> = 1/2 on the unit cycle). The detector brackets the BPC
-    at mu=0.4950, matching the analytic 0.5 to within 0.005.
-
-## Roadmap status (docs/ROADMAP_MATCONT_PARITY.md)
-A heteroclinic connections (prior iteration) and B branch-point-of-cycles
-(this iteration) are now DONE. Remaining: C codim-2 points on cycle-bifurcation
-curves, D a fully robust Lin's method for the stiff Bogdanov-Takens homoclinic.
+See docs/EXAMPLE_FOOD_CHAIN.md for the full workflow and the bifurcation
+inventory (Hopf + fold-of-cycles + a four-PD bubble).
 
 ## Verification
-- All 4 C++ TUs compile ZERO warnings; the REAL GLFW/OpenGL binary builds + runs.
-- New bpc_smoke passes; lpc_arclength, lpccurve, pd_curve, lc_selfseed,
-  heteroclinic all pass; CAS green.
+- All 4 C++ TUs compile ZERO warnings; the REAL GLFW/OpenGL binary builds and
+  renders the 2-parameter preset.
+- CAS green; codim2_cycle_smoke passes. The analysis library is unchanged this
+  iteration (preset + docs only), so the full suite is as previously verified.

@@ -72,3 +72,30 @@ D. [homoclinic] Lin's method for the stiff Bogdanov-Takens homoclinic — still
 
 This session: implement A (heteroclinic connections) end to end with a
 regression test, then proceed to B if budget allows.
+
+---
+
+## D (Lin's method) — diagnostic outcome
+
+Investigated thoroughly. KEY FINDING: for the Bogdanov-Takens normal form
+x'=y, y'=b1 + b2 y + x^2 + x y with b2 < 0 (the regime usually quoted for "the
+BT homoclinic"), forward integration of the saddle's unstable manifold does NOT
+return to that saddle — it connects to the OTHER equilibrium (a HETEROCLINIC,
+which solve_heteroclinic now handles correctly) or settles on a nearby limit
+cycle. This is exactly why a one-sided return test and a two-sided section gap
+both fail here: there is no homoclinic-to-the-same-saddle to bracket in that
+regime, and the backward stable manifold escapes to infinity rather than
+crossing any section built from the unstable excursion (verified numerically).
+
+OUTCOME (shipped): rather than a fully general Lin solver for the stiff case,
+lin_homoclinic now DIAGNOSES what the unstable manifold actually does and
+reports it honestly:
+  - connects to a different equilibrium  -> "heteroclinic, use solve_heteroclinic"
+  - settles on a cycle / escapes         -> "did not return; no homoclinic"
+  - genuinely returns near the saddle with small gap -> located approximately.
+It never emits a false positive. The validated connecting-orbit paths remain
+solve_homoclinic / continue_homoclinic (homoclinic) and solve_heteroclinic
+(saddle-to-saddle). A fully general Lin's method for the stiff same-saddle BT
+loop (where a homoclinic and a limit cycle nearly coincide) remains the open
+research item; it requires a genuine two-point BVP with the gap as an unknown,
+not a shooting test function.

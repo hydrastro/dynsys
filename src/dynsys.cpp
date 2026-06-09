@@ -311,6 +311,13 @@ struct AppState {
   float angle_x = 0.0f;
   float angle_y = 0.0f;
   float zoom = 1.0f;
+  /* user pan of the 3D view (right-drag), applied as a view-space translation
+   * so the orbit can be moved around the window independently of rotation */
+  float pan_x = 0.0f;
+  float pan_y = 0.0f;
+  /* one-time auto-fit of the 3D scene camera to the orbit's bounding box (so
+   * any coordinate scale is framed well); reset on system reload */
+  bool scene_fitted = false;
   float scene_scale = 0.05f;
   float camera_distance = 50.0f;
   bool bridge_cam_init = false;   /* set a geometry-fitting camera on first bridge frame */
@@ -2595,6 +2602,7 @@ bool compile_system(AppState &app, const char *system_text, std::string *error) 
   app.bifurcation_lyapunov.clear();
   app.bifurcation_period.clear();
   app.bridge_built = false; app.bridge_cam_init = false;
+  app.scene_fitted = false;   /* re-frame the 3D scene for the new system */
   app.bridge_point_count = 0;
   /* Tie the projection-solid bridge to the loaded system: pick the family it
    * actually supports (quadratic / cubic / sine), or fall back to the
@@ -2645,6 +2653,7 @@ struct SystemPreset {
 const SystemPreset kPresets[] = {
     {"Lorenz", "Continuous 3D", "# Lorenz system\nmode = ode\nintegrator = rk4\nparam sigma = 10 [0,50]\nparam rho = 28 [0,100]\nparam beta = 8 / 3 [0,10]\nobserve r = sqrt(x*x + y*y + z*z)\nsection = z - 27\nsection_direction = positive\nsection_plot = x, y\ndx = sigma * (y - x)\ndy = x * (rho - z) - y\ndz = x * y - beta * z\n", {0.1,0.1,0.1,0.0}, 0.01, 3, Integrator::RK4, 1.0f, 0.0f, 0.0f, 0.0f},
     {"Rossler", "Continuous 3D", "# Rössler system\nmode = ode\nintegrator = rk4\nparam a = 0.2 [0,1]\nparam b = 0.2 [0,1]\nparam c = 5.7 [0,15]\nobserve r = sqrt(x*x + y*y + z*z)\nsection = x\nsection_direction = positive\nsection_plot = y, z\ndx = 0 - (y + z)\ndy = x + a * y\ndz = b + z * (x - c)\n", {0.1,0.1,0.1,0.0}, 0.01, 3, Integrator::RK4, 1.0f,0.0f,0.0f,0.0f},
+    {"Food chain (3 species)", "Continuous 3D", "# Tritrophic food chain (Rosenzweig-MacArthur type):\n# prey x1, predator x2, top predator x3. Holling type-II functional responses.\n# K is the predator's conversion efficiency. As K rises 0->5 the coexistence\n# equilibrium loses stability through a Hopf bifurcation to a limit cycle, then\n# the cycle period-doubles toward chaos -- a showcase for the limit-cycle\n# continuation, Floquet/PD/NS, and codim-2 tools. A 2nd parameter d (predator\n# death rate) is exposed so you can trace PD/NS CURVES in the (K,d) plane.\nmode = ode\nintegrator = rk4\nstate = x1, x2, x3\nparam K = 2.5 [0,5]\nparam d = 0.4 [0.1,1.2]\nobserve total = x1 + x2 + x3\nsection = x2 - 0.5\nsection_direction = positive\nsection_plot = x1, x3\ndx1 = 0.11 * x1 * x3 - x1 * x2 / (x1 + 0.17) + (1 - x1) * x1\ndx2 = K * x1 * x2 / (x1 + 0.17) - d * (x2 * x3 / (x2 + 0.42) + x2)\ndx3 = 0.11 * x2 * x3 / (x2 + 0.42) - 0.008 * x3\n", {0.5,0.3,0.3,0.0}, 0.01, 3, Integrator::RK4, 1.0f,0.0f,0.0f,0.0f},
     {"Thomas", "Continuous 3D", "# Thomas cyclically symmetric attractor\nmode = ode\nintegrator = rk4\nparam b = 0.208186 [0,1]\nwave(u) = sin(u)\nobserve r = sqrt(x*x + y*y + z*z)\nsection = z\nsection_direction = positive\nsection_plot = x, y\ndx = wave(y) - b * x\ndy = wave(z) - b * y\ndz = wave(x) - b * z\n", {0.1,0,0,0}, 0.01, 4, Integrator::RK4, 1.0f,0.0f,0.0f,0.0f},
     {"Langford / Aizawa", "Continuous 3D", "# Langford, also called Aizawa\nmode = ode\nintegrator = rk4\nparam a = 0.95 [0,2]\nparam b = 0.7 [0,2]\nparam c = 0.6 [0,2]\nparam d = 3.5 [0,6]\nparam e = 0.25 [0,1]\nparam f = 0.1 [0,1]\nr2 = pow(x, 2) + pow(y, 2)\ndx = (z - b) * x - d * y\ndy = d * x + (z - b) * y\ndz = c + a * z - pow(z, 3) / 3 - r2 * (1 + e * z) + f * z * pow(x, 3)\n", {0.1,0,0,0}, 0.005, 4, Integrator::RK4, 1.0f,0,0,0},
     {"Dadras", "Continuous 3D", "# Dadras attractor\nmode = ode\nintegrator = rk4\nparam a = 3 [0,8]\nparam b = 2.7 [0,8]\nparam c = 1.7 [0,8]\nparam d = 2 [0,8]\nparam e = 9 [0,15]\ndx = y - a * x + b * y * z\ndy = c * y - x * z + z\ndz = d * x * y - e * z\n", {0.1,0.1,0.1,0}, 0.005, 4, Integrator::RK4,1.0f,0,0,0},
@@ -3005,6 +3014,7 @@ void run_bifurcation(AppState &app); /* PHASE B+: used by the in-view control st
 void run_continuation(AppState &app); /* PHASE D: equilibrium branch tracer */
 void run_lc_continuation(AppState &app); /* PHASE D step 2: limit-cycle sweep */
 void run_homoclinic(AppState &app); /* homoclinic-orbit BVP */
+void fit_scene_to_orbit(AppState &app); /* auto-frame the 3D scene to the orbit */
 void run_homoclinic_curve(AppState &app); /* 2-param homoclinic locus */
 void run_cycle_collocation(AppState &app); /* collocation + arclength + Floquet */
 
@@ -3634,7 +3644,7 @@ void render_scene_geometry(AppState &app, float aspect) {
   vec3 scale{}; set_vec3(scale, effective_scale, effective_scale, effective_scale); glm_scale(model, scale);
   vec3 axis_x{}; set_vec3(axis_x, 1.0f, 0.0f, 0.0f); glm_rotate(model, glm_rad(app.angle_x), axis_x);
   vec3 axis_y{}; set_vec3(axis_y, 0.0f, 1.0f, 0.0f); glm_rotate(model, glm_rad(app.angle_y), axis_y);
-  vec3 view_translation{}; set_vec3(view_translation, 0.0f, 0.0f, -app.camera_distance); glm_translate(view, view_translation);
+  vec3 view_translation{}; set_vec3(view_translation, app.pan_x, app.pan_y, -app.camera_distance); glm_translate(view, view_translation);
   glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "model"), 1, GL_FALSE, reinterpret_cast<float *>(model));
   glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "view"), 1, GL_FALSE, reinterpret_cast<float *>(view));
   glUniformMatrix4fv(glGetUniformLocation(app.shader_program, "projection"), 1, GL_FALSE, reinterpret_cast<float *>(projection));
@@ -3664,6 +3674,13 @@ void render_scene_to_fbo(AppState &app, int w, int h) {
  * wheel-zoom when the cursor isn't over a panel. Called from the main
  * loop before the GUI when the active view is the 3D scene. */
 void render_scene_background(AppState &app) {
+  /* one-time auto-fit: once the orbit has accumulated some history, frame it so
+   * systems with O(1) coordinates (food chain) and O(20) coordinates (Lorenz)
+   * both fill the view. Only fires once per system load. */
+  if (!app.scene_fitted && app.history.size() >= 50) {
+    fit_scene_to_orbit(app);
+    app.scene_fitted = true;
+  }
   glViewport(0, 0, app.window_width, app.window_height);
   const float aspect = static_cast<float>(app.window_width) /
                        std::max(1.0f, static_cast<float>(app.window_height));
@@ -3675,16 +3692,32 @@ void render_scene_background(AppState &app) {
       app.angle_y += io.MouseDelta.x * 0.4f;
       app.angle_x += io.MouseDelta.y * 0.4f;
     }
+    /* right-drag (or middle-drag) PANS the view -- moves the orbit around the
+     * window. Pan speed scales with the orthographic half-height / perspective
+     * distance so it feels consistent at any zoom. */
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+        ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+      const float h = std::max(1.0f, static_cast<float>(app.window_height));
+      const float world_per_px = app.orthographic_3d
+          ? (2.0f * (25.0f / std::max(app.zoom, 0.001f)) / h)   /* ortho: half-height/zoom */
+          : (2.0f * app.camera_distance * 0.41421f / h);        /* persp: tan(22.5deg) */
+      app.pan_x += io.MouseDelta.x * world_per_px;
+      app.pan_y -= io.MouseDelta.y * world_per_px;   /* screen y is down */
+    }
     if (io.MouseWheel != 0.0f) {
       app.zoom *= std::pow(1.15f, (float)clamped_wheel(io.MouseWheel));
-      app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
+      app.zoom = std::max(0.002f, std::min(app.zoom, 1000.0f));  /* wide zoom-out range */
       update_projection(app);
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)) {
-      app.zoom = std::min(app.zoom * 1.1f, 100.0f); update_projection(app);
+      app.zoom = std::min(app.zoom * 1.1f, 1000.0f); update_projection(app);
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)) {
-      app.zoom = std::max(app.zoom / 1.1f, 0.05f); update_projection(app);
+      app.zoom = std::max(app.zoom / 1.1f, 0.002f); update_projection(app);
+    }
+    /* reset pan with a press of '0' (escape hatch from a lost view) */
+    if (ImGui::IsKeyPressed(ImGuiKey_0) || ImGui::IsKeyPressed(ImGuiKey_Keypad0)) {
+      app.pan_x = 0.0f; app.pan_y = 0.0f;
     }
   }
 }
@@ -8330,6 +8363,10 @@ void run_pd_curve(AppState &app) {
   app.pd_curve_ready = app.pd_curve_data.ok;
   sync_param_values(app);
   app.pdns_curve_msg = "period-doubling curve: " + app.pd_curve_data.message;
+  for (const auto &c2 : app.pd_curve_data.codim2) {
+    char buf[160]; std::snprintf(buf, sizeof(buf), "\n  codim-2: %s at (%.4f, %.4f)", c2.label(), c2.p, c2.q);
+    app.pdns_curve_msg += buf;
+  }
   app.analysis_message = app.pdns_curve_msg;
 }
 
@@ -8343,6 +8380,10 @@ void run_ns_curve(AppState &app) {
   app.ns_curve_ready = app.ns_curve_data.ok;
   sync_param_values(app);
   app.pdns_curve_msg = "Neimark-Sacker curve: " + app.ns_curve_data.message;
+  for (const auto &c2 : app.ns_curve_data.codim2) {
+    char buf[160]; std::snprintf(buf, sizeof(buf), "\n  codim-2: %s at (%.4f, %.4f)", c2.label(), c2.p, c2.q);
+    app.pdns_curve_msg += buf;
+  }
   app.analysis_message = app.pdns_curve_msg;
 }
 
@@ -8945,6 +8986,38 @@ void run_lyapunov_spectrum(AppState &app) {
  * and handles drag-to-rotate and wheel-to-zoom while the image is
  * hovered — so the 3D controls live with the 3D view instead of being
  * global window-background interactions. */
+/* Auto-fit the 3D scene camera to the orbit's actual bounding box, so a system
+ * with O(1) coordinates (e.g. the food chain) is framed as well as one with
+ * O(20) coordinates (e.g. Lorenz). Uses the recorded history projected through
+ * the plot3d axis expressions; falls back to the raw state if those eval fails.
+ * Sets scene_scale + camera_distance + center to center and fill the view, and
+ * resets pan/zoom so the fit is exact. */
+void fit_scene_to_orbit(AppState &app) {
+  if (app.history.size() < 2) return;
+  double lo[3] = {1e300,1e300,1e300}, hi[3] = {-1e300,-1e300,-1e300};
+  for (const State &s : app.history) {
+    Point pt;
+    double v[3];
+    if (eval_plot3d(app, s, &pt)) { v[0]=pt.x; v[1]=pt.y; v[2]=pt.z; }
+    else { v[0]=state_at(s,0); v[1]=state_at(s,1); v[2]=state_at(s,2); }
+    for (int k=0;k<3;k++){ if(std::isfinite(v[k])){ lo[k]=std::min(lo[k],v[k]); hi[k]=std::max(hi[k],v[k]); } }
+  }
+  double cx=0,cy=0,cz=0, span=0;
+  for (int k=0;k<3;k++){ if(hi[k]<lo[k]) return; double c=0.5*(lo[k]+hi[k]); double e=hi[k]-lo[k]; if(k==0)cx=c; else if(k==1)cy=c; else cz=c; span=std::max(span,e); }
+  if (!(span>1e-9)) span = 1.0;
+  /* the model is scaled by scene_scale; choose it so the largest extent maps to
+   * ~30 world units (the camera at distance 50 frames roughly +/-25). center is
+   * applied in MODEL space (before scale), so negate the data center. */
+  app.scene_scale = (float)(30.0 / span);
+  app.center_x = (float)(-cx);
+  app.center_y = (float)(-cy);
+  app.center_z = (float)(-cz);
+  app.camera_distance = 50.0f;
+  app.zoom = 1.0f;
+  app.pan_x = 0.0f; app.pan_y = 0.0f;
+  update_projection(app);
+}
+
 [[maybe_unused]] void draw_scene_panel(AppState &app) {
   ImGui::Checkbox("axes", &app.show_axes);
   ImGui::SameLine();
@@ -8952,10 +9025,12 @@ void run_lyapunov_spectrum(AppState &app) {
   ImGui::SameLine();
   if (ImGui::SmallButton("reset view")) {
     app.angle_x = 0.0f; app.angle_y = 0.0f; app.zoom = 1.0f;
-    app.scene_scale = 0.05f; app.camera_distance = 50.0f;
-    app.center_x = app.center_y = app.center_z = 0.0f;
+    app.pan_x = 0.0f; app.pan_y = 0.0f;
+    fit_scene_to_orbit(app);   /* frame the actual orbit (any coordinate scale) */
     update_projection(app);
   }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("fit")) { fit_scene_to_orbit(app); }
 
   ImVec2 avail = ImGui::GetContentRegionAvail();
   const int pw = std::max(64, static_cast<int>(avail.x));
@@ -8981,15 +9056,24 @@ void run_lyapunov_spectrum(AppState &app) {
       app.angle_y += io.MouseDelta.x * 0.4f;
       app.angle_x += io.MouseDelta.y * 0.4f;
     }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+        ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+      const float hpx = std::max(1.0f, static_cast<float>(ph));
+      const float world_per_px = app.orthographic_3d
+          ? (2.0f * (25.0f / std::max(app.zoom, 0.001f)) / hpx)
+          : (2.0f * app.camera_distance * 0.41421f / hpx);
+      app.pan_x += io.MouseDelta.x * world_per_px;
+      app.pan_y -= io.MouseDelta.y * world_per_px;
+    }
     if (io.MouseWheel != 0.0f) {
       app.zoom *= std::pow(1.15f, (float)clamped_wheel(io.MouseWheel));
-      app.zoom = std::max(0.05f, std::min(app.zoom, 100.0f));
+      app.zoom = std::max(0.002f, std::min(app.zoom, 1000.0f));
       update_projection(app);
     }
   }
   (void)img_pos;
   ImGui::TextDisabled(
-      "drag: rotate   wheel: zoom   (this is the real 3D view)");
+      "left-drag: rotate   right-drag: pan   wheel or +/-: zoom   0: reset pan");
 }
 
 /* PHASE C+: save the current framebuffer (the full-window plot) to a PNG.
@@ -9220,7 +9304,7 @@ void draw_top_toolbar(AppState &app) {
                       effective_dimension(app),
                       app.active_view == AppState::ActiveView::Phase2D
                           ? "  | click: add orbit, drag: pan, wheel/+/-: zoom"
-                          : "  | drag: rotate, wheel/+/-: zoom");
+                          : "  | left-drag: rotate, right-drag: pan, wheel/+/-: zoom");
   app.window_toolbar_h = ImGui::GetWindowHeight();
   ImGui::End();
 }

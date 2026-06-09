@@ -360,6 +360,25 @@ bool seed_homoclinic_by_integration(const Model &m, const std::vector<double> &s
                                      std::vector<std::vector<double>> *seed_out,
                                      std::string *err);
 
+/* One-call homoclinic FINDER (no need to know the locus parameter up front).
+ *
+ * Sweeps the parameter p over [p_lo, p_hi]; at each p it integrates the saddle's
+ * unstable manifold and measures the CLOSEST RETURN distance back to the saddle
+ * after the excursion. That distance is ~0 exactly on the homoclinic and grows
+ * to either side (the manifold either spirals in short or escapes), so its
+ * minimum over the sweep brackets the connection. p is then refined by golden-
+ * section on the return distance, the orbit at that p is seeded by integration,
+ * and solve_homoclinic is run to produce the converged BVP orbit. This wraps the
+ * validated seeding + BVP solve and works for same-saddle homoclinics where the
+ * unstable manifold genuinely returns (it reports honestly when, as in the
+ * Bogdanov-Takens regime, the manifold instead connects to another equilibrium).
+ *
+ * Returns the located p in p_out. */
+HomoclinicResult find_homoclinic(const Model2 &m2,
+                                 const std::vector<double> &saddle_guess,
+                                 double q_fixed, double p_lo, double p_hi,
+                                 const HomoclinicSettings &settings, double *p_out);
+
 /* ---- two-parameter continuation of the HOMOCLINIC locus ----------------- *
  * A homoclinic connection is codimension-1, so in a two-parameter (p,q) plane
  * it traces a CURVE. We continue it by stepping the secondary parameter q and,
@@ -447,9 +466,34 @@ struct LPCCurve {
  * the unit circle). Same point type as LPC. Traced by scanning the secondary
  * parameter q, continuing the cycle in p at each q (with Floquet on), and
  * picking the bracketed PD / NS sample on that branch. */
-struct CycleBifPoint { double p = 0.0, q = 0.0; double period = 0.0; double amplitude = 0.0; };
+struct CycleBifPoint {
+  double p = 0.0, q = 0.0; double period = 0.0; double amplitude = 0.0;
+  /* secondary cycle test-function values AT this curve point, used to flag
+   * codim-2 degeneracies along the curve (e.g. an LPC coinciding with the PD). */
+  double fold_test = 0.0;     /* cycle fold (LPC) test at this point          */
+  double ns_test = 0.0;       /* Neimark-Sacker test at this point            */
+  double max_nontrivial_mult = 0.0;
+};
+
+/* A codim-2 point on a cycle-bifurcation curve: where a SECOND codim-1 cycle
+ * condition is met along the (PD or NS) locus. */
+enum class CycleCodim2Kind { None, FoldFlip, PDNS, DegeneratePD, CuspOfCycles };
+struct CycleCodim2Point {
+  double p = 0.0, q = 0.0;
+  CycleCodim2Kind kind = CycleCodim2Kind::None;
+  const char *label() const {
+    switch (kind) {
+      case CycleCodim2Kind::FoldFlip:     return "LPPD (fold-flip: LPC = PD)";
+      case CycleCodim2Kind::PDNS:         return "PD-NS interaction";
+      case CycleCodim2Kind::DegeneratePD: return "degenerate PD (curve meets Hopf, amp->0)";
+      case CycleCodim2Kind::CuspOfCycles: return "cusp of cycles (LPC turning point)";
+      default: return "none";
+    }
+  }
+};
 struct CycleBifCurve {
   std::vector<CycleBifPoint> points;
+  std::vector<CycleCodim2Point> codim2;   /* codim-2 points detected on the curve */
   std::string message;
   bool ok = false;
 };

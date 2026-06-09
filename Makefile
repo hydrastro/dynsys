@@ -223,7 +223,7 @@ IMGUI_DEPS := $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$(IMGUI_OBJS))
 OBJS := $(DYNSYS_OBJS) $(C_OBJS) $(GLEW_OBJ) $(IMGUI_OBJS)
 DEPS := $(DYNSYS_DEPS) $(C_DEPS) $(GLEW_DEP) $(IMGUI_DEPS)
 
-.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc debug release asan windows build-windows clean distclean install uninstall format print-vars help
+.PHONY: all build check-deps check-legacy prune-legacy run headless headless-ast headless-smoke bench test ir-smoke test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-codim2cyc test-lindiag test-findhomo debug release asan windows build-windows clean distclean install uninstall format print-vars help
 
 all: check-deps check-legacy $(TARGET)
 
@@ -316,7 +316,7 @@ $(CXX_OBJ_DIR)/imgui/backends/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@$(MKDIR_P) $(dir $@) $(dir $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(patsubst $(CXX_OBJ_DIR)/%.o,$(CXX_DEP_DIR)/%.d,$@) -c $< -o $@
 
-test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-lpccurve test-eshadow test-bridgealign test-projsolid
+test: test-analysis test-ad test-nullcline test-dim test-fp test-lyap test-fractal test-bridge test-bridgefamily test-basin test-solver test-scan test-odebif test-progressive test-basinchaos test-continuation test-period test-png test-paramsync test-boxdim test-ifs test-limitcycle test-lcsweep test-ifsmodel test-ifsparam test-ifslit test-cas test-hopfl1 test-foldnf test-codim2 test-twoparam test-lccolloc test-tpc2 test-lpc test-lpcarc test-branchsw test-btcodim2 test-basinsmt test-homoclinic test-homocont test-validation test-codim2coef test-homoseed test-zhhh test-lcseed test-pdns test-pdcurve test-hetero test-bpc test-codim2cyc test-lindiag test-findhomo test-lpccurve test-eshadow test-bridgealign test-projsolid
 
 test-analysis: $(ANALYSIS_TEST_TARGET)
 	./$(ANALYSIS_TEST_TARGET)
@@ -807,6 +807,30 @@ test-bpc: $(BPC_TEST_TARGET)
 $(BPC_TEST_TARGET): test/bpc_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/bpc_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+CODIM2CYC_TEST_TARGET := $(BUILD_DIR)/codim2_cycle_smoke$(EXEEXT)
+test-codim2cyc: $(CODIM2CYC_TEST_TARGET)
+	./$(CODIM2CYC_TEST_TARGET)
+
+$(CODIM2CYC_TEST_TARGET): test/codim2_cycle_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/codim2_cycle_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+LINDIAG_TEST_TARGET := $(BUILD_DIR)/lin_diag_smoke$(EXEEXT)
+test-lindiag: $(LINDIAG_TEST_TARGET)
+	./$(LINDIAG_TEST_TARGET)
+
+$(LINDIAG_TEST_TARGET): test/lin_diag_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/lin_diag_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
+
+FINDHOMO_TEST_TARGET := $(BUILD_DIR)/find_homoclinic_smoke$(EXEEXT)
+test-findhomo: $(FINDHOMO_TEST_TARGET)
+	./$(FINDHOMO_TEST_TARGET)
+
+$(FINDHOMO_TEST_TARGET): test/find_homoclinic_smoke.cpp $(SRC_DIR)/analysis.cpp $(SRC_DIR)/analysis.h
+	@$(MKDIR_P) $(dir $@)
+	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 -pthread -I$(SRC_DIR) test/find_homoclinic_smoke.cpp $(SRC_DIR)/analysis.cpp -o $@ -lm
 
 
 LPCCURVE_TEST_TARGET := $(BUILD_DIR)/lpc_curve_smoke$(EXEEXT)

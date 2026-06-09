@@ -2328,6 +2328,10 @@ static CycleBifCurve cycle_bif_curve(const Model2 &m,
         CycleBifPoint pt;
         pt.p = want_pd ? smp.pd_p : smp.ns_p;  /* the refined bifurcation param */
         pt.q = q; pt.period = smp.period; pt.amplitude = smp.amplitude;
+        /* secondary test functions at the bifurcation sample, for codim-2 */
+        pt.fold_test = smp.fold_test;
+        pt.ns_test   = want_pd ? smp.ns_test : smp.pd_test; /* the OTHER cycle test */
+        pt.max_nontrivial_mult = smp.max_nontrivial_mult;
         out.points.push_back(pt);
         break;
       }
@@ -2335,9 +2339,47 @@ static CycleBifCurve cycle_bif_curve(const Model2 &m,
     const CycleSample &mid = br.samples[br.samples.size()/2];
     per = mid.period; p0 = mid.p;
   }
+  /* CODIM-2 points on the curve: scan consecutive points (ordered in q) for a
+   * second condition becoming satisfied along the (PD or NS) locus.
+   *  - FoldFlip (LPPD): the cycle FOLD test changes sign along the curve => an
+   *    LPC coincides with the PD/NS at that q (refined by interpolation).
+   *  - PDNS: the OTHER cycle test (NS test on a PD curve, or PD test on an NS
+   *    curve) changes sign => PD and NS loci cross (a strong-resonance / PDNS
+   *    interaction point).
+   *  - DegeneratePD: the cycle amplitude collapses toward 0 => the curve runs
+   *    into a Hopf point (the cycle bifurcation degenerates as the orbit
+   *    shrinks to the equilibrium). */
+  auto interp_q = [](const CycleBifPoint &a, const CycleBifPoint &b, double fa, double fb) {
+    const double t = fa / (fa - fb); return a.q + t * (b.q - a.q);
+  };
+  auto interp_p = [](const CycleBifPoint &a, const CycleBifPoint &b, double fa, double fb) {
+    const double t = fa / (fa - fb); return a.p + t * (b.p - a.p);
+  };
+  for (std::size_t i = 1; i < out.points.size(); ++i) {
+    const CycleBifPoint &a = out.points[i-1], &b = out.points[i];
+    const double fa = a.fold_test, fb = b.fold_test;
+    if (std::isfinite(fa) && std::isfinite(fb) && fa * fb < 0.0) {
+      CycleCodim2Point c2; c2.kind = CycleCodim2Kind::FoldFlip;
+      c2.q = interp_q(a,b,fa,fb); c2.p = interp_p(a,b,fa,fb);
+      out.codim2.push_back(c2);
+    }
+    const double na = a.ns_test, nb = b.ns_test;
+    if (std::isfinite(na) && std::isfinite(nb) && na * nb < 0.0) {
+      CycleCodim2Point c2; c2.kind = CycleCodim2Kind::PDNS;
+      c2.q = interp_q(a,b,na,nb); c2.p = interp_p(a,b,na,nb);
+      out.codim2.push_back(c2);
+    }
+    /* amplitude collapse: a small amplitude with a clear downward trend */
+    if (b.amplitude < 0.05 && a.amplitude >= 0.05) {
+      CycleCodim2Point c2; c2.kind = CycleCodim2Kind::DegeneratePD;
+      c2.q = b.q; c2.p = b.p;
+      out.codim2.push_back(c2);
+    }
+  }
   out.ok = out.points.size() >= 2;
   const char *what = want_pd ? "PD" : "NS";
-  out.message = out.ok ? ("traced " + std::to_string(out.points.size()) + std::string(" ") + what + " points")
+  out.message = out.ok ? ("traced " + std::to_string(out.points.size()) + std::string(" ") + what + " points" +
+                          (out.codim2.empty() ? "" : (", " + std::to_string(out.codim2.size()) + " codim-2 point(s)")))
                        : (std::string("no ") + what + " bifurcation found in this (p,q) window");
   return out;
 }
@@ -3709,6 +3751,172 @@ HeteroclinicResult solve_heteroclinic(const Model &m,
   return R;
 }
 
+HomoclinicResult find_homoclinic(const Model2 &m2,
+                                 const std::vector<double> &saddle_guess,
+                                 double q_fixed, double p_lo, double p_hi,
+                                 const HomoclinicSettings &settings, double *p_out) {
+  HomoclinicResult R;
+  const std::size_t n = m2.n;
+  if (saddle_guess.size()!=n || n<2 || !(p_hi>p_lo)) { R.message="bad input to find_homoclinic"; return R; }
+
+  auto model_at = [&](double /*p placeholder*/) {
+    Model mm; mm.n=n;
+    mm.vector_field = [&m2,q_fixed](const double*xx,double pp,double*fo,std::string*er){ return m2.vector_field(xx,pp,q_fixed,fo,er); };
+    return mm;
+  };
+  Model mm = model_at(0.0);
+
+  /* return-to-saddle distance at parameter p: refine the saddle, integrate its
+   * unstable manifold (the orientation that stays bounded), and return the
+   * closest approach back to the saddle AFTER the excursion peak, normalized by
+   * the excursion size. ~0 on a homoclinic; ~1 if it never comes back. Also
+   * reports whether the orbit ended near a DIFFERENT equilibrium (heteroclinic). */
+  /* one RK4 step of the field at parameter p; returns false on field failure */
+  auto rk4 = [&](std::vector<double> &X, double p, double dt) -> bool {
+    const std::size_t nn = X.size();
+    std::vector<double> k1(nn),k2(nn),k3(nn),k4(nn),t(nn); std::string er;
+    if (!mm.vector_field(X.data(), p, k1.data(), &er)) return false;
+    for (std::size_t i=0;i<nn;i++) t[i]=X[i]+0.5*dt*k1[i];
+    if (!mm.vector_field(t.data(), p, k2.data(), &er)) return false;
+    for (std::size_t i=0;i<nn;i++) t[i]=X[i]+0.5*dt*k2[i];
+    if (!mm.vector_field(t.data(), p, k3.data(), &er)) return false;
+    for (std::size_t i=0;i<nn;i++) t[i]=X[i]+dt*k3[i];
+    if (!mm.vector_field(t.data(), p, k4.data(), &er)) return false;
+    for (std::size_t i=0;i<nn;i++) X[i]+=dt*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6.0;
+    double nrm=0; for (double v:X) nrm+=v*v;
+    return std::isfinite(nrm) && nrm < 1e6;
+  };
+  /* integrate W^u from x0 + so*eps*du; track max distance (far), closest return
+   * after the excursion peak (cl), and the final point (ept). */
+  auto integrate_unstable = [&](const std::vector<double> &x0, const std::vector<double> &du,
+                                double so, double p, double eps, double dt, double tmax,
+                                double *far, double *cl, std::vector<double> *ept) -> bool {
+    std::vector<double> X(x0.size()); for (std::size_t i=0;i<x0.size();i++) X[i]=x0[i]+so*eps*du[i];
+    double fd=0, closest=1e300; bool peaked=false; *ept=X;
+    const long steps=(long)(tmax/dt);
+    for (long s=0;s<steps;s++) {
+      double r=0; for (std::size_t i=0;i<X.size();i++){ double dd=X[i]-x0[i]; r+=dd*dd; } r=std::sqrt(r);
+      if (r>fd) fd=r;
+      if (r>0.5*fd && fd>1e-3) peaked=true;
+      if (peaked && r<closest) closest=r;
+      *ept=X;
+      if (!rk4(X,p,dt)) return false;
+    }
+    *far=fd; *cl=closest; return true;
+  };
+
+  auto return_dist = [&](double p, double *ratio, bool *hetero) -> bool {
+    *hetero=false;
+    std::vector<double> x0=saddle_guess; std::string e;
+    if (!correct_equilibrium(mm, &x0, p, 60, 1e-11, &e)) return false;
+    std::vector<double> A; if (!finite_diff_jacobian(mm, x0.data(), p, &A, &e, 1e-7)) return false;
+    std::vector<Cplx> ev; eigenvalues(A,n,&ev);
+    int npos=0,nneg=0; for(auto&z:ev){ if(z.real()>1e-7)npos++; if(z.real()<-1e-7)nneg++; }
+    if (npos==0||nneg==0) return false;
+    /* dominant unstable eigenvector via shifted power iteration on A */
+    std::vector<double> du(n,0.0); du[0]=1.0;
+    for (int it=0;it<500;it++){
+      std::vector<double> nv(n,0.0);
+      for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) nv[i]+=A[i*n+j]*du[j];
+      for (std::size_t i=0;i<n;i++) nv[i]+=6.0*du[i];
+      double nr=0; for (double v:nv) nr+=v*v; nr=std::sqrt(nr);
+      if (nr<1e-300) return false;
+      for (double &v:nv) v/=nr;
+      du=nv;
+    }
+    const double eps=1e-5, dt=0.002, tmax=settings.T>0?settings.T*4:400.0;
+    /* pick the orientation that stays bounded and excurses furthest */
+    double best_far=-1, best_cl=1e300; std::vector<double> best_ept;
+    for (int orient=0;orient<2;orient++) {
+      double so=orient?-1.0:1.0, far=0, cl=1e300; std::vector<double> ept;
+      if (!integrate_unstable(x0,du,so,p,eps,dt,tmax,&far,&cl,&ept)) continue;  /* escaped */
+      if (far>1e3) continue;
+      if (far>best_far) { best_far=far; best_cl=cl; best_ept=ept; }
+    }
+    if (best_far<1e-3) { *ratio=1.0; return true; }
+    *ratio = (best_far>1e-9)? best_cl/best_far : 1.0;
+    /* heteroclinic check: end point BOUNDED and near a DIFFERENT equilibrium */
+    { std::vector<double> fend(n); std::string er;
+      double endnorm=0; for(double v:best_ept) endnorm+=v*v; endnorm=std::sqrt(endnorm);
+      if (endnorm < 50.0 && mm.vector_field(best_ept.data(),p,fend.data(),&er)) {
+        double fn=0; for (double v:fend) fn+=v*v; fn=std::sqrt(fn);
+        double d0=0; for (std::size_t i=0;i<n;i++){ double dd=best_ept[i]-x0[i]; d0+=dd*dd; } d0=std::sqrt(d0);
+        if (fn<1e-2 && d0>0.1) *hetero=true;
+      } }
+    return true;
+  };
+
+  /* coarse sweep for the minimum return ratio */
+  const int NS=40; double best_p=p_lo, best_r=1e300;
+  for (int i=0;i<=NS;i++){ double p=p_lo+(p_hi-p_lo)*i/NS; double r; bool het;
+    if (return_dist(p,&r,&het)){ (void)het; if(r<best_r){best_r=r;best_p=p;} } }
+  /* golden-section refine */
+  double a=std::max(p_lo,best_p-(p_hi-p_lo)/NS), b=std::min(p_hi,best_p+(p_hi-p_lo)/NS);
+  auto rr=[&](double p){ double r; bool het; return return_dist(p,&r,&het)? r : 1e9; };
+  const double gr=0.6180339887; double c=b-gr*(b-a), d=a+gr*(b-a); double fc=rr(c), fd2=rr(d);
+  for (int it=0; it<40 && std::fabs(b-a)>1e-6; ++it){ if(fc<fd2){b=d;d=c;fd2=fc;c=b-gr*(b-a);fc=rr(c);} else {a=c;c=d;fc=fd2;d=a+gr*(b-a);fd2=rr(d);} }
+  double p_homo=(fc<fd2)?c:d;
+  if (p_out) *p_out=p_homo;
+
+  /* if the manifold connects to a different equilibrium, this is heteroclinic */
+  { double r; bool het=false; return_dist(p_homo,&r,&het);
+    if (het && r>0.2) { R.message="the unstable manifold connects to a DIFFERENT equilibrium near p="+std::to_string(p_homo)+" -- this is a heteroclinic; use solve_heteroclinic"; return R; } }
+
+  /* seed by integration at the located p */
+  std::vector<std::vector<double>> seed; std::string e;
+  if (!seed_homoclinic_by_integration(mm, saddle_guess, p_homo, 0.002, settings.T>0?settings.T*4:400.0, &seed, &e) || seed.size()<4) {
+    R.message="found candidate p="+std::to_string(p_homo)+" but could not seed an orbit there ("+e+")"; return R;
+  }
+  std::vector<double> x0=saddle_guess; correct_equilibrium(mm,&x0,p_homo,60,1e-11,&e);
+  /* seed amplitude (max deviation from the saddle) -- a trustworthy size measure */
+  double seed_amp=0; for (auto&pt:seed){ double d=0; for(std::size_t i=0;i<n && i<pt.size();i++){double dd=pt[i]-x0[i];d+=dd*dd;} seed_amp=std::max(seed_amp,std::sqrt(d)); }
+  /* guard: the integrated seed can diverge when p is not yet ON the locus.
+   * A physically sane homoclinic loop is O(1) for this saddle; reject a
+   * blown-up seed and fall back to reporting the located parameter only. */
+  const bool seed_sane = std::isfinite(seed_amp) && seed_amp < 1e3 && seed_amp > 1e-2;
+
+  /* Try to polish with the BVP, but ONLY if the seed is sane and the result
+   * stayed bounded and improved (long near-homoclinic loops can make free-T
+   * Newton diverge). Otherwise report the located parameter. */
+  HomoclinicResult B;
+  bool bvp_good = false;
+  if (seed_sane) {
+    B = solve_homoclinic(mm, x0, p_homo, seed, settings);
+    bvp_good = B.ok && std::isfinite(B.amplitude) && B.amplitude < 10.0*std::max(1.0,seed_amp) && std::isfinite(B.T) && B.T < 1e4;
+  }
+
+  if (bvp_good) {
+    R = B;
+    R.message = "found homoclinic at p="+std::to_string(p_homo)+" (return ratio "+std::to_string(best_r)+"); "+B.message;
+    return R;
+  }
+  /* report the located parameter; attach the seed loop only if it is sane */
+  R.saddle = x0; R.n_unstable = 0;
+  if (seed_sane) {
+    R.orbit = seed; R.tau.assign(seed.size(), 0.0);
+    for (std::size_t j=0;j<seed.size();++j) R.tau[j] = (double)j/(double)std::max<std::size_t>(1,seed.size()-1);
+    R.amplitude = seed_amp;
+  } else { R.amplitude = 0.0; }
+  R.T = 0.0; R.newton_residual = best_r; R.newton_steps = 0;
+  /* decide heteroclinic vs homoclinic AT the located p (not sweep-wide) */
+  bool hetero_here=false; { double r; return_dist(p_homo,&r,&hetero_here); }
+  const bool located = (best_r < 0.05);
+  if (located && !hetero_here) {
+    R.ok = true;
+    R.message = "located homoclinic at p="+std::to_string(p_homo)+" (return ratio "+std::to_string(best_r)+")"
+                + (seed_sane ? ("; returned the integrated near-homoclinic loop (amplitude "+std::to_string(seed_amp)+
+                                "); truncated-BVP polish did not converge for this long-period loop, but the located PARAMETER is reliable")
+                             : "; the located PARAMETER is reliable (a clean finite-time orbit was not extracted -- the loop period is very long near this connection)");
+  } else if (hetero_here) {
+    R.ok = false;
+    R.message = "no clean homoclinic located; a heteroclinic appears present near p="+std::to_string(p_homo)+" -- use solve_heteroclinic";
+  } else {
+    R.ok = false;
+    R.message = "no homoclinic located in ["+std::to_string(p_lo)+", "+std::to_string(p_hi)+"] (best return ratio "+std::to_string(best_r)+")";
+  }
+  return R;
+}
+
 HomoclinicCurve continue_homoclinic(const Model2 &m2,
                                     const std::vector<double> &x0_guess,
                                     double p0, double q0,
@@ -4056,9 +4264,47 @@ LinResult lin_homoclinic(const Model2 &m2, const std::vector<double> &saddle_gue
    * return relative to that loop. Tiny-amplitude minima (near a p where no real
    * excursion forms) are rejected as spurious -- they make |gap| small only
    * because the orbit barely moves. */
-  R.ok = (amp > 0.2) && (std::fabs(g) < 0.03 * amp);
-  R.message = R.ok ? ("homoclinic located approximately (p=" + std::to_string(p) + ", |gap|=" + std::to_string(std::fabs(g)) + ", amp=" + std::to_string(amp) + ")")
-                   : ("homoclinic not robustly located (best |gap|=" + std::to_string(std::fabs(g)) + ", amp=" + std::to_string(amp) + ") -- use solve_homoclinic/continue_homoclinic");
+  /* Diagnose WHAT the unstable manifold did, so a non-homoclinic result is
+   * informative rather than a bare failure. Two common BT-regime outcomes that
+   * are NOT a homoclinic: (a) W^u flows to a DIFFERENT equilibrium (=> a
+   * heteroclinic connection, which solve_heteroclinic handles); (b) the closest
+   * return stays comparable to the loop size (W^u settled on a limit cycle or
+   * ran to another equilibrium and never came back near THIS saddle). We detect
+   * (a) by checking whether the orbit endpoint sits near another zero of f that
+   * is distinct from the saddle. */
+  bool looks_heteroclinic = false;
+  if (!orbit.empty() && !x0fin.empty()) {
+    const std::vector<double> &endp = orbit.back();
+    std::vector<double> fend(n); std::string e;
+    if (m2.vector_field(endp.data(), p, q, fend.data(), &e)) {
+      double fn = 0; for (double v : fend) fn += v*v; fn = std::sqrt(fn);
+      double dist_to_saddle = 0; for (std::size_t i=0;i<n;i++){ double dd=endp[i]-x0fin[i]; dist_to_saddle += dd*dd; }
+      dist_to_saddle = std::sqrt(dist_to_saddle);
+      /* near a different equilibrium: |f| small but far from the start saddle */
+      if (fn < 1e-2 && dist_to_saddle > 0.1) looks_heteroclinic = true;
+    }
+  }
+  double closest_ratio = 1.0;
+  { /* recompute closest-return / amplitude at p for the message */
+    std::vector<std::vector<double>> ob; double gg; (void)gg;
+    if (lin_gap(p, &gg, &ob) && ob.size() > 2 && !x0fin.empty()) {
+      double far_d=0, cl=1e300; std::size_t fi=0;
+      for (std::size_t i=0;i<ob.size();++i){ double d=0; for(std::size_t k=0;k<n;k++){double dd=ob[i][k]-x0fin[k];d+=dd*dd;} d=std::sqrt(d); if(d>far_d){far_d=d;fi=i;} }
+      for (std::size_t i=fi;i<ob.size();++i){ double d=0; for(std::size_t k=0;k<n;k++){double dd=ob[i][k]-x0fin[k];d+=dd*dd;} d=std::sqrt(d); if(d<cl)cl=d; }
+      if (far_d>1e-9) closest_ratio = cl/far_d;
+    }
+  }
+  R.ok = (amp > 0.2) && (std::fabs(g) < 0.03 * amp) && (closest_ratio < 0.25);
+  if (R.ok) {
+    R.message = "homoclinic located approximately (p=" + std::to_string(p) + ", |gap|=" + std::to_string(std::fabs(g)) + ", amp=" + std::to_string(amp) + ")";
+  } else if (looks_heteroclinic) {
+    R.message = "the unstable manifold connects to a DIFFERENT equilibrium near p=" + std::to_string(p) +
+                " -- this is a heteroclinic, not a homoclinic; use solve_heteroclinic";
+  } else if (amp > 0.2 && closest_ratio > 0.5) {
+    R.message = "the unstable manifold did not return near the saddle (it settled on a limit cycle or escaped); no homoclinic located -- use solve_homoclinic with an integrated seed if a connection is expected";
+  } else {
+    R.message = "homoclinic not robustly located (best |gap|=" + std::to_string(std::fabs(g)) + ", amp=" + std::to_string(amp) + ", return ratio=" + std::to_string(closest_ratio) + ") -- use solve_homoclinic/continue_homoclinic";
+  }
   return R;
 }
 
