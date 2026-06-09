@@ -1378,6 +1378,82 @@ TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
   return curve;
 }
 
+Codim2Point locate_bogdanov_takens(const Model2 &m, const std::vector<double> &x0,
+                                   double p0, double q0) {
+  Codim2Point R; R.kind = SpecialPointKind::BogdanovTakens;
+  const std::size_t n = m.n;
+  if (n < 2 || x0.size() < n) { R.message = "BT needs a 2+ dim system"; return R; }
+
+  /* unknowns U = (x[0..n-1], p, q); defining system G(U) of length n+2:
+   *   G[0..n-1] = f(x,p,q)
+   *   G[n]      = mu_prod  = product of the two smallest-|.| eigenvalues
+   *   G[n+1]    = mu_sum   = sum of the real parts of those two eigenvalues
+   * At a Bogdanov-Takens point both small eigenvalues are zero, so both vanish.
+   * (Away from BT this still defines a well-posed target; Newton pulls the two
+   *  near-critical eigenvalues to the double-zero.) */
+  const std::size_t NU = n + 2;
+  std::vector<double> U(NU, 0.0);
+  for (std::size_t i=0;i<n;i++) U[i]=x0[i];
+  U[n]=p0; U[n+1]=q0;
+
+  auto eval_G = [&](const std::vector<double> &Uv, std::vector<double> *G) -> bool {
+    std::vector<double> x(Uv.begin(), Uv.begin()+n); double p=Uv[n], q=Uv[n+1];
+    Model mm; mm.n=n;
+    mm.vector_field = [&m,q](const double*xx,double pp,double*fo,std::string*er){ return m.vector_field(xx,pp,q,fo,er); };
+    std::vector<double> f(n); std::string e;
+    if (!mm.vector_field(x.data(), p, f.data(), &e)) return false;
+    std::vector<double> A; if (!finite_diff_jacobian(mm, x.data(), p, &A, &e, 1e-7)) return false;
+    std::vector<Complex> ev; if (!eigenvalues(A, n, &ev)) return false;
+    /* two smallest by magnitude */
+    std::sort(ev.begin(), ev.end(), [](const Complex&a,const Complex&b){ return std::abs(a) < std::abs(b); });
+    const Complex l1 = ev[0], l2 = (ev.size()>1? ev[1] : Complex(0,0));
+    G->assign(NU, 0.0);
+    for (std::size_t i=0;i<n;i++) (*G)[i]=f[i];
+    (*G)[n]   = (l1*l2).real();              /* product (real; imaginary parts cancel for a pair) */
+    (*G)[n+1] = l1.real() + l2.real();        /* sum of real parts */
+    return true;
+  };
+
+  std::vector<double> G(NU);
+  double resn = 0; int it = 0;
+  for (; it < 80; ++it) {
+    if (!eval_G(U, &G)) { R.message = "BT: defining-system eval failed"; return R; }
+    resn = 0; for (double g : G) resn += g*g; resn = std::sqrt(resn);
+    if (resn < 1e-11) break;
+    /* finite-difference Jacobian of G w.r.t. U (square (n+2)x(n+2)) */
+    std::vector<double> Jg(NU*NU, 0.0), Gp(NU); std::vector<double> Up = U;
+    for (std::size_t c=0;c<NU;c++) {
+      const double save = Up[c]; const double dh = 1e-7*(std::fabs(save)+1e-3);
+      Up[c]=save+dh; if (!eval_G(Up, &Gp)) { Up[c]=save; continue; } Up[c]=save;
+      for (std::size_t r=0;r<NU;r++) Jg[r*NU+c]=(Gp[r]-G[r])/dh;
+    }
+    /* Newton step: solve Jg dU = -G (Levenberg damping for robustness) */
+    std::vector<double> JtJ(NU*NU,0.0), Jtb(NU,0.0);
+    for (std::size_t a=0;a<NU;a++){ double s=0; for(std::size_t r=0;r<NU;r++) s+=Jg[r*NU+a]*G[r]; Jtb[a]=-s;
+      for (std::size_t b2=0;b2<NU;b2++){ double t=0; for(std::size_t r=0;r<NU;r++) t+=Jg[r*NU+a]*Jg[r*NU+b2]; JtJ[a*NU+b2]=t; } }
+    for (std::size_t a=0;a<NU;a++) JtJ[a*NU+a]+=1e-10;
+    std::vector<double> dU;
+    if (!solve_linear(JtJ, Jtb, &dU)) { R.message="BT: Newton solve failed"; break; }
+    double dn=0; for(double v:dU) dn+=v*v; dn=std::sqrt(dn);
+    double damp = dn>0.5 ? 0.5/dn : 1.0;
+    for (std::size_t a=0;a<NU;a++) U[a]+=damp*dU[a];
+  }
+  R.x.assign(U.begin(), U.begin()+n); R.p=U[n]; R.q=U[n+1]; R.residual=resn; R.iters=it;
+  R.ok = (resn < 1e-7);
+  if (R.ok) {
+    /* normal-form coefficients at the located BT point */
+    Model mm; mm.n=n; double q=R.q;
+    mm.vector_field = [&m,q](const double*xx,double pp,double*fo,std::string*er){ return m.vector_field(xx,pp,q,fo,er); };
+    double a=0,b=0; std::string e;
+    if (bt_normal_form(mm, R.x, R.p, &a, &b, &e)) { R.a=a; R.b=b; }
+    R.message = "located Bogdanov-Takens at (p="+std::to_string(R.p)+", q="+std::to_string(R.q)+
+                "), residual "+std::to_string(resn)+", BT normal form a="+std::to_string(R.a)+" b="+std::to_string(R.b);
+  } else {
+    R.message = "did not converge to a BT point (residual "+std::to_string(resn)+")";
+  }
+  return R;
+}
+
 /* ---- periodic-orbit continuation by collocation ------------------------- */
 namespace {
 

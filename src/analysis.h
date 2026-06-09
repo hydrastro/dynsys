@@ -329,6 +329,34 @@ TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
                               const std::vector<double> &x0, double p0, double q0,
                               const TwoParamSettings &settings);
 
+/* ---- CODIM-2 POINT LOCATION (defining-system Newton) -------------------- *
+ * A codim-2 point sits at the intersection of two codim-1 conditions and is
+ * found, in two free parameters, by solving its DEFINING SYSTEM directly (the
+ * way MatCont's BT/ZH "init" does) rather than only being detected along a
+ * curve. This pins the point -- equilibrium x AND both parameters (p,q) -- to
+ * Newton precision, which is the prerequisite for then continuing it in a third
+ * parameter. */
+struct Codim2Point {
+  std::vector<double> x;   /* equilibrium at the located point */
+  double p = 0.0, q = 0.0; /* the two parameter values         */
+  double residual = 0.0;   /* defining-system residual norm    */
+  int iters = 0;
+  bool ok = false;
+  SpecialPointKind kind = SpecialPointKind::None;
+  /* normal-form coefficients at the located point (filled for BT: a,b) */
+  double a = 0.0, b = 0.0;
+  std::string message;
+};
+
+/* Locate a Bogdanov-Takens point (double-zero eigenvalue) by Newton on the
+ * defining system { f(x,p,q) = 0 ; mu1(x,p,q) = 0 ; mu2(x,p,q) = 0 }, where
+ * mu1, mu2 are the two bordered "double-zero" test functions (the product and
+ * sum of the two smallest eigenvalues vanish at BT). x0,p0,q0 is a guess near
+ * the point (e.g. from detection along a fold/Hopf curve). On success the BT
+ * normal-form coefficients a,b are also computed at the located point. */
+Codim2Point locate_bogdanov_takens(const Model2 &m, const std::vector<double> &x0,
+                                   double p0, double q0);
+
 /* ---- HOMOCLINIC ORBITS (connection to a saddle) ------------------------- *
  * A homoclinic orbit leaves a saddle equilibrium along its unstable manifold
  * and returns to the SAME saddle along its stable manifold, so x(t) -> x0 as

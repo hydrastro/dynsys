@@ -41,7 +41,7 @@ suite, not that it matches MatCont's 15-year robustness on pathological inputs.
 | Codim-1 cycle-bif curves | LPC, PD, NS curves in two parameters | **LPC, PD, NS curves** (pd_curve / ns_curve / lpc_curve) | ≈ parity |
 | Branch point of cycles (BPC) | Yes | **Yes** (bordered-determinant test, validated) | ≈ parity |
 | Codim-2 on cycle curves | LPPD/fold-flip, PD-NS, cusp-of-cycles | **fold-flip / PD-NS / degenerate-PD** detection along PD/NS curves | ≈ parity (detection; MatCont also continues them) |
-| Codim-2 equilibrium points | BT, cusp, GH, ZH, HH — all with normal-form coefficients | **BT (a,b), cusp (c), GH (l2), ZH (b,Re c), HH (p11,p12,p21,p22)** — all validated | ≈ parity on coefficients |
+| Codim-2 equilibrium points | BT, cusp, GH, ZH, HH — all with normal-form coefficients | **BT (a,b), cusp (c), GH (l2), ZH (b,Re c), HH (p11,p12,p21,p22)** — all validated; **BT points also located directly by defining-system Newton** | ≈ parity on coefficients + BT point location |
 | Connecting orbits | Homoclinic & heteroclinic continuation (HomCont), Lin's method | solve_homoclinic / continue_homoclinic; **solve_heteroclinic**; **find_homoclinic** (sweep+locate); Lin diagnostic | ◐ (MatCont's parameter-as-unknown HomCont BVP is more general) |
 | Codim-1 equilibrium curve continuation | Pseudo-arclength, very robust on hard curves, restart/branch-switch | Equilibrium branch + fold/Hopf/branch detection + branch switching + 2-param fold/Hopf curves | ◐ (MatCont more robust on long/pathological curves) |
 | Track record | 15+ years, thousands of papers | new | gap (trust/validation) |
@@ -54,8 +54,12 @@ suite, not that it matches MatCont's 15-year robustness on pathological inputs.
    not yet solve the orbit, period, and bifurcation parameter as one coupled
    BVP with an integral phase condition the way HomCont does. (The collapse
    degeneracies that defeat the naive version are documented in the roadmap.)
-2. **Continuation of codim-2 points as curves in 3 parameters**, and detection
-   of higher codim-2 cycle points beyond the three implemented.
+2. **Continuation of codim-2 points as curves in a third parameter.** dynsys
+   now LOCATES a Bogdanov-Takens point directly (defining-system Newton in
+   (x,p,q), matching MatCont's BT init) and computes its normal form, but does
+   not yet continue it as a curve when a third parameter is freed. That step
+   (and detection of higher codim-2 cycle points beyond the three implemented)
+   remains.
 3. **Robustness and track record.** MatCont has 15 years of hardening on
    pathological systems and a large validation corpus; dynsys validates each
    feature against analytic ground truth but is new.
