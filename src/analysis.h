@@ -208,6 +208,45 @@ bool cusp_normal_form(const Model &m, const std::vector<double> &x, double p,
 bool gh_second_lyapunov(const Model &m, const std::vector<double> &x, double p,
                         double *l2, std::string *err);
 
+/* Zero-Hopf (Gavrilov-Guckenheimer / fold-Hopf) normal-form coefficients.
+ *
+ * At a zero-Hopf point the Jacobian has eigenvalues {0, +i*omega, -i*omega}.
+ * The quadratic normal form on the 3-D center manifold (Kuznetsov, Elements of
+ * Applied Bifurcation Theory, sec. 8.5) is governed by two leading coefficients:
+ *     b = < p0, B(q0, q0) >                 (real)
+ *     c = < p1, B(q0, q1) >                 (complex; Re c is the key part)
+ * where q0 is the real null eigenvector (A q0 = 0), q1 the complex eigenvector
+ * (A q1 = i*omega q1), and p0, p1 the corresponding adjoint vectors normalized
+ * so <p0,q0> = 1 and <p1,q1> = 1. The SIGN of b and of Re(c) (and the product
+ * s = b * Re(c)) classify which local bifurcation diagram occurs -- in
+ * particular whether an invariant torus and/or secondary connections are born.
+ * Returns b, Re(c), omega, and s = b*Re(c). */
+bool zero_hopf_normal_form(const Model &m, const std::vector<double> &x, double p,
+                           double *b_out, double *recc_out, double *omega_out,
+                           double *s_out, std::string *err);
+
+/* Hopf-Hopf (double-Hopf) normal-form coefficients.
+ *
+ * At a Hopf-Hopf point the Jacobian has TWO pure-imaginary pairs
+ * {+-i*omega1, +-i*omega2} (omega1 != omega2, non-resonant). The truncated
+ * amplitude normal form on the 4-D center manifold (Kuznetsov, Elements of
+ * Applied Bifurcation Theory, sec. 8.6) is
+ *     r1' = r1 (mu1 + p11 r1^2 + p12 r2^2)
+ *     r2' = r2 (mu2 + p21 r1^2 + p22 r2^2)
+ * (real cubic truncation). The four real cubic coefficients are:
+ *   p11 = self-interaction of mode 1 (its first Lyapunov coefficient),
+ *   p22 = self-interaction of mode 2,
+ *   p12 = mode-1 amplitude driven by mode-2 amplitude (cross-coupling),
+ *   p21 = mode-2 amplitude driven by mode-1 amplitude (cross-coupling).
+ * The signs of p11,p22 and of theta = p12/p22, delta = p21/p11 classify the
+ * local diagram (whether the two limit cycles can coexist, and whether an
+ * invariant 2-torus / heteroclinic structures appear -- the "simple" vs
+ * "difficult" cases). Returns p11,p12,p21,p22 and the two frequencies. */
+bool hopf_hopf_normal_form(const Model &m, const std::vector<double> &x, double p,
+                           double *p11_out, double *p12_out, double *p21_out,
+                           double *p22_out, double *omega1_out, double *omega2_out,
+                           std::string *err);
+
 /* Bogdanov-Takens normal-form coefficients (a, b) at a BT point (double-zero
  * eigenvalue, 2x2 Jordan block). The planar BT normal form is w0'=w1,
  * w1'=a w0^2 + b w0 w1; non-degeneracy needs a != 0 and b != 0. */
@@ -254,6 +293,12 @@ struct TwoParamPoint {
   double bt_a = 0.0, bt_b = 0.0;
   double cusp_c = 0.0;   /* cusp cubic coefficient (Cusp points)            */
   double gh_l2 = 0.0;    /* second Lyapunov coefficient (GeneralizedHopf)   */
+  /* zero-Hopf (ZeroHopf) normal-form coefficients: b, Re(c), and their product
+   * s = b*Re(c) whose sign classifies the local diagram. */
+  double zh_b = 0.0, zh_recc = 0.0, zh_s = 0.0;
+  /* Hopf-Hopf (HopfHopf) cubic coefficients of the amplitude normal form
+   * r1'=r1(.. + p11 r1^2 + p12 r2^2), r2'=r2(.. + p21 r1^2 + p22 r2^2). */
+  double hh_p11 = 0.0, hh_p12 = 0.0, hh_p21 = 0.0, hh_p22 = 0.0;
   bool has_codim2_nf = false;
 };
 struct TwoParamCurve {

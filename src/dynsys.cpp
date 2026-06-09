@@ -10318,16 +10318,18 @@ void draw_gui(AppState &app) {
             case dynsys::analysis::SpecialPointKind::Cusp:            mc=IM_COL32(255,160,80,255);  ml="CP"; break;
             case dynsys::analysis::SpecialPointKind::BogdanovTakens:  mc=IM_COL32(255,120,120,255); ml="BT"; break;
             case dynsys::analysis::SpecialPointKind::GeneralizedHopf: mc=IM_COL32(180,140,255,255); ml="GH"; break;
+            case dynsys::analysis::SpecialPointKind::ZeroHopf:       mc=IM_COL32(120,220,255,255); ml="ZH"; break;
+            case dynsys::analysis::SpecialPointKind::HopfHopf:        mc=IM_COL32(255,200,120,255); ml="HH"; break;
             default: mc=IM_COL32(230,230,230,255); ml="*"; break;
           }
           dl->AddRectFilled(ImVec2(c2.x-r,c2.y-r), ImVec2(c2.x+r,c2.y+r), mc);
           dl->AddRect(ImVec2(c2.x-r,c2.y-r), ImVec2(c2.x+r,c2.y+r), IM_COL32(20,20,25,255), 0,0,1.5f);
           dl->AddText(ImVec2(c2.x+7,c2.y-6), mc, ml);
         }
-        char lab[192]; std::snprintf(lab,sizeof(lab),"%s  (x: %s, y: %s)%s",
+        char lab[320]; std::snprintf(lab,sizeof(lab),"%s  (x: %s, y: %s)%s",
                        app.twopar_curve.kind==dynsys::analysis::SpecialPointKind::Hopf?"Hopf curve":"fold curve",
                        app.cont_param, app.twopar_p2,
-                       app.twopar_curve.special_indices.empty()?"":"  CP=cusp BT=Bogdanov-Takens GH=gen.Hopf");
+                       app.twopar_curve.special_indices.empty()?"":"  CP=cusp BT=Bogdanov-Takens GH=gen.Hopf ZH=zero-Hopf HH=Hopf-Hopf");
         dl->AddText(ImVec2(o.x+8,o.y+6), col, lab);
         ImGui::Dummy(ImVec2(W, H+4));
 
@@ -10349,6 +10351,16 @@ void draw_gui(AppState &app) {
             ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  2nd Lyapunov coeff l2=%.4g (sign %s => fold-of-cycles opens %s)",
                               kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.gh_l2,
                               sp.gh_l2 < 0 ? "-" : "+", sp.gh_l2 < 0 ? "supercritically" : "subcritically");
+          else if (sp.special==dynsys::analysis::SpecialPointKind::ZeroHopf && sp.has_codim2_nf)
+            ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  normal form: b=%.4g, Re(c)=%.4g, s=b*Re(c)=%.4g (s %s => %s)",
+                              kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.zh_b, sp.zh_recc, sp.zh_s,
+                              sp.zh_s < 0 ? "<0" : ">0",
+                              sp.zh_s < 0 ? "an invariant torus / secondary connections can be born" : "no torus (simpler unfolding)");
+          else if (sp.special==dynsys::analysis::SpecialPointKind::HopfHopf && sp.has_codim2_nf)
+            ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  —  cubic coeffs p11=%.4g p22=%.4g (self), p12=%.4g p21=%.4g (cross); p12*p21 %s 0 => %s",
+                              kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2, sp.hh_p11, sp.hh_p22, sp.hh_p12, sp.hh_p21,
+                              (sp.hh_p12*sp.hh_p21) < 0 ? "<" : ">",
+                              (sp.hh_p12*sp.hh_p21) < 0 ? "the two cycles can coexist (simple case)" : "competition (difficult case: torus/heteroclinic possible)");
           else
             ImGui::BulletText("%s at (%s=%.5g, %s=%.5g)  [refined]",
                               kn, app.cont_param, sp.p2, app.twopar_p2, sp.q2);

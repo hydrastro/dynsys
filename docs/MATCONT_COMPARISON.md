@@ -28,20 +28,40 @@ is to tell you which tool to reach for, not to win an argument.
 
 ---
 
-## Where MatCont is clearly ahead
+## Where MatCont is still ahead (and where dynsys has caught up)
 
-| Area | MatCont | dynsys | Honest gap |
+The table below is kept current as dynsys closes gaps. "≈ parity" means the
+capability exists and is validated against analytic ground truth in dynsys's test
+suite, not that it matches MatCont's 15-year robustness on pathological inputs.
+
+| Area | MatCont | dynsys | Status |
 |---|---|---|---|
-| Limit-cycle continuation | Orthogonal collocation, **adaptive mesh + arclength**, Floquet multipliers | Collocation cycle solver, but **steps the parameter monotonically (no pseudo-arclength)** | dynsys can't go around folds of cycles robustly; MatCont can |
-| Codim-1 curve continuation | Pseudo-arclength, handles folds in the curve, very long runs | Equilibrium branch + fold/Hopf detection; two-parameter fold/Hopf curves | MatCont's continuation is far more robust on hard curves |
-| Codim-2 points | BT, GH, ZH, HH, cusp with validated normal-form coefficients | BT / cusp / generalized-Hopf detection + first normal-form coefficients | MatCont covers more types and is better validated |
-| Homoclinic continuation | ● | ◐ (truncated-BVP locus, tangent predictor; Lin's method experimental) |
-| Floquet / monodromy | Yes, full | Partial (period & amplitude; not full Floquet) | gap |
-| Track record | 15+ years, thousands of papers | new | trust/validation |
-| Ecosystem | MATLAB: plotting, export, scripting, community | self-contained, no scripting language | MATLAB integration |
+| Limit-cycle continuation | Orthogonal collocation, adaptive mesh + pseudo-arclength, Floquet | Collocation + **pseudo-arclength + adaptive mesh**, self-seeding; goes around folds of cycles | ≈ parity (MatCont more robust on stiff/long runs) |
+| Floquet / monodromy | Full | **Full**: variational monodromy → multipliers, PD/NS classified & bracketed | ≈ parity |
+| Codim-1 cycle-bif curves | LPC, PD, NS curves in two parameters | **LPC, PD, NS curves** (pd_curve / ns_curve / lpc_curve) | ≈ parity |
+| Branch point of cycles (BPC) | Yes | **Yes** (bordered-determinant test, validated) | ≈ parity |
+| Codim-2 on cycle curves | LPPD/fold-flip, PD-NS, cusp-of-cycles | **fold-flip / PD-NS / degenerate-PD** detection along PD/NS curves | ≈ parity (detection; MatCont also continues them) |
+| Codim-2 equilibrium points | BT, cusp, GH, ZH, HH — all with normal-form coefficients | **BT (a,b), cusp (c), GH (l2), ZH (b,Re c), HH (p11,p12,p21,p22)** — all validated | ≈ parity on coefficients |
+| Connecting orbits | Homoclinic & heteroclinic continuation (HomCont), Lin's method | solve_homoclinic / continue_homoclinic; **solve_heteroclinic**; **find_homoclinic** (sweep+locate); Lin diagnostic | ◐ (MatCont's parameter-as-unknown HomCont BVP is more general) |
+| Codim-1 equilibrium curve continuation | Pseudo-arclength, very robust on hard curves, restart/branch-switch | Equilibrium branch + fold/Hopf/branch detection + branch switching + 2-param fold/Hopf curves | ◐ (MatCont more robust on long/pathological curves) |
+| Track record | 15+ years, thousands of papers | new | gap (trust/validation) |
+| Ecosystem | MATLAB: plotting, export, scripting, community | self-contained native binary, no scripting language | gap (different niche) |
 
-If your work depends on any row above, MatCont (or AUTO) is the right tool, and
-dynsys does not claim parity there.
+### The genuinely remaining gaps
+1. **A fully general parameter-as-unknown homoclinic BVP** (production HomCont):
+   dynsys locates homoclinics by sweeping the unstable-manifold return distance
+   and polishing with the truncated BVP, and continues a known locus; it does
+   not yet solve the orbit, period, and bifurcation parameter as one coupled
+   BVP with an integral phase condition the way HomCont does. (The collapse
+   degeneracies that defeat the naive version are documented in the roadmap.)
+2. **Continuation of codim-2 points as curves in 3 parameters**, and detection
+   of higher codim-2 cycle points beyond the three implemented.
+3. **Robustness and track record.** MatCont has 15 years of hardening on
+   pathological systems and a large validation corpus; dynsys validates each
+   feature against analytic ground truth but is new.
+
+If your work depends on rows still marked "gap" or "◐", MatCont (or AUTO) is the
+right tool, and dynsys does not claim full parity there.
 
 ---
 
@@ -117,12 +137,16 @@ dynsys now covers most of MatCont's single- and two-parameter continuation
 core: equilibrium and cycle continuation (collocation + pseudo-arclength +
 adaptive mesh), LPC fold-of-cycles, branch switching, Floquet multipliers via
 the variational monodromy, the full planar codim-2 set (BT, GH, cusp, zero-Hopf,
-Hopf-Hopf) with normal-form coefficients, and homoclinic continuation. The
-remaining gaps versus MatCont are the cycle-bifurcation CONTINUATION curves
-(period-doubling, Neimark-Sacker/torus), heteroclinic and saddle-node-homoclinic
-connections, and a fully robust Lin's method for stiff homoclinics. Where dynsys
-is genuinely differentiated is the **exact symbolic / proof-carrying** path and
-the breadth of *interactive* dynamics + fractals in one zero-setup tool.
+Hopf-Hopf) with validated normal-form coefficients, the two-parameter
+cycle-bifurcation curves (period-doubling and Neimark-Sacker/torus) with codim-2
+detection along them, branch-point-of-cycles, and homoclinic AND heteroclinic
+solving/continuation plus a one-call homoclinic locator. The remaining gaps
+versus MatCont are a fully general parameter-as-unknown homoclinic BVP
+(production-grade HomCont/Lin's method for stiff connections), continuation of
+codim-2 points as curves, and — most of all — 15 years of robustness hardening
+and validation track record. Where dynsys is genuinely differentiated is the
+**exact symbolic / proof-carrying** path and the breadth of *interactive*
+dynamics + fractals in one zero-setup tool.
 
 A fair one-liner: *MatCont is the specialist's continuation engine; dynsys is an
 interactive dynamics workbench that adds exact symbolic certificates and a

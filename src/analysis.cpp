@@ -1343,6 +1343,21 @@ TwoParamCurve two_param_curve(const Model2 &m, TwoParamKind kind,
                 curve.points[at].gh_l2 = ll2;
                 curve.points[at].has_codim2_nf = true;
               }
+            } else if (k == SpecialPointKind::ZeroHopf) {
+              Model mm = model_at_q(best.q);
+              double zb = 0, zrecc = 0, zom = 0, zs = 0; std::string e;
+              if (zero_hopf_normal_form(mm, best.x, best.p, &zb, &zrecc, &zom, &zs, &e)) {
+                curve.points[at].zh_b = zb; curve.points[at].zh_recc = zrecc; curve.points[at].zh_s = zs;
+                curve.points[at].has_codim2_nf = true;
+              }
+            } else if (k == SpecialPointKind::HopfHopf) {
+              Model mm = model_at_q(best.q);
+              double a11=0,a12=0,a21=0,a22=0,o1=0,o2=0; std::string e;
+              if (hopf_hopf_normal_form(mm, best.x, best.p, &a11,&a12,&a21,&a22,&o1,&o2, &e)) {
+                curve.points[at].hh_p11=a11; curve.points[at].hh_p12=a12;
+                curve.points[at].hh_p21=a21; curve.points[at].hh_p22=a22;
+                curve.points[at].has_codim2_nf = true;
+              }
             }
           } else {
             curve.points[at].p2 = curve.points[at].p;
@@ -3085,6 +3100,235 @@ bool gh_second_lyapunov(const Model &m, const std::vector<double> &x, double p,
             + 6.0*Cterm1[i] + 6.0*Cterm2[i] + 3.0*Bterm1[i] + 6.0*Bterm2[i];
   Cplx g = cdot(pp, hsum, n);
   if (l2) *l2 = g.real() / (12.0 * w);
+  return true;
+}
+
+bool zero_hopf_normal_form(const Model &m, const std::vector<double> &x, double p,
+                           double *b_out, double *recc_out, double *omega_out,
+                           double *s_out, std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 3 || x.size() < n) { if (err) *err = "zero-Hopf needs a 3+ dim system"; return false; }
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+  std::vector<Cplx> ev;
+  if (!eigenvalues(J, n, &ev)) { if (err) *err = "eigenvalue failure"; return false; }
+  /* identify the Hopf frequency omega and confirm a near-zero real eigenvalue */
+  double w = 0.0; bool found_w = false, found_zero = false;
+  for (const auto &lam : ev) {
+    if (lam.imag() > 1e-6 && std::fabs(lam.real()) < 1e-2 * (1.0 + std::fabs(lam.imag())) && !found_w) { w = lam.imag(); found_w = true; }
+    if (std::fabs(lam.imag()) < 1e-6 && std::fabs(lam.real()) < 1e-2) found_zero = true;
+  }
+  if (!found_w)   { if (err) *err = "no imaginary pair at this point (not zero-Hopf)"; return false; }
+  if (!found_zero){ if (err) *err = "no zero eigenvalue at this point (not zero-Hopf)"; return false; }
+  if (omega_out) *omega_out = w;
+
+  /* real null eigenvector q0 (A q0 = 0) and adjoint p0 (A^T p0 = 0) via inverse
+   * iteration on the regularized matrices. */
+  auto inv_null_real = [&](const std::vector<double> &Min, std::vector<double> *vec) -> bool {
+    std::vector<double> M = Min; for (std::size_t i=0;i<n;i++) M[i*n+i] += 1e-9;
+    std::vector<double> v(n, 1.0/std::sqrt((double)n));
+    for (int it=0; it<200; ++it) { std::vector<double> nv; if (!solve_linear(M, v, &nv)) return false;
+      double nr=0; for(double z:nv) nr+=z*z; nr=std::sqrt(nr); if(nr<1e-300) return false; for(double&z:nv) z/=nr; v=nv; }
+    *vec = v; return true;
+  };
+  std::vector<double> JTr(n*n); for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++) JTr[i*n+j]=J[j*n+i];
+  std::vector<double> q0, p0;
+  if (!inv_null_real(J,  &q0)) { if (err) *err="zero-Hopf: q0 solve failed"; return false; }
+  if (!inv_null_real(JTr,&p0)) { if (err) *err="zero-Hopf: p0 solve failed"; return false; }
+  /* normalize <p0,q0> = 1 */
+  { double s=0; for (std::size_t i=0;i<n;i++) s+=p0[i]*q0[i]; if (std::fabs(s)<1e-300){ if(err)*err="zero-Hopf: <p0,q0>=0"; return false; } for(double&z:p0) z/=s; }
+
+  /* complex eigenvector q1 (A q1 = i w q1) and adjoint p1 (A^T p1 = -i w p1),
+   * normalized <p1,q1> = 1. (Reuse the same inverse-iteration pattern as l1.) */
+  std::vector<Cplx> Jc(n*n), JTc(n*n);
+  for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++){
+    Jc[i*n+j]  = Cplx(J[i*n+j],0) - ((i==j)?Cplx(0,w):Cplx(0,0));
+    JTc[i*n+j] = Cplx(J[j*n+i],0) + ((i==j)?Cplx(0,w):Cplx(0,0));
+  }
+  auto inv_iter = [&](std::vector<Cplx> M, std::vector<Cplx> *vec)->bool{
+    for (std::size_t i=0;i<n;i++) M[i*n+i] += Cplx(1e-8,0);
+    std::vector<Cplx> v(n, Cplx(1.0/std::sqrt((double)n),0)); v[0]=Cplx(1,0);
+    for (int it=0; it<80; ++it){ std::vector<Cplx> nv; if(!solve_complex(M,v,n,&nv)) return false;
+      double nr=0; for(auto&z:nv) nr+=std::norm(z); nr=std::sqrt(nr); if(nr<1e-300) return false; for(auto&z:nv) z/=nr; v=nv; }
+    *vec=v; return true;
+  };
+  std::vector<Cplx> q1, p1;
+  if (!inv_iter(Jc,&q1))  { if (err) *err="zero-Hopf: q1 solve failed"; return false; }
+  if (!inv_iter(JTc,&p1)) { if (err) *err="zero-Hopf: p1 solve failed"; return false; }
+  { Cplx pq = cdot(p1, q1, n); if (std::abs(pq)<1e-300){ if(err)*err="zero-Hopf: <p1,q1>=0"; return false; } for(auto&z:p1) z/=pq; }
+
+  /* bilinear form context */
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=1e-4;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+
+  /* b = <p0, B(q0,q0)> (real) */
+  std::vector<double> Bqq;
+  if (!B_real(c, q0, q0, &Bqq)) { if (err) *err="zero-Hopf: B(q0,q0) failed"; return false; }
+  double b = 0; for (std::size_t i=0;i<n;i++) b += p0[i]*Bqq[i];
+
+  /* c = <p1, B(q0,q1)> (complex). Promote q0 to complex. */
+  std::vector<Cplx> q0c(n), Bq0q1;
+  for (std::size_t i=0;i<n;i++) q0c[i]=Cplx(q0[i],0);
+  if (!B_cplx(c, q0c, q1, &Bq0q1)) { if (err) *err="zero-Hopf: B(q0,q1) failed"; return false; }
+  Cplx cc = cdot(p1, Bq0q1, n);
+  const double recc = cc.real();
+
+  if (b_out)   *b_out   = b;
+  if (recc_out)*recc_out= recc;
+  if (s_out)   *s_out   = b * recc;   /* sign of product classifies the unfolding */
+  return true;
+}
+
+bool hopf_hopf_normal_form(const Model &m, const std::vector<double> &x, double p,
+                           double *p11_out, double *p12_out, double *p21_out,
+                           double *p22_out, double *omega1_out, double *omega2_out,
+                           std::string *err) {
+  const std::size_t n = m.n;
+  if (n < 4 || x.size() < n) { if (err) *err = "Hopf-Hopf needs a 4+ dim system"; return false; }
+  std::vector<double> J;
+  if (!finite_diff_jacobian(m, x.data(), p, &J, err, 1e-7)) return false;
+  std::vector<Cplx> ev;
+  if (!eigenvalues(J, n, &ev)) { if (err) *err = "eigenvalue failure"; return false; }
+  /* two distinct pure-imaginary pairs: collect positive imaginary parts with
+   * near-zero real part. */
+  std::vector<double> ws;
+  for (const auto &lam : ev)
+    if (lam.imag() > 1e-6 && std::fabs(lam.real()) < 1e-2 * (1.0 + std::fabs(lam.imag()))) ws.push_back(lam.imag());
+  std::sort(ws.begin(), ws.end());
+  /* dedup near-equal */
+  std::vector<double> wdist;
+  for (double w : ws) { if (wdist.empty() || std::fabs(w - wdist.back()) > 1e-4*(1+w)) wdist.push_back(w); }
+  if (wdist.size() < 2) { if (err) *err = "need two distinct imaginary pairs (not Hopf-Hopf)"; return false; }
+  const double w1 = wdist[0], w2 = wdist[1];
+  if (omega1_out) *omega1_out = w1;
+  if (omega2_out) *omega2_out = w2;
+
+  /* complex eigenvector + adjoint for frequency w, normalized <p,q>=1 */
+  auto eig_pair = [&](double w, std::vector<Cplx> *q, std::vector<Cplx> *pp) -> bool {
+    std::vector<Cplx> Jc(n*n), JTc(n*n);
+    for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++){
+      Jc[i*n+j]  = Cplx(J[i*n+j],0) - ((i==j)?Cplx(0,w):Cplx(0,0));
+      JTc[i*n+j] = Cplx(J[j*n+i],0) + ((i==j)?Cplx(0,w):Cplx(0,0));
+    }
+    auto inv_iter=[&](std::vector<Cplx> M, std::vector<Cplx>*vec)->bool{
+      for (std::size_t i=0;i<n;i++) M[i*n+i]+=Cplx(1e-8,0);
+      std::vector<Cplx> v(n,Cplx(1.0/std::sqrt((double)n),0)); v[0]=Cplx(1,0);
+      for (int it=0;it<120;it++){ std::vector<Cplx> nv; if(!solve_complex(M,v,n,&nv))return false;
+        double nr=0; for(auto&z:nv)nr+=std::norm(z); nr=std::sqrt(nr); if(nr<1e-300)return false; for(auto&z:nv) z/=nr; v=nv; }
+      *vec=v; return true; };
+    if(!inv_iter(Jc,q))  return false;
+    if(!inv_iter(JTc,pp)) return false;
+    { double qn=0; for(auto&z:*q)qn+=std::norm(z); qn=std::sqrt(qn); for(auto&z:*q)z/=qn; }
+    Cplx pq=cdot(*pp,*q,n); if(std::abs(pq)<1e-300) return false;
+    for(auto&z:*pp) z/=pq;
+    return true;
+  };
+  std::vector<Cplx> q1,p1q,q2,p2q;
+  if (!eig_pair(w1,&q1,&p1q)) { if (err) *err="HH: mode-1 eigenvector failed"; return false; }
+  if (!eig_pair(w2,&q2,&p2q)) { if (err) *err="HH: mode-2 eigenvector failed"; return false; }
+  std::vector<Cplx> q1b(n), q2b(n);
+  for (std::size_t i=0;i<n;i++){ q1b[i]=std::conj(q1[i]); q2b[i]=std::conj(q2[i]); }
+
+  DerivCtx c; c.m=&m; c.x0=x.data(); c.p=p; c.n=n; c.h=2e-2;
+  c.f_p.assign(n,0); c.f_m.assign(n,0); c.f_0.assign(n,0); c.xt.assign(n,0); c.err=err;
+  if (!m.vector_field(x.data(), p, c.f_0.data(), err)) return false;
+
+  /* solve (i*sigma - A) X = rhs for a non-resonant sigma (plain solve);
+   * sigma here is a combination like w_a+w_b, w_a-w_b, 2 w_a, or 0. For the
+   * sigma that equals +-w1 or +-w2 (resonant) we would need bordering, but in
+   * the cross-coupling coefficients below those resonant pieces are projected
+   * out by <p,.> so the plain (regularized) solve of the singular system gives
+   * the correct particular solution for the NON-resonant h-vectors we need. */
+  auto solveS = [&](double sigma, const std::vector<Cplx> &rhs, std::vector<Cplx> *X) -> bool {
+    std::vector<Cplx> M(n*n);
+    for (std::size_t i=0;i<n;i++) for (std::size_t j=0;j<n;j++)
+      M[i*n+j] = ((i==j)?Cplx(0,sigma):Cplx(0,0)) - Cplx(J[i*n+j],0);
+    /* regularize in case sigma is near an eigenvalue */
+    for (std::size_t i=0;i<n;i++) M[i*n+i] += Cplx(1e-9,0);
+    return solve_complex(M, rhs, n, X);
+  };
+
+  /* quadratic-correction vectors needed for the cubic coefficients */
+  std::vector<Cplx> B11_11, B22_22, B12, B12b, B1m2, h11_0, h0_11, h12, h1m2, h20_1, h20_2;
+  /* mode-1 self: h20_1 = (2iw1 - A)^-1 B(q1,q1); h11_0 = -A^-1 B(q1,q1bar) */
+  if(!B_cplx(c,q1,q1,&B11_11)) return false;
+  if(!B_cplx(c,q1,q1b,&h11_0)) return false;   /* reuse name temporarily: B(q1,q1bar) */
+  if(!solveS(2*w1, B11_11, &h20_1)) { if(err)*err="HH: solve 2iw1 failed"; return false; }
+  { std::vector<Cplx> rhs=h11_0; if(!solveS(0.0, rhs, &h11_0)) { if(err)*err="HH: solve A (mode1) failed"; return false; } }
+  /* mode-2 self */
+  if(!B_cplx(c,q2,q2,&B22_22)) return false;
+  if(!B_cplx(c,q2,q2b,&h0_11)) return false;    /* B(q2,q2bar) */
+  if(!solveS(2*w2, B22_22, &h20_2)) { if(err)*err="HH: solve 2iw2 failed"; return false; }
+  { std::vector<Cplx> rhs=h0_11; if(!solveS(0.0, rhs, &h0_11)) { if(err)*err="HH: solve A (mode2) failed"; return false; } }
+  /* cross terms: h12 = (i(w1+w2)-A)^-1 B(q1,q2); h1m2 = (i(w1-w2)-A)^-1 B(q1,q2bar) */
+  if(!B_cplx(c,q1,q2,&B12)) return false;
+  if(!B_cplx(c,q1,q2b,&B1m2)) return false;
+  if(!solveS(w1+w2, B12, &h12))  { if(err)*err="HH: solve i(w1+w2) failed"; return false; }
+  if(!solveS(w1-w2, B1m2, &h1m2)){ if(err)*err="HH: solve i(w1-w2) failed"; return false; }
+
+  /* trilinear C(a,b,d) for complex vectors via 8-combination expansion */
+  auto C_cplx = [&](const std::vector<Cplx>&A,const std::vector<Cplx>&Bv,const std::vector<Cplx>&D,std::vector<Cplx>*out)->bool{
+    std::vector<double> ar(n),ai(n),br(n),bi(n),dr(n),di(n);
+    for(std::size_t i=0;i<n;i++){ar[i]=A[i].real();ai[i]=A[i].imag();br[i]=Bv[i].real();bi[i]=Bv[i].imag();dr[i]=D[i].real();di[i]=D[i].imag();}
+    out->assign(n,Cplx(0,0));
+    for(int a=0;a<2;a++)for(int b=0;b<2;b++)for(int d=0;d<2;d++){
+      const std::vector<double>&va=a?ai:ar; const std::vector<double>&vb=b?bi:br; const std::vector<double>&vd=d?di:dr;
+      Cplx coef(1,0); if(a)coef*=Cplx(0,1); if(b)coef*=Cplx(0,1); if(d)coef*=Cplx(0,1);
+      std::vector<double> cr; if(!C_real(c,va,vb,vd,&cr)) return false;
+      for(std::size_t i=0;i<n;i++) (*out)[i]+=coef*cr[i];
+    }
+    return true;
+  };
+
+  /* p_11 = Re <p1, C(q1,q1,q1bar) + B(q1bar,h20_1) + 2 B(q1,h11_0)> / 2
+   * (the standard first Lyapunov coefficient of mode 1; the /2 and the i/2w
+   * conventions differ between texts -- we report a sign-faithful real value). */
+  auto selfL = [&](const std::vector<Cplx>&q,const std::vector<Cplx>&qb,const std::vector<Cplx>&pq,
+                   const std::vector<Cplx>&h20,const std::vector<Cplx>&h11,double w,double*out)->bool{
+    std::vector<Cplx> Cq, Bb1, Bb2;
+    if(!C_cplx(q,q,qb,&Cq)) return false;
+    if(!B_cplx(c,qb,h20,&Bb1)) return false;
+    if(!B_cplx(c,q,h11,&Bb2)) return false;
+    std::vector<Cplx> g(n); for(std::size_t i=0;i<n;i++) g[i]=Cq[i]+Bb1[i]+2.0*Bb2[i];
+    Cplx g21=cdot(pq,g,n);
+    *out = (0.5*g21).real();   /* Re(g21)/2 = first Lyapunov coefficient sign */
+    (void)w; return true;
+  };
+  double p11=0,p22=0;
+  if(!selfL(q1,q1b,p1q,h20_1,h11_0,w1,&p11)){ if(err)*err="HH: p11 failed"; return false; }
+  if(!selfL(q2,q2b,p2q,h20_2,h0_11,w2,&p22)){ if(err)*err="HH: p22 failed"; return false; }
+
+  /* cross-coupling p_12 (mode 1 driven by mode-2 amplitude):
+   * Re <p1, C(q1,q2,q2bar) + B(q1,h0_11) + B(q2bar,h12) + B(q2,h1m2)> */
+  auto cross = [&](const std::vector<Cplx>&qa,const std::vector<Cplx>&pa,
+                   const std::vector<Cplx>&qb,const std::vector<Cplx>&qbb,
+                   const std::vector<Cplx>&hbb,const std::vector<Cplx>&hpp,const std::vector<Cplx>&hpm,
+                   double*out)->bool{
+    std::vector<Cplx> Cc, Ba, Bp, Bm;
+    if(!C_cplx(qa,qb,qbb,&Cc)) return false;     /* C(qa,qb,qb_bar) */
+    if(!B_cplx(c,qa,hbb,&Ba)) return false;       /* B(qa, h_{b,bbar,0}) */
+    if(!B_cplx(c,qbb,hpp,&Bp)) return false;      /* B(qb_bar, h_{a+b}) */
+    if(!B_cplx(c,qb,hpm,&Bm)) return false;       /* B(qb, h_{a-b}) */
+    std::vector<Cplx> g(n); for(std::size_t i=0;i<n;i++) g[i]=Cc[i]+Ba[i]+Bp[i]+Bm[i];
+    *out = cdot(pa,g,n).real();
+    return true;
+  };
+  double p12=0,p21=0;
+  /* p12: a=mode1, b=mode2 */
+  if(!cross(q1,p1q,q2,q2b,h0_11,h12,h1m2,&p12)){ if(err)*err="HH: p12 failed"; return false; }
+  /* p21: a=mode2, b=mode1 -> need h-vectors with roles swapped: h11_0 is
+   * B-corr for mode1 self (q1,q1bar); cross uses h_{b,bbar}=h11_0, h_{a+b}=h12
+   * (same combination q1+q2), h_{a-b}=(i(w2-w1)-A)^-1 B(q2,q1bar). */
+  std::vector<Cplx> B2m1, h2m1;
+  if(!B_cplx(c,q2,q1b,&B2m1)) return false;
+  if(!solveS(w2-w1, B2m1, &h2m1)){ if(err)*err="HH: solve i(w2-w1) failed"; return false; }
+  if(!cross(q2,p2q,q1,q1b,h11_0,h12,h2m1,&p21)){ if(err)*err="HH: p21 failed"; return false; }
+
+  if (p11_out) *p11_out = p11;
+  if (p22_out) *p22_out = p22;
+  if (p12_out) *p12_out = p12;
+  if (p21_out) *p21_out = p21;
   return true;
 }
 
