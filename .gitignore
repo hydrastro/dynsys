@@ -1,3 +1,18 @@
+# Build output (provided by `make`; never committed)
 build/
 result
+result-*
 *.o
+*.d
+*.obj
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# Dear ImGui runtime state (written next to the binary at run time)
+imgui.ini
+
+# Nix
+.direnv/

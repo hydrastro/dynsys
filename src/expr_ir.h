@@ -23,7 +23,7 @@
 #include <vector>
 
 extern "C" {
-#include "../vendor/tpcas/src/ast.h"
+#include <ast.h>
 }
 
 namespace dynsys::ir {

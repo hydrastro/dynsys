@@ -48,8 +48,7 @@ SRC_DIR    := src
 # (or pass TPCAS_DIR=/path/to/tpcas) so the flake supplies the source tree.
 # The tpcas source bundles its own curated `vendor/ds` subset.
 TPCAS_DIR  ?=
-DS_ROOT    ?=
-DS_DIR     := $(DS_ROOT)/lib
+DS_DIR     := $(TPCAS_DIR)/vendor/ds/lib
 OBJ_DIR    := $(BUILD_DIR)/obj
 C_OBJ_DIR  := $(BUILD_DIR)/obj-c
 CXX_OBJ_DIR:= $(BUILD_DIR)/obj-cxx
@@ -122,7 +121,7 @@ PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
 PKG_LIBS   := $(shell $(PKG_CONFIG) $(PKG_CONFIG_LIBS_ARGS) $(PKGS) 2>/dev/null)
 
 CPPFLAGS ?=
-CPPFLAGS += -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(DS_ROOT) $(PKG_CFLAGS)
+CPPFLAGS += -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds $(PKG_CFLAGS)
 ifneq ($(strip $(IMGUI_DIR)),)
   CPPFLAGS += -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
 endif
@@ -459,7 +458,7 @@ test-ad: $(AD_TEST_TARGET)
 AD_TPCAS_C := $(TPCAS_DIR)/src/ast.c $(TPCAS_DIR)/src/arena.c \
   $(DS_DIR)/common.c $(DS_DIR)/status.c $(DS_DIR)/error.c \
   $(DS_DIR)/diagnostic.c $(DS_DIR)/context.c $(DS_DIR)/allocators.c
-AD_INCLUDES := -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(DS_ROOT)
+AD_INCLUDES := -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds
 $(AD_TEST_TARGET): $(SRC_DIR)/expr_ir.cpp $(SRC_DIR)/expr_ir_ad.cpp test/ad_smoke.cpp $(AD_TPCAS_C)
 	@$(MKDIR_P) $(dir $@) $(BUILD_DIR)/ad-cobj
 	@for c in $(AD_TPCAS_C); do \
@@ -571,7 +570,7 @@ test-paramsync: $(PARAMSYNC_TEST_TARGET)
 
 $(TEST_OBJ_DIR)/test/paramsync_smoke.o: test/paramsync_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(DS_ROOT) -c test/paramsync_smoke.cpp -o $@
+	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds -c test/paramsync_smoke.cpp -o $@
 
 $(PARAMSYNC_TEST_TARGET): $(PARAMSYNC_OBJS)
 	@$(MKDIR_P) $(dir $@)
@@ -583,7 +582,7 @@ test-eshadow: $(ESHADOW_TEST_TARGET)
 
 $(TEST_OBJ_DIR)/test/e_shadow_smoke.o: test/e_shadow_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(DS_ROOT) -c test/e_shadow_smoke.cpp -o $@
+	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds -c test/e_shadow_smoke.cpp -o $@
 
 $(ESHADOW_TEST_TARGET): $(ESHADOW_OBJS)
 	@$(MKDIR_P) $(dir $@)
@@ -636,7 +635,7 @@ test-ifslit: $(IFSLIT_TEST_TARGET)
 
 $(TEST_OBJ_DIR)/test/ifslit_smoke.o: test/ifslit_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
-	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(DS_ROOT) -c test/ifslit_smoke.cpp -o $@
+	$(CXX) $(CXXSTD) -O2 -I$(SRC_DIR) -I$(TPCAS_DIR)/src -I$(TPCAS_DIR)/vendor/ds -c test/ifslit_smoke.cpp -o $@
 
 $(IFSLIT_TEST_TARGET): $(IFSLIT_OBJS)
 	@$(MKDIR_P) $(dir $@)

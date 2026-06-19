@@ -1,21 +1,21 @@
-# Lizard examples
+# dynsys examples
 
-Run a file through the REPL with stdin redirection:
+Each `.dyn` file describes one dynamical system in the small text format
+documented in the top-level `README.md`. Load one in the GUI from the preset
+list, or run it headless:
 
-```sh
-./lizard < examples/02-recursion.lisp
+```
+./build/dynsys --headless examples/lorenz.dyn --steps 10000
 ```
 
-Or load it interactively by pasting one expression at a time — the
-REPL accumulates lines until parens balance, so multi-line definitions
-work as expected.
-
-Numbered for suggested reading order, but each file is self-contained:
-
-| File | Topics |
-| ---- | ------ |
-| `01-basics.lisp`    | `define`, `lambda`, arithmetic, comparisons, `let`, `set!` |
-| `02-recursion.lisp` | `fact`, `fib`, `gcd`, Ackermann, mutual recursion, bignums |
-| `03-lists.lisp`     | `cons`, `car`, `cdr`, `list`, `null?`, `pair?`, building `map`/`length`/`reverse` |
-| `04-macros.lisp`    | `define-syntax`, quasiquote `` ` ``, unquote `,`, splicing `,@` |
-| `05-control.lisp`   | `if`, `cond` with `else`, `begin`, `and`/`or`/`not` |
+| File | System | Kind |
+|---|---|---|
+| `lorenz.dyn` | Lorenz attractor | ODE, 3-D chaotic |
+| `rossler.dyn` | Rössler attractor | ODE, 3-D chaotic |
+| `thomas.dyn` | Thomas' cyclically symmetric attractor | ODE, 3-D |
+| `four_dimensional_demo.dyn` | A 4-D demo system | ODE, 4-D |
+| `van_der_pol.dyn` | Van der Pol oscillator | ODE, limit cycle |
+| `damped_pendulum.dyn` | Damped pendulum | ODE, 2-D |
+| `lotka_volterra.dyn` | Lotka-Volterra predator-prey | ODE, 2-D |
+| `saddle_separatrix.dyn` | A saddle with separatrices | ODE, 2-D |
+| `henon.dyn` | Hénon map | discrete map |

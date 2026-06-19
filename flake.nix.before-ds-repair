@@ -22,12 +22,6 @@
       url = "github:hydrastro/tpcas";
       flake = false;
     };
-
-    # DS is a separate source dependency of TPCAS.
-    ds-src = {
-      url = "github:hydrastro/ds/9e3224b3aef9b6e271d02b76ff671b1db4301601";
-      flake = false;
-    };
     # Phase E (exact symbolic analysis): the Sangaku proof-carrying CAS and the
     # Lizard interpreter it runs on. The dynsys cas_bridge shells out to the
     # `lizard` binary with Sangaku on the module path for exact eigenvalues,

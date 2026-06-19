@@ -22,12 +22,6 @@
       url = "github:hydrastro/tpcas";
       flake = false;
     };
-
-    # DS is a separate source dependency of TPCAS.
-    ds-src = {
-      url = "github:hydrastro/ds/9e3224b3aef9b6e271d02b76ff671b1db4301601";
-      flake = false;
-    };
     # Phase E (exact symbolic analysis): the Sangaku proof-carrying CAS and the
     # Lizard interpreter it runs on. The dynsys cas_bridge shells out to the
     # `lizard` binary with Sangaku on the module path for exact eigenvalues,
@@ -44,7 +38,7 @@
     };
   };
 
-  outputs = { nixpkgs, imgui, glew-src, lizard, sangaku, tpcas, ds-src, ... }:
+  outputs = { nixpkgs, imgui, glew-src, lizard, sangaku, tpcas, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -110,7 +104,6 @@
             CXX = "clang++";
             IMGUI_DIR = "${imgui}";
             TPCAS_DIR = "${tpcas}";
-            DS_ROOT = "${ds-src}";
             # Phase E: where the cas_bridge finds the CAS. LIZARD is the
             # interpreter binary; SANGAKU_ROOT is the library the launcher
             # feeds (prelude + script). The bridge degrades gracefully to the
@@ -122,7 +115,6 @@
               export CC=clang
               export CXX=clang++
               export TPCAS_DIR=${lib.escapeShellArg "${tpcas}"}
-              export DS_ROOT=${lib.escapeShellArg "${ds-src}"}
               export LIZARD=${lib.escapeShellArg "${lizardBin}/bin/lizard"}
               export SANGAKU_ROOT=${lib.escapeShellArg "${sangakuSrc}"}
               echo "dynsys Dear ImGui native dev shell"
@@ -131,7 +123,6 @@
               echo "  clean: make clean"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  TPCAS_DIR=$TPCAS_DIR"
-              echo "  DS_ROOT=$DS_ROOT"
               echo "  GLEW_DIR=$GLEW_DIR"
               echo "  LIZARD=$LIZARD  (Phase E CAS bridge)"
             '';
@@ -152,7 +143,6 @@
             GLEW_DIR = "${glew-src}";
             CGLM_INCLUDE_DIR = "${lib.getDev pkgs.cglm}/include";
             TPCAS_DIR = "${tpcas}";
-            DS_ROOT = "${ds-src}";
 
             PKG_CONFIG_ALLOW_CROSS = "1";
             PKG_CONFIG_LIBDIR = lib.concatStringsSep ":" [ winPkgConfigPath winPkgConfigSharePath ];
@@ -186,7 +176,6 @@
               export GLEW_DIR=${lib.escapeShellArg "${glew-src}"}
               export CGLM_INCLUDE_DIR=${lib.escapeShellArg "${lib.getDev pkgs.cglm}/include"}
               export TPCAS_DIR=${lib.escapeShellArg "${tpcas}"}
-              export DS_ROOT=${lib.escapeShellArg "${ds-src}"}
               echo "dynsys Windows cross-build shell"
               echo "  target: ${winTarget}"
               echo "  build:  make windows"
@@ -194,8 +183,6 @@
               echo "  output: build/windows/dynsys.exe"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  GLEW_DIR=$GLEW_DIR"
-              echo "  TPCAS_DIR=$TPCAS_DIR"
-              echo "  DS_ROOT=$DS_ROOT"
             '';
           };
         });

@@ -1,5 +1,58 @@
 {
   "nodes": {
+    "ds": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1739704346,
+        "narHash": "sha256-n1ErSLEiupwPbPkfaEKRwqSQsrfAuEZSrjlesRHyq74=",
+        "owner": "hydrastro",
+        "repo": "ds",
+        "rev": "688cc2e0f5de9d8af1ef28b07a284423c7241a2c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hydrastro",
+        "repo": "ds",
+        "type": "github"
+      }
+    },
+    "ds-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1780346483,
+        "narHash": "sha256-RZtWDYuNeCf8lIfhf0l7H+PLTR8knUX2cYZneBDQ7K0=",
+        "owner": "hydrastro",
+        "repo": "ds",
+        "rev": "9e3224b3aef9b6e271d02b76ff671b1db4301601",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hydrastro",
+        "repo": "ds",
+        "rev": "9e3224b3aef9b6e271d02b76ff671b1db4301601",
+        "type": "github"
+      }
+    },
+    "flake-utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
     "glew-src": {
       "flake": false,
       "locked": {
@@ -30,7 +83,44 @@
         "type": "github"
       }
     },
+    "lizard": {
+      "inputs": {
+        "ds": "ds",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1781019048,
+        "narHash": "sha256-tt59Pvv6LGhwEYMrOHtMOV7Xb3praNP3L4hQDtDxCdo=",
+        "owner": "hydrastro",
+        "repo": "lizard",
+        "rev": "6a2482b9c3123111974acf41b16bf3987aefd096",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hydrastro",
+        "repo": "lizard",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
+      "locked": {
+        "lastModified": 1739482815,
+        "narHash": "sha256-/5Lwtmp/8j+ro32gXzitucSdyjJ6QehfJCL58WNA7N0=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "ba0939c506a03c60a765cd7f7c43794816540eec",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
       "locked": {
         "lastModified": 1739482815,
         "narHash": "sha256-/5Lwtmp/8j+ro32gXzitucSdyjJ6QehfJCL58WNA7N0=",
@@ -48,9 +138,68 @@
     },
     "root": {
       "inputs": {
+        "ds-src": "ds-src",
         "glew-src": "glew-src",
         "imgui": "imgui",
-        "nixpkgs": "nixpkgs"
+        "lizard": "lizard",
+        "nixpkgs": "nixpkgs_2",
+        "sangaku": "sangaku",
+        "tpcas": "tpcas"
+      }
+    },
+    "sangaku": {
+      "inputs": {
+        "flake-utils": "flake-utils",
+        "lizard": [
+          "lizard"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1780912732,
+        "narHash": "sha256-YFwoC7wDun4F4TLzLRQs31Q/jS32CNBNCU8JYV/r+Dw=",
+        "owner": "hydrastro",
+        "repo": "sangaku",
+        "rev": "fd67ab699d6e23436b7f49350762d8e6cd36b8ce",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hydrastro",
+        "repo": "sangaku",
+        "type": "github"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
+    "tpcas": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1781872541,
+        "narHash": "sha256-bIV3/BNOB8pX/uLLLTP9wvXcChf12J1g5rVE9tgr5Gg=",
+        "owner": "hydrastro",
+        "repo": "tpcas",
+        "rev": "f10e9b0c3bcc4021d6510e6910e6966ade05198e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hydrastro",
+        "repo": "tpcas",
+        "type": "github"
       }
     }
   },
