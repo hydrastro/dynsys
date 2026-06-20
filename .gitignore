@@ -1,4 +1,4 @@
-# Build output (provided by `make`; never committed)
+# Build output (produced by `make`; never committed)
 build/
 result
 result-*

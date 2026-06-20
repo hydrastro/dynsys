@@ -46,9 +46,19 @@ SRC_DIR    := src
 # TPCAS_DIR is provided by the Nix flake (the `tpcas` input), exactly like
 # IMGUI_DIR / GLEW_DIR. The repo no longer vendors tpcas; run `nix develop`
 # (or pass TPCAS_DIR=/path/to/tpcas) so the flake supplies the source tree.
-# The tpcas source bundles its own curated `vendor/ds` subset.
+# The tpcas source bundles its own `ds` data-structures library (as a git
+# submodule). Its location inside the tpcas tree can vary, and all its headers
+# are included as "lib/<name>.h", so we DISCOVER the directory containing
+# lib/context.h at make-time (searching the whole tree, shallowest match wins)
+# and use its parent as the include root. Works regardless of submodule nesting.
 TPCAS_DIR  ?=
+# DS_ROOT may be supplied explicitly (e.g. a separate `ds` checkout, or a flake
+# input); otherwise we auto-detect it under TPCAS_DIR by finding lib/context.h.
 DS_ROOT    ?=
+ifeq ($(strip $(DS_ROOT)),)
+DS_CONTEXT := $(if $(strip $(TPCAS_DIR)),$(shell find -L "$(TPCAS_DIR)" -type f -path '*/lib/context.h' -printf '%d %p\n' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-))
+DS_ROOT    := $(patsubst %/lib/context.h,%,$(DS_CONTEXT))
+endif
 DS_DIR     := $(DS_ROOT)/lib
 OBJ_DIR    := $(BUILD_DIR)/obj
 C_OBJ_DIR  := $(BUILD_DIR)/obj-c
@@ -292,9 +302,27 @@ check-deps:
 	fi
 	@test -f "$(TPCAS_DIR)/src/pratt.c" || { \
 	  echo "error: TPCAS_DIR does not point at a tpcas source tree: $(TPCAS_DIR)" >&2; \
-	  echo "      (expected $(TPCAS_DIR)/src/pratt.c and a bundled vendor/ds)" >&2; \
+	  echo "      (expected $(TPCAS_DIR)/src/pratt.c)" >&2; \
 	  exit 1; \
 	}
+	@if [ -z "$(strip $(DS_ROOT))" ] || [ ! -f "$(DS_ROOT)/lib/context.h" ]; then \
+	  echo "error: could not locate the tpcas 'ds' library under $(TPCAS_DIR)" >&2; \
+	  echo "      (searched for */lib/context.h; ds is a git submodule of tpcas)" >&2; \
+	  echo "what is actually there:" >&2; \
+	  ls -la "$(TPCAS_DIR)" 2>/dev/null | sed 's/^/      /' >&2; \
+	  found=$$(find -L "$(TPCAS_DIR)" -maxdepth 4 -type d -name ds 2>/dev/null); \
+	  if [ -n "$$found" ]; then \
+	    echo "      (found a 'ds' dir but no lib/context.h in it — the submodule is present but EMPTY:" >&2; \
+	    echo "       $$found )" >&2; \
+	    echo "fix: the ds submodule did not populate. Re-lock so Nix fetches it:" >&2; \
+	    echo "       nix flake lock --update-input tpcas   (the flake uses submodules=1)" >&2; \
+	  else \
+	    echo "fix: point DS_ROOT at a ds checkout, e.g.  make DS_ROOT=/path/to/ds" >&2; \
+	    echo "     or ensure tpcas was fetched with its ds submodule." >&2; \
+	  fi; \
+	  exit 1; \
+	fi
+	@echo "deps OK: TPCAS_DIR=$(TPCAS_DIR)  DS_ROOT=$(DS_ROOT)"
 
 check-legacy:
 	@if [ -f "$(SRC_DIR)/dynsys.c" ]; then \
@@ -928,4 +956,3 @@ $(PROJSOLID_TEST_TARGET): test/projsolid_smoke.cpp
 $(BRIDGEALIGN_TEST_TARGET): test/bridge_align_smoke.cpp
 	@$(MKDIR_P) $(dir $@)
 	$(CXX) $(CXXSTD) $(WARNINGS_CXX) -O2 test/bridge_align_smoke.cpp -o $@ -lm
-

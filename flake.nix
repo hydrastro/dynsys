@@ -1,42 +1,42 @@
 {
-  description = "Development shells for the dynsys TPCAS + Dear ImGui visualizer";
+  description = "dynsys — dynamical-system visualizer and analysis toolkit";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
     imgui = {
       url = "github:ocornut/imgui/v1.92.8";
       flake = false;
     };
-    # Use the official release archive, not the GitHub source checkout.
-    # The GitHub checkout does not contain the generated src/glew.c file
-    # needed by this project's simple Windows static GLEW build.
+
+    # The official release archive contains the generated src/glew.c needed by
+    # the MinGW static build. The GitHub source checkout does not.
     glew-src = {
       url = "https://downloads.sourceforge.net/project/glew/glew/2.2.0/glew-2.2.0.tgz";
       flake = false;
     };
-    # The TPCAS typed parser/CAS frontend that dynsys compiles in (it bundles
-    # its own curated vendor/ds subset). Sourced through the flake so the repo
-    # vendors no third-party code itself. NOTE: confirm this URL/ref points at
-    # the canonical tpcas repo (and that it is pushed) before relying on it.
+
+    # dynsys currently compiles the small TPCAS frontend directly from source.
     tpcas = {
-      url = "github:hydrastro/tpcas";
+      url = "git+https://github.com/hydrastro/tpcas?rev=4ede7411a5f82f91c114b9b09784a4d06d154b25&submodules=1";
       flake = false;
     };
 
-    # DS is a separate source dependency of TPCAS.
+    # TPCAS no longer vendors ds. Keep the source revision aligned with the ds
+    # revision in the locked TPCAS flake and pass it to the existing Makefile as
+    # DS_ROOT.
     ds-src = {
       url = "github:hydrastro/ds/9e3224b3aef9b6e271d02b76ff671b1db4301601";
       flake = false;
     };
-    # Phase E (exact symbolic analysis): the Sangaku proof-carrying CAS and the
-    # Lizard interpreter it runs on. The dynsys cas_bridge shells out to the
-    # `lizard` binary with Sangaku on the module path for exact eigenvalues,
-    # equilibria, and certified derivatives. Lizard's own flake pulls its C
-    # dependencies (ds + gmp), so we don't re-declare them here.
+
+    # Optional exact-symbolic runtime. It is deliberately kept out of the
+    # default shell/package so a Lizard failure cannot block the core build.
     lizard = {
       url = "github:hydrastro/lizard";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
     sangaku = {
       url = "github:hydrastro/sangaku";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -44,31 +44,137 @@
     };
   };
 
-  outputs = { nixpkgs, imgui, glew-src, lizard, sangaku, tpcas, ds-src, ... }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      imgui,
+      glew-src,
+      tpcas,
+      ds-src,
+      lizard,
+      sangaku,
+      ...
+    }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-    in {
-      devShells = forAllSystems (system:
+
+      mkPkgs = system: import nixpkgs { inherit system; };
+
+      commonBuildInputs = pkgs: [
+        pkgs.cglm
+        pkgs.glew
+        pkgs.glfw3
+        pkgs.libGL
+        pkgs.xorg.libX11
+        pkgs.xorg.libXcursor
+        pkgs.xorg.libXi
+        pkgs.xorg.libXinerama
+        pkgs.xorg.libXrandr
+      ];
+
+      mkDynsys =
+        system:
         let
-          pkgs = import nixpkgs { inherit system; };
-          # Some useful cross packages are blocked only by nixpkgs metadata,
-          # not by the actual MinGW build. Keep the normal native shell strict,
-          # but allow unsupported host platforms for the Windows cross package set.
+          pkgs = mkPkgs system;
+        in
+        pkgs.stdenv.mkDerivation {
+          pname = "dynsys";
+          version = "0.1.0";
+          src = ./.;
+
+          strictDeps = true;
+          enableParallelBuilding = true;
+
+          nativeBuildInputs = [
+            pkgs.gnumake
+            pkgs.pkg-config
+          ];
+          buildInputs = commonBuildInputs pkgs;
+
+          IMGUI_DIR = "${imgui}";
+          TPCAS_DIR = "${tpcas}";
+          DS_ROOT = "${ds-src}";
+
+          makeFlags = [ "MODE=release" ];
+
+          installPhase = ''
+            runHook preInstall
+            make install MODE=release PREFIX="$out"
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "Interactive visualizer and analyzer for dynamical systems";
+            homepage = "https://github.com/hydrastro/dynsys";
+            mainProgram = "dynsys";
+            platforms = systems;
+          };
+        };
+    in
+    {
+      packages = forAllSystems (system: rec {
+        dynsys = mkDynsys system;
+        default = dynsys;
+      });
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/dynsys";
+        };
+      });
+
+      checks = forAllSystems (system: {
+        package = self.packages.${system}.default;
+      });
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = mkPkgs system;
+          lib = pkgs.lib;
+          hasLizard = builtins.hasAttr system lizard.packages;
+          lizardBin =
+            if hasLizard then
+              lizard.packages.${system}.default or lizard.defaultPackage.${system}
+            else
+              null;
+
+          nativeTools = [
+            pkgs.clang
+            pkgs.clang-tools
+            pkgs.gdb
+            pkgs.gnumake
+            pkgs.pkg-config
+          ];
+
+          mkNativeShell =
+            extraPackages: extraAttrs:
+            pkgs.mkShell (
+              {
+                inputsFrom = [ self.packages.${system}.default ];
+                packages = nativeTools ++ extraPackages;
+
+                CC = "clang";
+                CXX = "clang++";
+                IMGUI_DIR = "${imgui}";
+                TPCAS_DIR = "${tpcas}";
+                DS_ROOT = "${ds-src}";
+              }
+              // extraAttrs
+            );
+
           pkgsAllowUnsupported = import nixpkgs {
             inherit system;
             config.allowUnsupportedSystem = true;
           };
-          lib = pkgs.lib;
-          # Phase E CAS bridge: the Lizard interpreter binary and the Sangaku
-          # library source. lizardBin/bin/lizard runs Sangaku Lisp; sangakuSrc
-          # is the library root (so SANGAKU_ROOT points the launcher at it).
-          lizardBin = lizard.packages.${system}.default or lizard.defaultPackage.${system};
-          sangakuSrc = sangaku;
           winPkgs = pkgsAllowUnsupported.pkgsCross.mingwW64;
           winTarget = winPkgs.stdenv.hostPlatform.config;
-          # Force GLFW to be built as a static MinGW library so the final
-          # executable does not need a glfw3.dll next to it.
           winGlfwStatic = winPkgs.glfw3.overrideAttrs (old: {
             cmakeFlags = (old.cmakeFlags or [ ]) ++ [
               "-DBUILD_SHARED_LIBS=OFF"
@@ -77,70 +183,26 @@
               "-DGLFW_BUILD_TESTS=OFF"
             ];
           });
-          winTargetPkgs = [
+          winTargetPkgOutputs = [
             winGlfwStatic
+            (lib.getDev winGlfwStatic)
           ];
-          winTargetPkgOutputs = winTargetPkgs ++ (map lib.getDev winTargetPkgs);
           winPkgConfigPath = lib.makeSearchPath "lib/pkgconfig" winTargetPkgOutputs;
           winPkgConfigSharePath = lib.makeSearchPath "share/pkgconfig" winTargetPkgOutputs;
-        in {
-          default = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
-              clang
-              clang-tools
-              gdb
-              gnumake
-              pkg-config
-              lizardBin
-            ];
-
-            buildInputs = with pkgs; [
-              cglm
-              glew
-              glfw3
-              libGL
-              xorg.libX11
-              xorg.libXcursor
-              xorg.libXi
-              xorg.libXinerama
-              xorg.libXrandr
-            ];
-
-            CC = "clang";
-            CXX = "clang++";
-            IMGUI_DIR = "${imgui}";
-            TPCAS_DIR = "${tpcas}";
-            DS_ROOT = "${ds-src}";
-            # Phase E: where the cas_bridge finds the CAS. LIZARD is the
-            # interpreter binary; SANGAKU_ROOT is the library the launcher
-            # feeds (prelude + script). The bridge degrades gracefully to the
-            # numeric path if these are unset / the binary is absent.
-            LIZARD = "${lizardBin}/bin/lizard";
-            SANGAKU_ROOT = "${sangakuSrc}";
-
+        in
+        {
+          default = mkNativeShell [ ] {
             shellHook = ''
-              export CC=clang
-              export CXX=clang++
-              export TPCAS_DIR=${lib.escapeShellArg "${tpcas}"}
-              export DS_ROOT=${lib.escapeShellArg "${ds-src}"}
-              export LIZARD=${lib.escapeShellArg "${lizardBin}/bin/lizard"}
-              export SANGAKU_ROOT=${lib.escapeShellArg "${sangakuSrc}"}
-              echo "dynsys Dear ImGui native dev shell"
-              echo "  build: make"
-              echo "  run:   make run"
-              echo "  clean: make clean"
+              echo "dynsys native development shell"
+              echo "  build package: nix build"
+              echo "  development:   make"
+              echo "  run:           make run"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  TPCAS_DIR=$TPCAS_DIR"
               echo "  DS_ROOT=$DS_ROOT"
-              echo "  GLEW_DIR=$GLEW_DIR"
-              echo "  LIZARD=$LIZARD  (Phase E CAS bridge)"
             '';
           };
 
-          # Native NixOS shell containing a MinGW-w64 cross compiler and
-          # Windows-target GLFW pkg-config files. GLEW is built from source by
-          # the Makefile for Windows because nixpkgs marks winPkgs.glew
-          # unsupported for MinGW. cglm is also used as headers only.
           windows = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.gnumake
@@ -155,7 +217,10 @@
             DS_ROOT = "${ds-src}";
 
             PKG_CONFIG_ALLOW_CROSS = "1";
-            PKG_CONFIG_LIBDIR = lib.concatStringsSep ":" [ winPkgConfigPath winPkgConfigSharePath ];
+            PKG_CONFIG_LIBDIR = lib.concatStringsSep ":" [
+              winPkgConfigPath
+              winPkgConfigSharePath
+            ];
             PKG_CONFIG_SYSROOT_DIR = "";
             PKG_CONFIG_ALLOW_SYSTEM_LIBS = "1";
             PKG_CONFIG_ALLOW_SYSTEM_CFLAGS = "1";
@@ -170,27 +235,9 @@
             WIN_PKG_CONFIG = "pkg-config";
 
             shellHook = ''
-              export CC=${winTarget}-gcc
-              export CXX=${winTarget}-g++
-              export AR=${winTarget}-ar
-              export WIN_TRIPLE=${winTarget}
-              export WIN_CC=${winTarget}-gcc
-              export WIN_CXX=${winTarget}-g++
-              export WIN_AR=${winTarget}-ar
-              export WIN_PKG_CONFIG=pkg-config
-              export PKG_CONFIG_ALLOW_CROSS=1
-              export PKG_CONFIG_LIBDIR=${lib.escapeShellArg (lib.concatStringsSep ":" [ winPkgConfigPath winPkgConfigSharePath ])}
-              export PKG_CONFIG_SYSROOT_DIR=
-              export PKG_CONFIG_ALLOW_SYSTEM_LIBS=1
-              export PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1
-              export GLEW_DIR=${lib.escapeShellArg "${glew-src}"}
-              export CGLM_INCLUDE_DIR=${lib.escapeShellArg "${lib.getDev pkgs.cglm}/include"}
-              export TPCAS_DIR=${lib.escapeShellArg "${tpcas}"}
-              export DS_ROOT=${lib.escapeShellArg "${ds-src}"}
               echo "dynsys Windows cross-build shell"
               echo "  target: ${winTarget}"
               echo "  build:  make windows"
-              echo "  link:   static MinGW runtime + static GLFW/GLEW; Windows system DLLs remain system-provided"
               echo "  output: build/windows/dynsys.exe"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  GLEW_DIR=$GLEW_DIR"
@@ -198,10 +245,25 @@
               echo "  DS_ROOT=$DS_ROOT"
             '';
           };
-        });
+        }
+        // lib.optionalAttrs hasLizard {
+          cas = mkNativeShell [ lizardBin ] {
+            LIZARD = "${lizardBin}/bin/lizard";
+            SANGAKU_ROOT = "${sangaku}";
 
-      formatter = forAllSystems (system:
-        let pkgs = import nixpkgs { inherit system; };
-        in pkgs.nixfmt-rfc-style);
+            shellHook = ''
+              echo "dynsys development shell with exact-symbolic CAS support"
+              echo "  build:        make"
+              echo "  run:          make run"
+              echo "  LIZARD=$LIZARD"
+              echo "  SANGAKU_ROOT=$SANGAKU_ROOT"
+              echo "  TPCAS_DIR=$TPCAS_DIR"
+              echo "  DS_ROOT=$DS_ROOT"
+            '';
+          };
+        }
+      );
+
+      formatter = forAllSystems (system: (mkPkgs system).nixfmt-rfc-style);
     };
 }

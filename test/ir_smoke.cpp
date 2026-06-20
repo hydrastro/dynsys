@@ -8,21 +8,15 @@
  *      memoization path (a 0-arity def referenced multiple times),
  *      and select's lazy semantics.
  *
- * Build (from project root):
- *   g++ -std=c++17 -O2 -Wall -Wextra \
- *       -Ivendor/tpcas/src -Ivendor/tpcas/vendor/ds \
- *       src/expr_ir.cpp test/ir_smoke.cpp \
- *       vendor/tpcas/src/arena.c vendor/tpcas/src/ast.c \
- *       vendor/tpcas/src/lex.c   vendor/tpcas/src/pratt.c \
- *       vendor/tpcas/vendor/ds/lib/<all .c files> \
- *       -o build/ir_smoke
+ * Build (from project root, with the Nix development shell active):
+ *   make ir-smoke
  */
 
 #include "../src/expr_ir.h"
 
 extern "C" {
-#include "../vendor/tpcas/src/arena.h"
-#include "../vendor/tpcas/src/pratt.h"
+#include <arena.h>
+#include <pratt.h>
 }
 
 #include <cmath>

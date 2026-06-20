@@ -189,17 +189,20 @@
     "tpcas": {
       "flake": false,
       "locked": {
-        "lastModified": 1781872541,
-        "narHash": "sha256-bIV3/BNOB8pX/uLLLTP9wvXcChf12J1g5rVE9tgr5Gg=",
-        "owner": "hydrastro",
-        "repo": "tpcas",
-        "rev": "f10e9b0c3bcc4021d6510e6910e6966ade05198e",
-        "type": "github"
+        "lastModified": 1780348688,
+        "narHash": "sha256-dmp1MULIu/CinYBrxohWOUMqicqvKN2nJQneSlvNfU8=",
+        "ref": "refs/heads/master",
+        "rev": "4ede7411a5f82f91c114b9b09784a4d06d154b25",
+        "revCount": 15,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/hydrastro/tpcas"
       },
       "original": {
-        "owner": "hydrastro",
-        "repo": "tpcas",
-        "type": "github"
+        "rev": "4ede7411a5f82f91c114b9b09784a4d06d154b25",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/hydrastro/tpcas"
       }
     }
   },
