@@ -1,0 +1,46 @@
+--- a/src/lex.c
++++ b/src/lex.c
+@@ -95,6 +95,28 @@
+ 
+     char c = l->src[l->pos];
+ 
++    /* Decimal/scientific constants used by .dyn models. Scan before
++     * punctuation so .5 remains one token; a standalone dot is unchanged. */
++    if (isdigit((unsigned char)c) ||
++        (c == '.' && isdigit((unsigned char)peek_ch(l, 1)))) {
++        while (isdigit((unsigned char)peek_ch(l, 0))) advance(l);
++        if (peek_ch(l, 0) == '.') {
++            advance(l);
++            while (isdigit((unsigned char)peek_ch(l, 0))) advance(l);
++        }
++        if (peek_ch(l, 0) == 'e' || peek_ch(l, 0) == 'E') {
++            advance(l);
++            if (peek_ch(l, 0) == '+' || peek_ch(l, 0) == '-') advance(l);
++            if (!isdigit((unsigned char)peek_ch(l, 0)))
++                return mk_err(make_span(l, start, sline, scol),
++                              "expected digits in numeric exponent");
++            while (isdigit((unsigned char)peek_ch(l, 0))) advance(l);
++        }
++        char *lex = arena_strndup(l->arena, l->src + start, l->pos - start);
++        if (!lex) return mk_err(make_span(l, start, sline, scol), "out of memory");
++        return mk_tok(TOK_NUMBER, make_span(l, start, sline, scol), lex);
++    }
++
+     /* single-char punctuation */
+     if (c == '(') { advance(l); return mk_tok(TOK_LPAREN,    make_span(l,start,sline,scol), "("); }
+     if (c == ')') { advance(l); return mk_tok(TOK_RPAREN,    make_span(l,start,sline,scol), ")"); }
+@@ -119,14 +141,6 @@
+         return t;
+     }
+ 
+-    /* number */
+-    if (isdigit((unsigned char)c)) {
+-        while (l->pos < l->len && isdigit((unsigned char)l->src[l->pos])) advance(l);
+-        size_t n = l->pos - start;
+-        char *lex = arena_strndup(l->arena, l->src + start, n);
+-        return mk_tok(TOK_NUMBER, make_span(l, start, sline, scol), lex);
+-    }
+-
+     /* identifier */
+     if (isalpha((unsigned char)c) || c == '_') {
+         while (l->pos < l->len &&

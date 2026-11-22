@@ -16,17 +16,16 @@
       flake = false;
     };
 
-    # dynsys currently compiles the small TPCAS frontend directly from source.
+    # Requires the TPCAS DSA migration. Refresh this input after publishing it.
     tpcas = {
-      url = "git+https://github.com/hydrastro/tpcas?rev=4ede7411a5f82f91c114b9b09784a4d06d154b25&submodules=1";
+      url = "github:hydrastro/tpcas";
       flake = false;
     };
 
-    # TPCAS no longer vendors ds. Keep the source revision aligned with the ds
-    # revision in the locked TPCAS flake and pass it to the existing Makefile as
-    # DS_ROOT.
-    ds-src = {
-      url = "github:hydrastro/ds/9e3224b3aef9b6e271d02b76ff671b1db4301601";
+    # Build DSA separately; after the rename change the owner/repo to
+    # hydrastro/dsa and refresh this input's lock.
+    dsa-src = {
+      url = "github:hydrastro/ds/909b4a462410b190db2488cb0fac7fca088af81c";
       flake = false;
     };
 
@@ -51,7 +50,7 @@
       imgui,
       glew-src,
       tpcas,
-      ds-src,
+      dsa-src,
       lizard,
       sangaku,
       ...
@@ -64,6 +63,33 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
       mkPkgs = system: import nixpkgs { inherit system; };
+
+      # Use DSA's build system, keeping its Unicode generator on the build
+      # machine when targeting MinGW. Windows omits the two POSIX I/O adapters.
+      mkDsa = pkgs: pkgs.stdenv.mkDerivation {
+        pname = "dsa";
+        version = "909b4a4";
+        src = dsa-src;
+        nativeBuildInputs = [ pkgs.buildPackages.gnumake ];
+        dontConfigure = true;
+        buildPhase = ''
+          runHook preBuild
+          make build/tools/gen_ucd CC=${pkgs.buildPackages.stdenv.cc}/bin/cc
+          ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isWindows ''
+            sources=$(find src/core src/structures src/algorithms -name '*.c' ! -name posix_store.c ! -name str_io_posix.c | sort | tr '\n' ' ')
+          ''}
+          make build/libdsa.a CC="$CC" AR="$AR" \
+            ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isWindows ''LIB_SRC="$sources"''}
+          runHook postBuild
+        '';
+        installPhase = ''
+          runHook preInstall
+          mkdir -p "$out/include" "$out/lib"
+          cp -R include/. "$out/include/"
+          cp build/libdsa.a "$out/lib/"
+          runHook postInstall
+        '';
+      };
 
       commonBuildInputs = pkgs: [
         pkgs.cglm
@@ -92,15 +118,18 @@
 
           nativeBuildInputs = [
             pkgs.gnumake
+            pkgs.patch
             pkgs.pkg-config
           ];
           buildInputs = commonBuildInputs pkgs;
 
           IMGUI_DIR = "${imgui}";
           TPCAS_DIR = "${tpcas}";
-          DS_ROOT = "${ds-src}";
+          DSA_ROOT = "${mkDsa pkgs}";
 
           makeFlags = [ "MODE=release" ];
+          doCheck = true;
+          checkTarget = "test";
 
           installPhase = ''
             runHook preInstall
@@ -150,6 +179,7 @@
             pkgs.clang-tools
             pkgs.gdb
             pkgs.gnumake
+            pkgs.patch
             pkgs.pkg-config
           ];
 
@@ -164,7 +194,7 @@
                 CXX = "clang++";
                 IMGUI_DIR = "${imgui}";
                 TPCAS_DIR = "${tpcas}";
-                DS_ROOT = "${ds-src}";
+                DSA_ROOT = "${mkDsa pkgs}";
               }
               // extraAttrs
             );
@@ -199,13 +229,14 @@
               echo "  run:           make run"
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  TPCAS_DIR=$TPCAS_DIR"
-              echo "  DS_ROOT=$DS_ROOT"
+              echo "  DSA_ROOT=$DSA_ROOT"
             '';
           };
 
           windows = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.gnumake
+              pkgs.patch
               pkgs.pkg-config
               winPkgs.stdenv.cc
             ];
@@ -214,7 +245,7 @@
             GLEW_DIR = "${glew-src}";
             CGLM_INCLUDE_DIR = "${lib.getDev pkgs.cglm}/include";
             TPCAS_DIR = "${tpcas}";
-            DS_ROOT = "${ds-src}";
+            DSA_ROOT = "${mkDsa winPkgs}";
 
             PKG_CONFIG_ALLOW_CROSS = "1";
             PKG_CONFIG_LIBDIR = lib.concatStringsSep ":" [
@@ -242,7 +273,7 @@
               echo "  IMGUI_DIR=$IMGUI_DIR"
               echo "  GLEW_DIR=$GLEW_DIR"
               echo "  TPCAS_DIR=$TPCAS_DIR"
-              echo "  DS_ROOT=$DS_ROOT"
+              echo "  DSA_ROOT=$DSA_ROOT"
             '';
           };
         }
@@ -258,7 +289,7 @@
               echo "  LIZARD=$LIZARD"
               echo "  SANGAKU_ROOT=$SANGAKU_ROOT"
               echo "  TPCAS_DIR=$TPCAS_DIR"
-              echo "  DS_ROOT=$DS_ROOT"
+              echo "  DSA_ROOT=$DSA_ROOT"
             '';
           };
         }

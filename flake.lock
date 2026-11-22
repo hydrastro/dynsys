@@ -18,20 +18,20 @@
         "type": "github"
       }
     },
-    "ds-src": {
+    "dsa-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1780346483,
-        "narHash": "sha256-RZtWDYuNeCf8lIfhf0l7H+PLTR8knUX2cYZneBDQ7K0=",
+        "lastModified": 1795130373,
+        "narHash": "sha256-q23XMvYg6GEA5m9xyTwgJu1QglDTz+6PzMJAWHIPDVU=",
         "owner": "hydrastro",
         "repo": "ds",
-        "rev": "9e3224b3aef9b6e271d02b76ff671b1db4301601",
+        "rev": "909b4a462410b190db2488cb0fac7fca088af81c",
         "type": "github"
       },
       "original": {
         "owner": "hydrastro",
         "repo": "ds",
-        "rev": "9e3224b3aef9b6e271d02b76ff671b1db4301601",
+        "rev": "909b4a462410b190db2488cb0fac7fca088af81c",
         "type": "github"
       }
     },
@@ -138,7 +138,7 @@
     },
     "root": {
       "inputs": {
-        "ds-src": "ds-src",
+        "dsa-src": "dsa-src",
         "glew-src": "glew-src",
         "imgui": "imgui",
         "lizard": "lizard",
@@ -189,20 +189,17 @@
     "tpcas": {
       "flake": false,
       "locked": {
-        "lastModified": 1780348688,
-        "narHash": "sha256-dmp1MULIu/CinYBrxohWOUMqicqvKN2nJQneSlvNfU8=",
-        "ref": "refs/heads/master",
-        "rev": "4ede7411a5f82f91c114b9b09784a4d06d154b25",
-        "revCount": 15,
-        "submodules": true,
-        "type": "git",
-        "url": "https://github.com/hydrastro/tpcas"
+        "lastModified": 1781993023,
+        "narHash": "sha256-tXaCSb4zu6xHYQN+0kRlnHc+Mvu8TK72RbJpbcsJfNs=",
+        "owner": "hydrastro",
+        "repo": "tpcas",
+        "rev": "7849f7bbc1656a36f784189bf29b405a21f2987b",
+        "type": "github"
       },
       "original": {
-        "rev": "4ede7411a5f82f91c114b9b09784a4d06d154b25",
-        "submodules": true,
-        "type": "git",
-        "url": "https://github.com/hydrastro/tpcas"
+        "owner": "hydrastro",
+        "repo": "tpcas",
+        "type": "github"
       }
     }
   },

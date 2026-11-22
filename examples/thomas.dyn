@@ -6,7 +6,6 @@ param b = 0.208186 [0,1]
 wave(u) = sin(u)
 
 plot3d = x, y, z
-plot2d = x, y
 
 initial x = 0.1
 initial y = 0

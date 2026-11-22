@@ -7,7 +7,6 @@ param b = 0.2 [0,1]
 param c = 5.7 [0,20]
 
 plot3d = x, y, z
-plot2d = x, y
 
 initial x = 0.1
 initial y = 0

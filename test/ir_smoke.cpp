@@ -181,6 +181,15 @@ int main() {
     check(s, "0",       0.0);
     check(s, "1",       1.0);
     check(s, "3.14",    3.14);
+    check(s, ".5",      0.5);
+    check(s, "1.",      1.0);
+    check(s, "1e-3",    0.001);
+    check(s, "2.5E+2",  250.0);
+    check(s, "-0.04",  -0.04);
+    check(s, "-2 * (3 + 1)", -8.0);
+    check_err(s, "1e", "exponent");
+    check_err(s, "1e+", "exponent");
+    check_err(s, "1.2.3", "unexpected");
     check(s, "x",       1.5);
     check(s, "y",       2.5);
     check(s, "z",       3.5);

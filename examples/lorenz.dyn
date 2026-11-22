@@ -7,7 +7,6 @@ param rho = 28 [0,100]
 param beta = 8 / 3 [0,10]
 
 plot3d = x, y, z
-plot2d = x, z
 observe r = sqrt(x*x + y*y + z*z)
 
 section = z - 27

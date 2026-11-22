@@ -68,24 +68,54 @@ available — computes exact eigenvalues and certified derivatives.
 
 ## Build
 
-Dependencies are provided **entirely through the Nix flake** — Dear ImGui, GLEW,
-GLFW, cglm, the OpenGL/X libraries, the TPCAS parser frontend, and the Lizard +
-Sangaku CAS. The repository vendors no third-party source itself.
+The Nix flake provides Dear ImGui, GLEW, GLFW, cglm, OpenGL/X libraries,
+TPCAS and DSA. Lizard + Sangaku are optional, available through the `cas` shell.
+The repository contains no bundled dependency sources.
 
 ```sh
-nix develop        # dev shell; exports IMGUI_DIR, TPCAS_DIR, DS_CFLAGS/DS_LIBS, LIZARD, SANGAKU_ROOT
+nix flake update tpcas # required once your TPCAS migration is pushed
+nix develop        # exports IMGUI_DIR, TPCAS_DIR and DSA_ROOT
 make               # builds build/dynsys
-make run           # or ./build/dynsys
-make clean
+make test          # parser/IR and numeric smoke suites; no display required
+make run
 ```
 
-To build without the dev shell, supply the same variables by hand (the Makefile
-checks they are set and errors with a hint otherwise):
+Without Nix, install GLFW/GLEW/cglm/OpenGL development packages and `patch`,
+then prepare the pinned dependencies separately:
 
 ```sh
-make IMGUI_DIR=/path/to/imgui TPCAS_DIR=/path/to/tpcas \
-     DS_CFLAGS=-I/path/to/ds/include DS_LIBS='-L/path/to/ds/lib -lds'
+git clone https://github.com/hydrastro/ds.git ../dsa
+git -C ../dsa checkout 909b4a462410b190db2488cb0fac7fca088af81c
+make -C ../dsa
+git clone https://github.com/hydrastro/tpcas.git ../tpcas
+# TPCAS must include the latest DSA migration patch.
+git clone --depth 1 --branch v1.92.8 https://github.com/ocornut/imgui.git ../imgui
+make MODE=release TPCAS_DIR=../tpcas DSA_ROOT=../dsa IMGUI_DIR=../imgui
+make MODE=release test TPCAS_DIR=../tpcas DSA_ROOT=../dsa
 ```
+
+TPCAS must contain the DSA migration patch supplied earlier. The build copies
+its sources into `build/tpcas/` and applies
+[`patches/tpcas-numbers.patch`](patches/tpcas-numbers.patch), which adds decimal
+and scientific numeric literals required by `.dyn` expressions. Your supplied
+checkout is never modified. Unary minus comes from the migrated TPCAS parser.
+
+The committed TPCAS lock still identifies the last published source revision.
+After pushing your TPCAS migration, run `nix flake update tpcas` and commit the
+refreshed lock. Until then, use your patched checkout via `TPCAS_DIR`, or run
+`nix develop --override-input tpcas path:/absolute/path/to/tpcas`.
+
+`DSA_ROOT` accepts a built checkout or installation prefix. Leave it unset to
+use `pkg-config dsa`, or set `DSA_CFLAGS` and `DSA_LIBS` explicitly. `DS_ROOT`
+is a legacy alias for `DSA_ROOT`. DSA is linked as `libdsa`; its source files
+are no longer compiled into dynsys. Start with a clean build when changing
+compiler flags or use `BUILD_ROOT=build-asan` / `build-installed` to keep builds
+separate. Tests honour `MODE=asan` as well as the normal build modes.
+
+The DSA repository is still named `hydrastro/ds`. After the rename, change the
+clone URL and the `dsa-src` input to `github:hydrastro/dsa/<revision>`, then run
+`nix flake update dsa-src`. The optional CAS has its own independent dependency
+pins and is not migrated by this update.
 
 ### Windows cross-build
 
@@ -94,14 +124,19 @@ nix develop .#windows    # MinGW-w64 cross toolchain + static GLFW/GLEW
 make windows             # -> build/windows/dynsys.exe
 ```
 
+The cross shell builds a separate target DSA archive and runs its Unicode
+generator with the native compiler. The two POSIX-only DSA I/O adapters are
+excluded from that archive; dynsys does not use them. For a manual cross build,
+supply DSA headers and a MinGW-built archive with `DSA_CFLAGS` / `DSA_LIBS`.
+
 ## Dependencies
 
 dynsys is built on a small stack of the author's own libraries, sourced through
 the flake:
 
 - **[tpcas](https://github.com/hydrastro/tpcas)** — the typed parser used to read
-  `.dyn` expressions. It links against **[ds](https://github.com/hydrastro/ds)**,
-  a data-structures library, which the flake supplies as a package (`-lds`).
+  `.dyn` expressions. It links against **[DSA](https://github.com/hydrastro/ds)**,
+  supplied as a separately built static library by the flake.
 - **[lizard](https://github.com/hydrastro/lizard)** + **[sangaku](https://github.com/hydrastro/sangaku)**
   — the exact-symbolic (CAS) backend. The `cas_bridge` shells out to the
   `lizard` binary with Sangaku on the module path.
@@ -139,7 +174,6 @@ param rho   = 28 [0,100]
 param beta  = 8 / 3 [0,10]
 
 plot3d = x, y, z
-plot2d = x, z
 observe r = sqrt(x*x + y*y + z*z)
 
 section = z - 27
@@ -164,8 +198,9 @@ Pol), predator-prey (Lotka-Volterra), and higher-dimensional systems.
 ## Tests
 
 ```sh
-make test          # full smoke-test suite (numeric core)
-make test-cas      # exact-symbolic (CAS) bridge tests; needs LIZARD + SANGAKU_ROOT
+make test          # parser/IR and full numeric smoke-test suite
+make test-cas      # optional CAS test; skips without LIZARD + SANGAKU_ROOT
+nix develop .#cas  # shell with the optional CAS dependencies
 ```
 
 Each analysis feature is validated against analytic ground truth in the suite.
