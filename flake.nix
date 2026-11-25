@@ -16,16 +16,13 @@
       flake = false;
     };
 
-    # Requires the TPCAS DSA migration. Refresh this input after publishing it.
     tpcas = {
       url = "github:hydrastro/tpcas";
       flake = false;
     };
 
-    # Build DSA separately; after the rename change the owner/repo to
-    # hydrastro/dsa and refresh this input's lock.
     dsa-src = {
-      url = "github:hydrastro/ds/909b4a462410b190db2488cb0fac7fca088af81c";
+      url = "github:hydrastro/dsa";
       flake = false;
     };
 
